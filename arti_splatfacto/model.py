@@ -12,10 +12,10 @@ except ImportError:
 import torch
 from nerfstudio.models.splatfacto import SplatfactoModelConfig, SplatfactoModel
 from nerfstudio.utils.spherical_harmonics import RGB2SH, SH2RGB, num_sh_bases
-from artisplatfacto.obj_3d_seg import Object3DSeg
+from arti_splatfacto.obj_3d_seg import Object3DSeg
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.utils.misc import torch_compile
-from artisplatfacto.gauss_utils import transform_gaussians, sample_gaussians, fit_gaussian_batch, rot2quat
+from arti_splatfacto.gauss_utils import transform_gaussians, sample_gaussians, fit_gaussian_batch, rot2quat
 
 @torch_compile()
 def get_viewmat(optimized_camera_to_world):

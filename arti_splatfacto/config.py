@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-# from artisplatfacto.dataparser import ArtiSplatfactoDataParserConfig
-from artisplatfacto.model import ArtiSplatfactoModelConfig
+from arti_splatfacto.dataparser import ArtiSplatfactoDataParserConfig
+from arti_splatfacto.model import ArtiSplatfactoModelConfig
 
 
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
@@ -16,16 +16,16 @@ from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig, FullImageDatamanager
 
 
-artisplatfacto_config = MethodSpecification(
+arti_splatfacto_config = MethodSpecification(
     config=TrainerConfig(
-        method_name="artisplatfacto", 
+        method_name="arti_splatfacto", 
         steps_per_eval_batch=100,
         steps_per_save=2000,
         max_num_iterations=30000,
         mixed_precision=True,
         pipeline=VanillaPipelineConfig(
             datamanager=FullImageDatamanagerConfig(
-                dataparser=NerfstudioDataParserConfig(load_3D_points=True),
+                dataparser=ArtiSplatfactoDataParserConfig(load_3D_points=True),
                 cache_images_type="uint8",
             ),
             model=ArtiSplatfactoModelConfig(
