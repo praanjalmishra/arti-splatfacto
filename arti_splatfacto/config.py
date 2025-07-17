@@ -22,10 +22,10 @@ arti_splatfacto_config = MethodSpecification(
         steps_per_eval_batch=100,
         steps_per_save=2000,
         max_num_iterations=30000,
-        mixed_precision=True,
+        mixed_precision=False,
         pipeline=VanillaPipelineConfig(
             datamanager=FullImageDatamanagerConfig(
-                dataparser=ArtiSplatfactoDataParserConfig(load_3D_points=True),
+                dataparser=ArtiSplatfactoDataParserConfig(),
                 cache_images_type="uint8",
             ),
             model=ArtiSplatfactoModelConfig(

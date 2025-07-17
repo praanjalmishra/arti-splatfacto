@@ -10,8 +10,11 @@ except ImportError:
     print("Please install gsplat>=1.0.0")
 
 import torch
+from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from nerfstudio.models.splatfacto import SplatfactoModelConfig, SplatfactoModel
+from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.utils.spherical_harmonics import RGB2SH, SH2RGB, num_sh_bases
+from nerfstudio.model_components.lib_bilagrid import BilateralGrid, color_correct, slice, total_variation_loss
 from arti_splatfacto.obj_3d_seg import Object3DSeg
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.utils.misc import torch_compile
@@ -40,7 +43,7 @@ def get_viewmat(optimized_camera_to_world):
 class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
 
 
-    _target: Type = field(default_factory=lambda: SplatfactoModel)
+    _target: Type = field(default_factory=lambda: ArtiSplatfactoModel)
     obj_mask_file: Optional[Path] = None
     # background_color: Literal["random", "black", "white"] = "random"
 
@@ -219,6 +222,116 @@ class ArtiSplatfactoModel(SplatfactoModel):
         print(f"Fixed gaussians: {getattr(self, 'gauss_params_fixed', {}).get('means', torch.tensor([])).shape[0] if hasattr(self, 'gauss_params_fixed') else 0}")
         print(f"Training mode: {self.training}")
         print(f"=== END ===")
+    
+    def clear_optimizer_state(self, optimizers):
+        """Clear optimizer state after parameter resizing"""
+        # print("!!! Clearing optimizer state after parameter resizing...")
+        
+        for name, optimizer in optimizers.optimizers.items():
+            if name in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]:
+                # Clear the optimizer state for this parameter group
+                for param_group in optimizer.param_groups:
+                    for param in param_group['params']:
+                        if param in optimizer.state:
+                            print(f"Clearing state for {name}")
+                            optimizer.state[param].clear()
+                            # Re-initialize the state
+                            optimizer.state[param] = {}
+
+    def step_cb(self, optimizers: Optimizers, step):
+        # print(f"!!!Step callback: {step}")  
+        if step == 20000:  
+            self.clear_optimizer_state(optimizers)
+        self.step = step
+        self.optimizers = optimizers.optimizers
+        self.schedulers = optimizers.schedulers
+
+
+    def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
+        gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
+        pred_img = outputs["rgb"]
+
+
+        # if "mask" in batch:
+        #     mask = self._downscale_if_required(batch["mask"])  # [H, W, 1]
+        #     mask = mask.to(self.device).float()  # Ensure float32 for pooling/blurring
+
+        #     if self.step % 100 == 0:
+        #         plt.imsave(f"{debug_dir}/mask_step_{self.step:05d}.png", mask.squeeze().detach().cpu().numpy(), cmap="gray")
+
+        #     # --- Dilation ---
+        #     dilated_mask = mask.permute(2, 0, 1).unsqueeze(0)  # [1, 1, H, W]
+
+        #     dilated_mask = torch.nn.functional.max_pool2d(dilated_mask, kernel_size=9, stride=1, padding=4)
+
+        #     # --- Gaussian Blur ---
+        #     blur = GaussianBlur(kernel_size=5, sigma=3.0)
+        #     blurred_mask = blur(dilated_mask)  # [1, 1, H, W]
+
+        #     # --- Final soft mask ---
+        #     soft_mask = blurred_mask.squeeze(0).permute(1, 2, 0)  # [H, W, 1]
+        #     soft_mask = soft_mask.clamp(0.0, 1.0)  # Optional: restrict to [0, 1]
+
+        #     # Save intermediate masks
+        #     if self.step % 100 == 0:
+        #         plt.imsave(f"{debug_dir}/dilated_mask_step_{self.step:05d}.png", dilated_mask.squeeze().detach().cpu().numpy(), cmap="gray")
+        #         plt.imsave(f"{debug_dir}/soft_mask_step_{self.step:05d}.png", soft_mask.squeeze().detach().cpu().numpy(), cmap="gray")
+
+        #     # Apply mask to both images
+        #     soft_mask = soft_mask.expand(-1, -1, 3)  # [H, W, 3]
+
+        #     # Apply soft mask to images
+        #     gt_img = gt_img * soft_mask
+        #     pred_img = pred_img * soft_mask
+
+
+        #     # Save masked outputs for comparison
+        #     if self.step % 100 == 0:
+        #         gt_np = gt_img.detach().cpu().numpy()
+        #         pred_np = pred_img.detach().cpu().numpy()
+        #         plt.imsave(f"{debug_dir}/gt_masked_{self.step:05d}.png", gt_np)
+        #         plt.imsave(f"{debug_dir}/pred_masked_{self.step:05d}.png", pred_np)
+
+        # === Losses ===
+        Ll1 = torch.abs(gt_img - pred_img).mean()
+        simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
+
+        if self.config.use_scale_regularization and self.step % 10 == 0:
+            scale_exp = torch.exp(self.scales)
+            scale_reg = (
+                torch.maximum(
+                    scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1),
+                    torch.tensor(self.config.max_gauss_ratio),
+                )
+                - self.config.max_gauss_ratio
+            )
+            scale_reg = 0.1 * scale_reg.mean()
+        else:
+            scale_reg = torch.tensor(0.0).to(self.device)
+
+        loss_dict = {
+            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
+            "scale_reg": scale_reg,
+        }
+
+        # MCMC extras
+        if self.config.strategy == "mcmc":
+            if self.config.mcmc_opacity_reg > 0.0:
+                loss_dict["mcmc_opacity_reg"] = (
+                    self.config.mcmc_opacity_reg * torch.abs(torch.sigmoid(self.gauss_params["opacities"])).mean()
+                )
+            if self.config.mcmc_scale_reg > 0.0:
+                loss_dict["mcmc_scale_reg"] = (
+                    self.config.mcmc_scale_reg * torch.abs(torch.exp(self.gauss_params["scales"])).mean()
+                )
+
+        # Camera + bilateral grid
+        if self.training:
+            self.camera_optimizer.get_loss_dict(loss_dict)
+            if self.config.use_bilateral_grid:
+                loss_dict["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)
+
+        return loss_dict
 
 
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
