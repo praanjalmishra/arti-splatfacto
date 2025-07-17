@@ -25,23 +25,23 @@ CHECKPOINT_PATH="/local/home/pmishra/nerfstudio/outputs/gs_sim_2/splatfacto/2025
 
 # Check existence of important files
 if [[ ! -f "$TRANSFORM_JSON" ]]; then
-    echo "❌ transforms_finetune.json not found at $TRANSFORM_JSON"
+    echo "[ERROR] transforms_finetune.json not found at $TRANSFORM_JSON"
     exit 1
 fi
 
 if [[ ! -f "$OBJ_MASK_FILE" ]]; then
-    echo "❌ Object mask file not found at $OBJ_MASK_FILE"
+    echo "[ERROR] Object mask file not found at $OBJ_MASK_FILE"
     exit 1
 fi
 
 if [[ ! -d "$CHECKPOINT_PATH" ]]; then
-    echo "❌ Checkpoint directory not found at $CHECKPOINT_PATH"
+    echo "[ERROR] Checkpoint directory not found at $CHECKPOINT_PATH"
     exit 1
 fi
 
 # ------------------ Launch Training ------------------
 ns-train arti_splatfacto \
-    --vis viewer \
+    --vis viewer+wandb \
     --experiment-name "$(basename "$DATA_FOLDER")"_finetune \
     --output-dir "$OUTPUT_FOLDER" \
     --timestamp "$current_time" \

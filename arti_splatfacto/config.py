@@ -74,5 +74,5 @@ arti_splatfacto_config = MethodSpecification(
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
         vis="viewer",
     ),
-    description="A clone of the splatfacto config",
+    description="A fine-tuning variant of Splatfacto",
 )
