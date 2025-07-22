@@ -311,6 +311,12 @@ class ArtiSplatfactoModel(SplatfactoModel):
         if not isinstance(camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
+        time_value = 1.0  # Default to fully fine-tuned state
+        if hasattr(camera, "times") and camera.times is not None:
+            time_value = float(camera.times.flatten()[0])
+            print(f"Using camera time: {time_value}")
+        else:
+            print("!!!No camera.times found, using default time=1.0")
 
         if self.training:
             assert camera.shape[0] == 1, "Only one camera at a time"
