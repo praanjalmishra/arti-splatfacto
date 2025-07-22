@@ -12,3 +12,4 @@ class ArtiSplatfactoDataParserConfig(NerfstudioDataParserConfig):
 @dataclass
 class ArtiSplatfactoDataParser(Nerfstudio):
     config: ArtiSplatfactoDataParserConfig
+    includes_time: bool = True

@@ -19,7 +19,8 @@ export CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES
 current_time=$(date +%Y-%m-%d_%H%M%S)
 
 # ------------------ Paths ------------------
-TRANSFORM_JSON="$DATA_FOLDER/transforms_finetune.json"
+# TRANSFORM_JSON="$DATA_FOLDER/transforms_finetune.json"
+TRANSFORM_JSON="$DATA_FOLDER/transforms_finetune_with_timestamp.json"
 OBJ_MASK_FILE="$DATA_FOLDER/obj3Dseg0_updated.pt"
 CHECKPOINT_PATH="/local/home/pmishra/nerfstudio/outputs/gs_sim_2/splatfacto/2025-07-12_162025/nerfstudio_models"
 
@@ -49,7 +50,7 @@ ns-train arti_splatfacto \
     --pipeline.model.cull-alpha-thresh 0.001 \
     --pipeline.model.densify-grad-thresh 0.0001 \
     --pipeline.model.obj-mask-file "$OBJ_MASK_FILE" \
-    --max-num-iterations 50000 \
+    --max-num-iterations 30000 \
     --machine.num-devices 1 \
     --viewer.quit-on-train-completion True \
     --load-dir "$CHECKPOINT_PATH" \
