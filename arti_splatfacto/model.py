@@ -45,7 +45,6 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
 
     _target: Type = field(default_factory=lambda: ArtiSplatfactoModel)
     obj_mask_file: Optional[Path] = None
-    # background_color: Literal["random", "black", "white"] = "random"
 
 
 class ArtiSplatfactoModel(SplatfactoModel):    
@@ -55,32 +54,42 @@ class ArtiSplatfactoModel(SplatfactoModel):
     def populate_modules(self):
         """
         Populates the modules of the model.
-
-        returns:
-            None
         """
         super().populate_modules()
 
-        means = torch.zeros((1, 3)).float().cuda()  
-        scales = torch.zeros((1, 3)).float().cuda()
-        quats = torch.zeros((1, 4)).float().cuda()
+        def make_param(shape, requires_grad=True):
+            return torch.nn.Parameter(torch.zeros(shape).float().cuda(), requires_grad=requires_grad)
+
         dim_sh = num_sh_bases(self.config.sh_degree)
-        features_dc = torch.zeros((1, 3)).float().cuda()
-        features_rest = torch.zeros((1, dim_sh-1, 3)).float().cuda()
-        opacities = torch.zeros((1, 1)).float().cuda()
-        
-        # Convert to parameters
-        self.gauss_params = torch.nn.ParameterDict(
-            {
-                "means": torch.nn.Parameter(means),
-                "scales": torch.nn.Parameter(scales),
-                "quats": torch.nn.Parameter(quats),
-                "features_dc": torch.nn.Parameter(features_dc),
-                "features_rest": torch.nn.Parameter(features_rest),
-                "opacities": torch.nn.Parameter(opacities),
-            }
-        )
-    
+
+        # Trainable Gaussians
+        self.gauss_params = torch.nn.ParameterDict({
+            "means":         make_param((1, 3)),
+            "scales":        make_param((1, 3)),
+            "quats":         make_param((1, 4)),
+            "features_dc":   make_param((1, 3)),
+            "features_rest": make_param((1, dim_sh - 1, 3)),
+            "opacities":     make_param((1, 1)),
+        })
+
+        # Fixed (non-trainable) Gaussians 
+        self.gauss_params_fixed = torch.nn.ParameterDict({
+            "means":         make_param((0, 3), requires_grad=False),
+            "scales":        make_param((0, 3), requires_grad=False),
+            "quats":         make_param((0, 4), requires_grad=False),
+            "features_dc":   make_param((0, 3), requires_grad=False),
+            "features_rest": make_param((0, dim_sh - 1, 3), requires_grad=False),
+            "opacities":     make_param((0, 1), requires_grad=False),
+        })
+
+        # self.register_module("gauss_params_fixed", self.gauss_params_fixed)
+
+    def state_dict(self, *args, **kwargs):
+        state = super().state_dict(*args, **kwargs)
+        if hasattr(self, "gauss_params_fixed"):
+            for name, param in self.gauss_params_fixed.items():
+                state[f"gauss_params_fixed.{name}"] = param.data
+        return state
 
     def load_state_dict(self, dict, **kwargs):
         print(f"!!! Loading state_dict, training={self.training}")
@@ -159,54 +168,34 @@ class ArtiSplatfactoModel(SplatfactoModel):
                     print(f"Resized {name}: {existing_param.shape}")
                 
                 # Store fixed gaussians
-                self.gauss_params_fixed = {}
+                # self.gauss_params_fixed = {}
                 non_obj_mask = ~self.obj_mask
-                for name in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]:
-                    self.gauss_params_fixed[name] = dict[f"gauss_params.{name}"][non_obj_mask].to(self.device)
+                for name in self.gauss_params_fixed.keys():
+                    data = dict[f"gauss_params.{name}"][non_obj_mask].to(self.device)
+                    self.gauss_params_fixed[name] = torch.nn.Parameter(data, requires_grad=False)
+
+
                 
                 print(f"[INFO] Loaded {filtered_data['means'].shape[0]} Gaussians for fine-tuning.")
 
-
-
-                # num_seed = 3000  # Or more, based on resolution needs
-                # bbox_min = filtered_data["means"].min(dim=0).values.to(self.device)
-                # bbox_max = filtered_data["means"].max(dim=0).values.to(self.device)
-
-                # # Uniform random seed in bounding box
-                # new_means = torch.rand((num_seed, 3), device=self.device) * (bbox_max - bbox_min) + bbox_min
-                # new_scales = torch.log(torch.ones((num_seed, 3), device=self.device) * 0.01)
-                # new_quats = torch.nn.functional.normalize(torch.randn((num_seed, 4), device=self.device), dim=-1)
-                # new_features_dc = torch.rand((num_seed, 3), device=self.device) * 0.5 + 0.25  # mid-gray
-                # new_features_rest = torch.zeros((num_seed, self.features_rest.shape[1], 3), device=self.device)
-                # new_opacities = torch.full((num_seed, 1), -2.0, device=self.device)  # low initial opacity
-
-                # # Concatenate to existing object Gaussians
-                # for name, new_tensor in {
-                #     "means": new_means,
-                #     "scales": new_scales,
-                #     "quats": new_quats,
-                #     "features_dc": new_features_dc,
-                #     "features_rest": new_features_rest,
-                #     "opacities": new_opacities,
-                # }.items():
-                #     existing = getattr(self, name)
-                #     new_full = torch.cat([existing, new_tensor], dim=0)
-                #     self.gauss_params[name].data = new_full
-
-                
             else:
                 # INFERENCE MODE: Load all gaussians directly
                 print("!!! Inference mode: loading all gaussians directly")
-                
-                # Resize model to match checkpoint size
-                checkpoint_size = dict["gauss_params.means"].shape[0]
-                print(f"Resizing model from {self.means.shape[0]} to {checkpoint_size} gaussians")
-                
+
                 for name in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]:
-                    checkpoint_data = dict[f"gauss_params.{name}"]
-                    existing_param = self.gauss_params[name]
-                    existing_param.data = checkpoint_data.to(existing_param.device).detach()
-                    print(f"Loaded {name}: {existing_param.shape}")
+                    checkpoint_data = dict[f"gauss_params.{name}"].to(self.device)
+
+                    if hasattr(self, "gauss_params_fixed") and name in self.gauss_params_fixed:
+                        fixed_data = self.gauss_params_fixed[name].data.to(self.device)
+                        merged_data = torch.cat([checkpoint_data, fixed_data], dim=0)
+                        print(f"Merged {name}: {checkpoint_data.shape[0]} + {fixed_data.shape[0]} = {merged_data.shape[0]}")
+                    else:
+                        merged_data = checkpoint_data
+                        print(f"No fixed gaussians for {name}, using only {checkpoint_data.shape[0]}")
+
+                    self.gauss_params[name].data = merged_data.detach()
+                    print(f"Loaded {name}: {self.gauss_params[name].shape}")
+
             
             self.step = 0
             
@@ -216,12 +205,26 @@ class ArtiSplatfactoModel(SplatfactoModel):
             super().load_state_dict(dict, **kwargs)
             self.step = 0
 
+        if hasattr(self, "gauss_params_fixed"):
+            for name in self.gauss_params_fixed.keys():
+                key = f"gauss_params_fixed.{name}"
+                if key in dict:
+                    print(f"[INFO] Restoring fixed gaussians for {name}")
+                    self.gauss_params_fixed[name].data = dict[key].to(self.device)
+
+
         # Debug info
         print(f"=== FINAL STATE ===")
         print(f"Gaussians loaded: {self.means.shape[0]}")
-        print(f"Fixed gaussians: {getattr(self, 'gauss_params_fixed', {}).get('means', torch.tensor([])).shape[0] if hasattr(self, 'gauss_params_fixed') else 0}")
+
+        if hasattr(self, 'gauss_params_fixed') and 'means' in self.gauss_params_fixed:
+            print(f"Fixed gaussians: {self.gauss_params_fixed['means'].shape[0]}")
+        else:
+            print("Fixed gaussians: 0")
+
         print(f"Training mode: {self.training}")
         print(f"=== END ===")
+
     
     def clear_optimizer_state(self, optimizers):
         """Clear optimizer state after parameter resizing"""
@@ -250,47 +253,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         pred_img = outputs["rgb"]
-
-
-        # if "mask" in batch:
-        #     mask = self._downscale_if_required(batch["mask"])  # [H, W, 1]
-        #     mask = mask.to(self.device).float()  # Ensure float32 for pooling/blurring
-
-        #     if self.step % 100 == 0:
-        #         plt.imsave(f"{debug_dir}/mask_step_{self.step:05d}.png", mask.squeeze().detach().cpu().numpy(), cmap="gray")
-
-        #     # --- Dilation ---
-        #     dilated_mask = mask.permute(2, 0, 1).unsqueeze(0)  # [1, 1, H, W]
-
-        #     dilated_mask = torch.nn.functional.max_pool2d(dilated_mask, kernel_size=9, stride=1, padding=4)
-
-        #     # --- Gaussian Blur ---
-        #     blur = GaussianBlur(kernel_size=5, sigma=3.0)
-        #     blurred_mask = blur(dilated_mask)  # [1, 1, H, W]
-
-        #     # --- Final soft mask ---
-        #     soft_mask = blurred_mask.squeeze(0).permute(1, 2, 0)  # [H, W, 1]
-        #     soft_mask = soft_mask.clamp(0.0, 1.0)  # Optional: restrict to [0, 1]
-
-        #     # Save intermediate masks
-        #     if self.step % 100 == 0:
-        #         plt.imsave(f"{debug_dir}/dilated_mask_step_{self.step:05d}.png", dilated_mask.squeeze().detach().cpu().numpy(), cmap="gray")
-        #         plt.imsave(f"{debug_dir}/soft_mask_step_{self.step:05d}.png", soft_mask.squeeze().detach().cpu().numpy(), cmap="gray")
-
-        #     # Apply mask to both images
-        #     soft_mask = soft_mask.expand(-1, -1, 3)  # [H, W, 3]
-
-        #     # Apply soft mask to images
-        #     gt_img = gt_img * soft_mask
-        #     pred_img = pred_img * soft_mask
-
-
-        #     # Save masked outputs for comparison
-        #     if self.step % 100 == 0:
-        #         gt_np = gt_img.detach().cpu().numpy()
-        #         pred_np = pred_img.detach().cpu().numpy()
-        #         plt.imsave(f"{debug_dir}/gt_masked_{self.step:05d}.png", gt_np)
-        #         plt.imsave(f"{debug_dir}/pred_masked_{self.step:05d}.png", pred_np)
 
         # === Losses ===
         Ll1 = torch.abs(gt_img - pred_img).mean()
@@ -383,6 +345,9 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
             if hasattr(self, "gauss_params_fixed") and self.training:
                 # print(f"!!! Combining {self.means.shape[0]} trainable + {self.gauss_params_fixed['means'].shape[0]} fixed gaussians")
+                assert features_rest_crop.shape[1:] == self.gauss_params_fixed["features_rest"].shape[1:], \
+                f"features_rest shape mismatch: {features_rest_crop.shape} vs {self.gauss_params_fixed['features_rest'].shape}"
+
                 
                 opacities_crop = torch.cat([opacities_crop, self.gauss_params_fixed["opacities"]], dim=0)
                 means_crop = torch.cat([means_crop, self.gauss_params_fixed["means"]], dim=0)
@@ -390,9 +355,10 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 features_rest_crop = torch.cat([features_rest_crop, self.gauss_params_fixed["features_rest"]], dim=0)
                 scales_crop = torch.cat([scales_crop, self.gauss_params_fixed["scales"]], dim=0)
                 quats_crop = torch.cat([quats_crop, self.gauss_params_fixed["quats"]], dim=0)
+                
             elif hasattr(self, "gauss_params_fixed"):
                 # During evaluation, also include fixed gaussians
-                # print(f"!!! (Eval) Combining {self.means.shape[0]} trainable + {self.gauss_params_fixed['means'].shape[0]} fixed gaussians")
+                print(f"!!! (Eval) Combining {self.means.shape[0]} trainable + {self.gauss_params_fixed['means'].shape[0]} fixed gaussians")
                 
                 opacities_crop = torch.cat([opacities_crop, self.gauss_params_fixed["opacities"]], dim=0)
                 means_crop = torch.cat([means_crop, self.gauss_params_fixed["means"]], dim=0)
