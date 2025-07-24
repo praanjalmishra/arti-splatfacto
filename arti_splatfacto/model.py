@@ -10,6 +10,7 @@ except ImportError:
     print("Please install gsplat>=1.0.0")
 
 import torch
+import torch.nn.functional as F
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from nerfstudio.models.splatfacto import SplatfactoModelConfig, SplatfactoModel
 from nerfstudio.engine.optimizers import Optimizers
@@ -38,6 +39,28 @@ def get_viewmat(optimized_camera_to_world):
     viewmat[:, :3, 3:4] = T_inv
     return viewmat
 
+
+def slerp(q0: torch.Tensor, q1: torch.Tensor, t: float) -> torch.Tensor:
+    """Spherical linear interpolation (SLERP) between two quaternions."""
+    dot = torch.sum(q0 * q1, dim=-1, keepdim=True)
+
+    # Use the shorter path by negating q1 if needed
+    q1 = torch.where(dot < 0, -q1, q1)
+    dot = torch.clamp(dot.abs(), 1e-6, 1.0)
+
+    theta_0 = torch.acos(dot)  # Angle between input vectors
+    sin_theta_0 = torch.sin(theta_0)
+
+    if torch.any(sin_theta_0 < 1e-4):
+        return F.normalize((1 - t) * q0 + t * q1, dim=-1)
+
+    theta = theta_0 * t
+    sin_theta = torch.sin(theta)
+
+    s0 = torch.sin(theta_0 - theta) / sin_theta_0
+    s1 = sin_theta / sin_theta_0
+
+    return F.normalize(s0 * q0 + s1 * q1, dim=-1)
 
 @dataclass
 class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
@@ -145,8 +168,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
     def load_state_dict(self, state_dict, **kwargs):
         """
-        CORRECTED VERSION: This method ONLY loads data into separate parameter
-        groups. It DOES NOT merge them. This is critical for interpolation to work.
+        Load the state_dict into the model.
         """
         print(f"--- Loading state_dict (Training mode: {self.training}) ---")
 
@@ -154,7 +176,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         GAUSSIAN_PARAM_NAMES: List[str] = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
         if is_partitioned_checkpoint:
-            print("🔄 Resuming from a partitioned checkpoint...")
+            print("Resuming from a partitioned checkpoint...")
             # Create a copy for the super() call to avoid modifying the original dict
             super_state_dict = state_dict.copy()
             
@@ -187,7 +209,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 print("⚡️ Loading full scene for inference.")
                 super().load_state_dict(state_dict, **kwargs)
         else:
-            print("📦 Normal checkpoint loading.")
+            print("Normal checkpoint loading.")
             super().load_state_dict(state_dict, **kwargs)
             
         self.step = state_dict.get("step", 0)
@@ -263,38 +285,36 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         return loss_dict
 
-
     def _get_gaussians_for_render(
-        self, time: float = 1.0
+        self, time: float = 1.0, interp_mode: str = "lerp"
     ) -> Dict[str, torch.Tensor]:
         """
         Selects, interpolates, and combines Gaussians for rendering.
-        This method is now the single source of truth for scene assembly.
+        Allows LERP or SLERP interpolation between object states.
         """
-        # Start with the trainable object Gaussians as the base "post" state.
-        # self.gauss_params now correctly refers to the object ONLY.
         obj_params_post = self.gauss_params
-
-        # Check if we should interpolate
         has_pre_state = hasattr(self, "gauss_params_pre") and self.gauss_params_pre["means"].shape[0] > 0
-        
-        # Use the interpolated object state if applicable
+
         if not self.training and has_pre_state and time < 1.0:
-            print(f"Interpolating object state with time t={time:.2f}")
+            print(f"Interpolating object state with time t={time:.2f} using {interp_mode.upper()}")
             t = time
             final_obj_params = {}
-            # Interpolate between object_pre and object_post states.
-            # This will now work as both tensors have the same size.
+
             for name in obj_params_post.keys():
                 pre = self.gauss_params_pre[name]
                 post = obj_params_post[name]
-                final_obj_params[name] = (1 - t) * pre + t * post
-            final_obj_params["quats"] = torch.nn.functional.normalize(final_obj_params["quats"], dim=-1)
+
+                if name == "quats" and interp_mode == "slerp":
+                    final_obj_params[name] = slerp(pre, post, t)
+                else:
+                    final_obj_params[name] = (1 - t) * pre + t * post
+
+            if interp_mode == "lerp":
+                final_obj_params["quats"] = F.normalize(final_obj_params["quats"], dim=-1)
+
         else:
-            # Otherwise, use the final fine-tuned object state
             final_obj_params = obj_params_post
 
-        # Now, combine the final object state with the static background
         if hasattr(self, "gauss_params_fixed") and self.gauss_params_fixed["means"].shape[0] > 0:
             full_scene_params = {}
             for name in final_obj_params.keys():
@@ -302,8 +322,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
                     [final_obj_params[name], self.gauss_params_fixed[name]], dim=0
                 )
             return full_scene_params
-        
-        # If there's no background, the scene is just the object
+
         return final_obj_params
 
 
@@ -318,7 +337,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             time_value = float(camera.times.flatten()[0])
 
         # 2. Prepare Gaussians for rendering using the new helper method
-        gaussians_to_render = self._get_gaussians_for_render(time=time_value)
+        gaussians_to_render = self._get_gaussians_for_render(time=time_value, interp_mode="slerp")
 
         # 3. Handle camera optimization
         optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera) if self.training else camera.camera_to_worlds
