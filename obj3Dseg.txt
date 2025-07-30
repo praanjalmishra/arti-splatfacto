@@ -1,0 +1,12 @@
+| Key                   | Description                              | Type / Shape                  |
+| --------------------- | ---------------------------------------- | ----------------------------- |
+| `bbox_min`            | Minimum corner of object's bounding box  | `Tensor([3])` (float32)       |
+| `bbox_max`            | Maximum corner of object's bounding box  | `Tensor([3])` (float32)       |
+| `voxel`               | 3D occupancy mask / segmentation volume  | `Tensor([30, 30, 30])` (bool) |
+| `pose_change`         | Object's 4×4 transformation matrix       | `Tensor([4, 4])` (float32)    |
+| `mask_dilate_uniform` | Uniform dilation factor (unused = 0)     | `int`                         |
+| `mask_dilate_top`     | Top-only dilation factor (unused = 0)    | `int`                         |
+| `tight_bbox`          | Tight AABB of the object                 | `tuple((3,), (3,))`           |
+| `joint_axis`          | Revolute joint axis (unit vector, world) | `Tensor([3])` (float32)       |
+| `joint_pivot`         | Point on joint axis (world coordinates)  | `Tensor([3])` (float32)       |
+| `joint_angle`         | Rotation angle in radians                | `Tensor([])` (float32 scalar) |
