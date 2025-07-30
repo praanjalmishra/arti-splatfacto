@@ -22,7 +22,7 @@ class Object3DSeg:
     """
     def __init__(
         self, bbox_min, bbox_max, voxel, pose_change,
-        tight_bbox=None, mask_dilate_uniform=0, mask_dilate_top=5
+        tight_bbox=None, mask_dilate_uniform=0, mask_dilate_top=5, joint_axis=None, joint_pivot=None, joint_angle=None
     ):
         """
         Args:
@@ -53,6 +53,11 @@ class Object3DSeg:
             self.voxel = self.dilate_uniform(mask_dilate_uniform)
         if mask_dilate_top > 0:
             self.voxel = self.dilate_top(mask_dilate_top)
+
+        self.joint_axis = None
+        self.joint_pivot = None
+        self.joint_angle = None
+
 
     def get_bbox(self):
         """
@@ -445,6 +450,21 @@ class Object3DSeg:
         # print(f"dilate uniform: {obj.mask_dilate_uniform}")
         # print(f"dilate top: {obj.mask_dilate_top}")
         print(f"Pose change:\n {obj.pose_change}")
+        # Load articulation metadata if available
+        if 'joint_axis' in data and data['joint_axis'] is not None:
+            obj.joint_axis = data['joint_axis'].to(device)
+        if 'joint_pivot' in data and data['joint_pivot'] is not None:
+            obj.joint_pivot = data['joint_pivot'].to(device)
+        if 'joint_angle' in data and data['joint_angle'] is not None:
+            obj.joint_angle = data['joint_angle'].to(device)
+
+        # print(f"Pose change:\n{obj.pose_change}")
+        # if obj.joint_axis is not None:
+        #     print(f"Joint axis: {obj.joint_axis}")
+        # if obj.joint_pivot is not None:
+        #     print(f"Joint pivot: {obj.joint_pivot}")
+        # if obj.joint_angle is not None:
+        #     print(f"Joint angle: {obj.joint_angle:.3f} rad")
         return obj
     
     def refine_mask(self, dilate_k=2, erode_k=1):
@@ -561,116 +581,15 @@ class Object3DSeg:
         mesh_o3d.compute_vertex_normals()
         o3d.io.write_triangle_mesh(f"{output_dir}/occ_mesh_debug.ply", mesh_o3d)
 
+    def get_pivot_to_origin_transform(self):
+        """
+        Returns a 4x4 matrix that translates the object so its pivot is at the origin.
+        """
+        device = self.voxel.device
+        T = torch.eye(4, device=device)
+        T[:3, 3] = -self.joint_pivot.to(device)
+        return T
 
 
 
 
-# class Obj3DFeats:
-#     """
-#     Object's multiview SuperPoint features
-#     """
-#     def __init__(self, feats=[], pts3D=[]):
-#         """
-#         Args:
-#             feats (dict): SuperPoint feature dict
-#         """
-#         self.feats = feats
-#         self.pts3D = pts3D
-#         assert len(feats) == len(pts3D)
-#         assert all(
-#             [feats['keypoints'].shape[1] == pts.shape[0] 
-#             for feats, pts in zip(feats, pts3D)]
-#         )
-#         self.device = torch.device(
-#             "cuda" if torch.cuda.is_available() else "cpu"
-#         )
-    
-#     def add_feats(self, feats, pts3D):
-#         """
-#         Add features to the object
-
-#         Args:
-#             feats (dict): SuperPoint feature dict from a view
-#             pts3D (Nx3 tensor): 3D points corresponding to the features
-#         """
-#         assert feats['keypoints'].shape[1] == pts3D.shape[0]
-#         self.feats.append(feats)
-#         self.pts3D.append(pts3D)
-
-#     def match(self, feats, matcher=None):
-#         """
-#         Match features with the object features
-
-#         Args:
-#             feats (dict): SuperPoint feature dict for 2D image points
-#             matcher (LightGlue.Matcher): Feature matcher
-        
-#         Returns:
-#             matched3D (Nx3): Matched 3D points
-#             matched2D (Nx2): Matched 2D points
-#         """
-#         assert len(self.feats) > 0, "No features to match"
-#         # TODO: have to take matcher as input
-#         if matcher is None:
-#             from lightglue import LightGlue            
-#             matcher = LightGlue(features='superpoint').eval().to(self.device)
-#         matched_pts3D, matches = [], []
-#         for obj_feats, obj_pts3D in zip(self.feats, self.pts3D): 
-#             mm = matcher({'image0': obj_feats, 'image1': feats})
-#             _, _, mm = [rbd(x) for x in [obj_feats, feats, mm]]
-#             # Uncomment to filter low-confidence matches
-#             # mm["matches"] = mm["matches"][mm["scores"] > 0.4, :]
-#             matched3D = obj_pts3D[mm["matches"][:, 0]]
-#             matches.append(mm["matches"][:, 1])
-#             matched_pts3D.append(matched3D)
-#         matches = torch.cat(matches, dim=0)
-#         matched_pts3D = torch.cat(matched_pts3D, dim=0)
-#         # TODO: handle duplicate matches by comparing 
-#         matched_pts2D = feats["keypoints"][0][matches]
-#         return matched_pts2D, matched_pts3D
-    
-#     def PnP(self, feats, K, H, W, matcher=None, verbose=False):
-#         """
-#         Solve PnP problem to estimate cam-to-obj pose
-
-#         Args:
-#             feats (dict): SuperPoint feature dict
-#             K (3x3): Camera intrinsics
-#             matcher (LightGlue.Matcher): Feature matcher
-        
-#         Returns:
-#             pose (4x4 tensor): Camera-to-obj pose
-#             num_inliers (int): Number of inliers
-#             num_matches (int): Number of matches
-#         """
-
-#         assert K.shape == (3, 3)
-#         matched_pts2D, matched_pts3D = self.match(feats, matcher)
-#         matched_pts2D = matched_pts2D.cpu().numpy()
-#         matched_pts3D = matched_pts3D.cpu().numpy()
-#         if matched_pts3D.shape[0] < 4:
-#             print("Warn: Not enough points for PnP")
-#             return None, 0.0, 0
-#         pycolmap_cam = pycolmap.Camera(
-#             model='OPENCV', width=W, height=H,
-#             params=[K[0, 0], K[1, 1], K[0, -1], K[1, -1], 0, 0, 0, 0]
-#         )
-#         ret = pycolmap.absolute_pose_estimation(
-#             matched_pts2D, matched_pts3D, pycolmap_cam,
-#             estimation_options={'ransac': {'max_error': 12.0}}, 
-#             refinement_options={'print_summary': verbose}
-#         )
-#         if not ret['success']:
-#             print("Warn: PnP failed!!")
-#             return None, 0.0, 0
-#         R_mat = torch.tensor(Quaternion(*ret['qvec']).rotation_matrix)
-#         tvec = torch.tensor(ret['tvec'])
-#         pose = torch.eye(4, device=K.device)
-#         pose[:3, :3], pose[:3, 3] = R_mat, tvec
-#         pose = pose.inverse()
-#         if verbose:
-#             print(
-#                 f"Number of inliers: {ret['num_inliers']}/{len(matched_pts2D)}"
-#             )
-#             print(f"pose est:\n {pose}")
-#         return pose, ret["num_inliers"], len(matched_pts2D)

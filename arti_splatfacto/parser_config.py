@@ -2,6 +2,6 @@
 from __future__ import annotations
 
 from nerfstudio.plugins.registry_dataparser import DataParserSpecification
-from arti_splatfacto.dataparser import ArtiSplatfactoDataParserConfig
+from arti_splatfacto.data.dataparser import ArtiSplatfactoDataParserConfig
 
 arti_splatfacto_dataparser = DataParserSpecification(config=ArtiSplatfactoDataParserConfig())

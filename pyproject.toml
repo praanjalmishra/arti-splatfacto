@@ -13,4 +13,4 @@ include = ["arti_splatfacto*"]
 arti_splatfacto = 'arti_splatfacto.config:arti_splatfacto_config'
 
 [project.entry-points.'nerfstudio.dataparser_configs']
-custom-dataparser = 'arti_splatfacto.parser_config:arti_splatfacto_dataparser'
+arti-dataparser = 'arti_splatfacto.parser_config:arti_splatfacto_dataparser'

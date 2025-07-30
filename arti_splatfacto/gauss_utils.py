@@ -150,3 +150,21 @@ def fit_gaussian_batch(points, masks):
     covariances = torch.sum(weighted_outer_product, dim=1) \
         / (count_masked_points.unsqueeze(-1) - 1)
     return means, covariances
+
+def quaternion_multiply(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """
+    Multiply two quaternions.
+    Both q1 and q2 should be (..., 4) tensors in (x, y, z, w) format.
+    
+    Returns:
+        torch.Tensor: Resulting quaternion (..., 4) in (x, y, z, w) format.
+    """
+    x1, y1, z1, w1 = q1.unbind(-1)
+    x2, y2, z2, w2 = q2.unbind(-1)
+
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+
+    return torch.stack([x, y, z, w], dim=-1)

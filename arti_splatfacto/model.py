@@ -9,6 +9,7 @@ try:
 except ImportError:
     print("Please install gsplat>=1.0.0")
 
+from importlib_metadata import metadata
 import torch
 import torch.nn.functional as F
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
@@ -17,9 +18,11 @@ from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.utils.spherical_harmonics import RGB2SH, SH2RGB, num_sh_bases
 from nerfstudio.model_components.lib_bilagrid import BilateralGrid, color_correct, slice, total_variation_loss
 from arti_splatfacto.obj_3d_seg import Object3DSeg
+from arti_splatfacto.scene_3d import Scene3D
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.utils.misc import torch_compile
 from arti_splatfacto.gauss_utils import transform_gaussians, sample_gaussians, fit_gaussian_batch, rot2quat
+from pytorch3d.transforms import quaternion_multiply
 
 @torch_compile()
 def get_viewmat(optimized_camera_to_world):
@@ -44,11 +47,10 @@ def slerp(q0: torch.Tensor, q1: torch.Tensor, t: float) -> torch.Tensor:
     """Spherical linear interpolation (SLERP) between two quaternions."""
     dot = torch.sum(q0 * q1, dim=-1, keepdim=True)
 
-    # Use the shorter path by negating q1 if needed
     q1 = torch.where(dot < 0, -q1, q1)
     dot = torch.clamp(dot.abs(), 1e-6, 1.0)
 
-    theta_0 = torch.acos(dot)  # Angle between input vectors
+    theta_0 = torch.acos(dot)  
     sin_theta_0 = torch.sin(theta_0)
 
     if torch.any(sin_theta_0 < 1e-4):
@@ -67,7 +69,13 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
 
 
     _target: Type = field(default_factory=lambda: ArtiSplatfactoModel)
-    obj_mask_file: Optional[Path] = None
+
+    # background_model: SplatfactoModelConfig = field(default_factory=lambda: SplatfactoModelConfig)
+    # object_model: SplatfactoModelConfig = field(default_factory=lambda: SplatfactoModelConfig)
+
+    # # obj_mask_file: Optional[Path] = None
+    # fourier_features_dim: int = 5
+    # fourier_features_scale: int = 1
 
 
 class ArtiSplatfactoModel(SplatfactoModel):    
@@ -75,27 +83,32 @@ class ArtiSplatfactoModel(SplatfactoModel):
     config: ArtiSplatfactoModelConfig
 
     def populate_modules(self):
-        """
-        Populates the modules of the model.
-        """
+
         super().populate_modules()
+
+        # Clean up: deregister inherited Gaussian parameter attributes (e.g., self.means, self.quats, etc.)
+        # for gs_param in list(self.gauss_params.keys()):
+        #     self._parameters.pop(gs_param, None)   # safe if it was a registered param
+        #     self._buffers.pop(gs_param, None)      # safe if it was a registered buffer
+        #     if hasattr(self, gs_param):
+        #         delattr(self, gs_param)            # now safe to delete
+        #     setattr(self, gs_param, None)  
 
         def make_param(shape, requires_grad=True):
             return torch.nn.Parameter(torch.zeros(shape).float().cuda(), requires_grad=requires_grad)
 
         dim_sh = num_sh_bases(self.config.sh_degree)
 
-        # Post transformation Gaussians (trainable)
-        self.gauss_params = torch.nn.ParameterDict({
-            "means":         make_param((1, 3)),
-            "scales":        make_param((1, 3)),
-            "quats":         make_param((1, 4)),
-            "features_dc":   make_param((1, 3)),
-            "features_rest": make_param((1, dim_sh - 1, 3)),
-            "opacities":     make_param((1, 1)),
-        })
-
-        # Fixed (non-trainable) Gaussians 
+        # Canonical (trainable object Gaussians in canonical frame)
+        self.gauss_params_canonical = torch.nn.ParameterDict({
+            "means":         make_param((0, 3), requires_grad=True),
+            "scales":        make_param((0, 3), requires_grad=True),
+            "quats":         make_param((0, 4), requires_grad=True),
+            "features_dc":   make_param((0, 3), requires_grad=True),
+            "features_rest": make_param((0, dim_sh - 1, 3), requires_grad=True),
+            "opacities":     make_param((0, 1), requires_grad=True),
+            })
+        
         self.gauss_params_fixed = torch.nn.ParameterDict({
             "means":         make_param((0, 3), requires_grad=False),
             "scales":        make_param((0, 3), requires_grad=False),
@@ -105,115 +118,175 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "opacities":     make_param((0, 1), requires_grad=False),
         })
 
-        # Pre-transformation Gaussians (for object-specific loading)
-        self.gauss_params_pre = torch.nn.ParameterDict({
-            "means":         make_param((0, 3), requires_grad=False),
-            "scales":        make_param((0, 3), requires_grad=False),
-            "quats":         make_param((0, 4), requires_grad=False),
-            "features_dc":   make_param((0, 3), requires_grad=False),
-            "features_rest": make_param((0, dim_sh - 1, 3), requires_grad=False),
-            "opacities":     make_param((0, 1), requires_grad=False),
-        })
+        metadata = self.kwargs.get("metadata", {})
 
+        if "scene_path" not in metadata:
+            raise ValueError("Scene path not found in metadata. Please provide a valid scene path.")
+        else:
+            print(f"Loading scene from path: {metadata['scene_path']}")
+            device = self.gauss_params_canonical["means"].device
+            self.scene = Scene3D.from_directory(metadata["scene_path"], device=device)
+
+        
+        # assert "scene" in self.kwargs["metadata"], "Scene is not available in metadata!!!"
+        # self.scene: Scene3D = self.kwargs["metadata"]["scene"]
+        self.register_buffer("gaussian_obj_ids", torch.empty(0, dtype=torch.long))
+
+        # self.all_models = torch.nn.ModuleDict()
+        
+        # setup bg model
+        # self.config.background_model.sh_degree = self.config.sh_degree
+        # self.all_models["background"] = self.config.background_model.setup(
+        #     scene_box=self.scene_box,
+        #     num_train_data=self.num_train_data,
+        #     **self.kwargs
+        # )
+
+        # # setup object models
+        # for obj_id, obj in self.scene.objects.items():
+        #     self.config.object_model.sh_degree = self.config.sh_degree
+        #     obj_model = self.config.object_model.setup(
+        #         scene_box=self.scene_box,
+        #         num_train_data=self.num_train_data,
+        #         object_id=obj_id,
+        #         **self.kwargs
+        #     )
+        #     self.all_models[f"object_{obj_id}"] = obj_model
+
+        # setup object model
+        # print(f"✅ Scene3D with {len(self.scene.objects)} objects loaded.")
+
+    # @property
+    # def background_model(self) -> SplatfactoModel:
+    #     return self.all_models["background"]
+
+    # def get_object_model(self, object_id: int) -> SplatfactoModel:
+    #     return self.all_models[f"object_{object_id}"]
 
     def state_dict(self, *args, **kwargs):
-        state = super().state_dict(*args, **kwargs)
-        if hasattr(self, "gauss_params_fixed"):
-            for name, param in self.gauss_params_fixed.items():
-                state[f"gauss_params_fixed.{name}"] = param.data
-
-        if hasattr(self, "gauss_params_pre"):
-            for name, param in self.gauss_params_pre.items():
-                state[f"gauss_params_pre.{name}"] = param.data
-        return state
+        """
+        Returns the state dictionary for the model.
+        
+        The super() call automatically includes all registered ParameterDicts 
+        (gauss_params_canonical, gauss_params_fixed) and buffers (gaussian_obj_ids).
+        """
+        return super().state_dict(*args, **kwargs)
     
     def _initialize_and_partition(self, state_dict: Dict[str, torch.Tensor]):
         """
-        Initializes the model from a full-scene checkpoint, partitioning it
-        into trainable (object) and fixed (background) sets.
-        This is typically run only once at the start of fine-tuning.
+        Initializes the model from a full-scene checkpoint, partitioning Gaussians
+        into trainable objects (in canonical space) and a fixed background.
         """
         print("🚀 Initializing from full scene: partitioning Gaussians...")
 
-        self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
-        self.obj_3d_seg.refine_mask(dilate_k=2, erode_k=1)
-        
-        # Identify Gaussians inside the object mask
-        all_means = state_dict["gauss_params.means"]
-        obj_mask = self.obj_3d_seg.query(all_means.to(self.device), dilate=True).cpu()
-        non_obj_mask = ~obj_mask
+        scene: Scene3D = self.scene
+        all_means = state_dict["gauss_params.means"].to(self.device)
+        N = all_means.shape[0]
 
-        GAUSSIAN_PARAM_NAMES: List[str] = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+        # Use a list to collect Gaussian parameters for each object
+        obj_gaussians_list = []
+        obj_ids_list = []
+        full_obj_mask = torch.zeros(N, dtype=torch.bool, device=self.device)
 
-        
-        # Partition data
-        obj_data = {name: state_dict[f"gauss_params.{name}"][obj_mask] for name in GAUSSIAN_PARAM_NAMES}
-        bg_data = {name: state_dict[f"gauss_params.{name}"][non_obj_mask] for name in GAUSSIAN_PARAM_NAMES}
+        GAUSSIAN_PARAM_NAMES = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+        # Note: state_dict keys from splatfacto are prefixed with `_`
+        STATE_DICT_MAP = {k: f"gauss_params.{k}" for k in GAUSSIAN_PARAM_NAMES}
+        STATE_DICT_MAP["features_dc"] = "gauss_params.features_dc" # Has different shape, handle carefully
+        STATE_DICT_MAP["features_rest"] = "gauss_params.features_rest"
 
-        # 1. Save pre-transformation object Gaussians
-        for name, data in obj_data.items():
-            self.gauss_params_pre[name] = torch.nn.Parameter(data.to(self.device).detach(), requires_grad=False)
 
-        # 2. Transform and load trainable object Gaussians
-        pose = self.obj_3d_seg.pose_change.cpu()
-        obj_data["means"], obj_data["quats"] = transform_gaussians(pose, obj_data["means"], obj_data["quats"])
-        for name, data in obj_data.items():
-            self.gauss_params[name].data = data.to(self.device)
+        for obj_id, obj in scene.objects.items():
+            # print(f"  🔹 Object ID: {obj_id} | Type: {type(obj)} | Content: {obj}")
+            obj_mask = obj.query(all_means, dilate=False) # Use Scene3D's query method per object
+            if obj_mask.sum() == 0:
+                print(f"⚠️ [Warning] Object {obj_id} has no Gaussians assigned.")
+                continue
 
-        # 3. Load fixed background Gaussians
+            print(f"Found {obj_mask.sum()} Gaussians for object {obj_id}.")
+            full_obj_mask |= obj_mask
+
+            # Extract Gaussians belonging to this object from the world frame
+            obj_data_world = {
+                name: state_dict[STATE_DICT_MAP[name]].to(self.device)[obj_mask] for name in GAUSSIAN_PARAM_NAMES
+            }
+
+            # Reshape features_dc if necessary (splatfacto stores it as (N, 3))
+            if obj_data_world["features_dc"].dim() == 2:
+                obj_data_world["features_dc"] = obj_data_world["features_dc"].unsqueeze(1)
+
+
+            # Get the transform to move Gaussians from world to this object's canonical frame.
+            # This is the inverse of the transform that places the canonical object in the world.
+            world_to_canonical_T = torch.inverse(obj.get_pivot_to_origin_transform().to(self.device))
+
+            # Transform means and quaternions to the canonical frame
+            means_canonical, quats_canonical = transform_gaussians(
+                world_to_canonical_T, obj_data_world["means"], obj_data_world["quats"]
+            )
+
+            # Store the canonical Gaussians for this object
+            obj_data_canonical = obj_data_world
+            obj_data_canonical["means"] = means_canonical
+            obj_data_canonical["quats"] = quats_canonical
+            obj_gaussians_list.append(obj_data_canonical)
+            obj_ids_list.append(torch.full((obj_mask.sum(),), obj_id, device=self.device, dtype=torch.long))
+
+        # --- Populate Trainable Object Parameters ---
+        if obj_gaussians_list:
+            # Concatenate all collected object Gaussians
+            final_obj_gaussians = {
+                name: torch.cat([d[name] for d in obj_gaussians_list], dim=0) for name in GAUSSIAN_PARAM_NAMES
+            }
+            # Assign to the model's canonical parameter dictionary
+            for name, data in final_obj_gaussians.items():
+                self.gauss_params_canonical[name] = torch.nn.Parameter(data, requires_grad=True)
+
+            self.gaussian_obj_ids = torch.cat(obj_ids_list, dim=0)
+
+        # --- Populate Fixed Background Parameters ---
+        bg_mask = ~full_obj_mask
+        bg_data = {
+            name: state_dict[STATE_DICT_MAP[name]].to(self.device)[bg_mask] for name in GAUSSIAN_PARAM_NAMES
+        }
+        # Reshape features_dc for background
+        if bg_data["features_dc"].dim() == 2:
+            bg_data["features_dc"] = bg_data["features_dc"].unsqueeze(1)
+
         for name, data in bg_data.items():
-            self.gauss_params_fixed[name] = torch.nn.Parameter(data.to(self.device), requires_grad=False)
-        print(f"✅ Partitioning complete. Trainable: {obj_data['means'].shape[0]}, Fixed: {bg_data['means'].shape[0]}")
+            self.gauss_params_fixed[name] = torch.nn.Parameter(data, requires_grad=False)
+
+        num_obj_gaussians = self.gauss_params_canonical["means"].shape[0]
+        num_bg_gaussians = self.gauss_params_fixed["means"].shape[0]
+        print(f"✅ Partitioning complete. Trainable Objects: {num_obj_gaussians}, Fixed Background: {num_bg_gaussians}")
 
 
     def load_state_dict(self, state_dict, **kwargs):
         """
-        Load the state_dict into the model.
+        Loads the state_dict. If it's a raw splatfacto checkpoint, it triggers
+        the partitioning process. If it's an already partitioned ArtiSplatfacto
+        checkpoint, it loads the parameters into their respective groups.
         """
-        print(f"--- Loading state_dict (Training mode: {self.training}) ---")
-
         is_partitioned_checkpoint = "gauss_params_fixed.means" in state_dict
-        GAUSSIAN_PARAM_NAMES: List[str] = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
-        if is_partitioned_checkpoint:
-            print("Resuming from a partitioned checkpoint...")
-            # Create a copy for the super() call to avoid modifying the original dict
-            super_state_dict = state_dict.copy()
-            
-            # Manually load our custom parameter groups from the original state_dict
-            for name in GAUSSIAN_PARAM_NAMES:
-                for param_group_name in ["gauss_params_fixed", "gauss_params_pre"]:
-                    key = f"{param_group_name}.{name}"
-                    if key in state_dict:
-                        # Ensure the parameter dictionary exists on the model
-                        if not hasattr(self, param_group_name):
-                            setattr(self, param_group_name, torch.nn.ParameterDict())
-                        
-                        # Load the data and create a new parameter
-                        getattr(self, param_group_name)[name] = torch.nn.Parameter(
-                            state_dict[key].to(self.device), requires_grad=False
-                        )
-
-                        # Remove the key from the dictionary we pass to super()
-                        if key in super_state_dict:
-                            del super_state_dict[key]
-            
-            # Load all remaining standard parameters (e.g., trainable gauss_params)
-            super().load_state_dict(super_state_dict, **kwargs)
-            print("✅ State restored successfully into separate groups.")
-
-        elif self.config.obj_mask_file is not None:
-            if self.training:
-                self._initialize_and_partition(state_dict)
-            else:
-                print("⚡️ Loading full scene for inference.")
-                super().load_state_dict(state_dict, **kwargs)
+        if self.training and not is_partitioned_checkpoint:
+            # This is the first run with a full scene checkpoint, so partition it.
+            self._initialize_and_partition(state_dict)
         else:
-            print("Normal checkpoint loading.")
-            super().load_state_dict(state_dict, **kwargs)
-            
-        self.step = state_dict.get("step", 0)
-        print("--- Loading complete. Gaussians are kept in separate groups. ---")
+            # Loading a pre-partitioned checkpoint or running in inference mode.
+            if is_partitioned_checkpoint:
+                print("✅ Resuming from a partitioned ArtiSplatfacto checkpoint...")
+                # Load canonical object params
+                for name, param in self.gauss_params_canonical.items():
+                    param.data = state_dict[f"gauss_params_canonical.{name}"]
+                # Load fixed background params
+                for name, param in self.gauss_params_fixed.items():
+                    param.data = state_dict[f"gauss_params_fixed.{name}"]
+                # Load object IDs
+                self.gaussian_obj_ids = state_dict["gaussian_obj_ids"]
+            else:
+                # Loading a full scene for inference without partitioning
+                print("⚡️ Loading full scene for inference. No partitioning will be performed.")
+                super().load_state_dict(state_dict, **kwargs)
 
     
     def clear_optimizer_state(self, optimizers):
@@ -285,70 +358,100 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         return loss_dict
 
-    def _get_gaussians_for_render(
-        self, time: float = 1.0, interp_mode: str = "lerp"
-    ) -> Dict[str, torch.Tensor]:
+    def _get_gaussians_for_render(self, joint_angles: Dict[str, float]) -> Dict[str, torch.Tensor]:
         """
-        Selects, interpolates, and combines Gaussians for rendering.
-        Allows LERP or SLERP interpolation between object states.
+        Applies forward kinematics to canonical object Gaussians to pose them for the
+        current frame, then merges them with the static background Gaussians.
         """
-        obj_params_post = self.gauss_params
-        has_pre_state = hasattr(self, "gauss_params_pre") and self.gauss_params_pre["means"].shape[0] > 0
+        # Return only background if no objects exist
+        if self.gauss_params_canonical["means"].shape[0] == 0:
+            return self.gauss_params_fixed
 
-        if not self.training and has_pre_state and time < 1.0:
-            print(f"Interpolating object state with time t={time:.2f} using {interp_mode.upper()}")
-            t = time
-            final_obj_params = {}
+        # 1. Apply forward kinematics (FK) to transform canonical object Gaussians
+        # The Scene3D object handles all the underlying matrix math for FK.
+        posed = self.scene.apply_articulations(
+            self.gauss_params_canonical["means"],
+            self.gauss_params_canonical["quats"],
+            joint_angles
+        )
 
-            for name in obj_params_post.keys():
-                pre = self.gauss_params_pre[name]
-                post = obj_params_post[name]
+        posed_obj_params = {
+            "means": posed["means"],
+            "quats": posed["quats"],
+            "scales": self.gauss_params_canonical["scales"],
+            "features_dc": self.gauss_params_canonical["features_dc"],
+            "features_rest": self.gauss_params_canonical["features_rest"],
+            "opacities": self.gauss_params_canonical["opacities"],
+        }
 
-                if name == "quats" and interp_mode == "slerp":
-                    final_obj_params[name] = slerp(pre, post, t)
-                else:
-                    final_obj_params[name] = (1 - t) * pre + t * post
-
-            if interp_mode == "lerp":
-                final_obj_params["quats"] = F.normalize(final_obj_params["quats"], dim=-1)
-
-        else:
-            final_obj_params = obj_params_post
-
-        if hasattr(self, "gauss_params_fixed") and self.gauss_params_fixed["means"].shape[0] > 0:
-            full_scene_params = {}
-            for name in final_obj_params.keys():
-                full_scene_params[name] = torch.cat(
-                    [final_obj_params[name], self.gauss_params_fixed[name]], dim=0
-                )
+        # 2. Merge posed object Gaussians with static background Gaussians
+        if self.gauss_params_fixed["means"].shape[0] > 0:
+            full_scene_params = {
+                name: torch.cat([posed_obj_params[name], self.gauss_params_fixed[name]], dim=0)
+                for name in posed_obj_params.keys()
+            }
             return full_scene_params
-
-        return final_obj_params
+        else:
+            return posed_obj_params
 
 
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
-        """Takes in a camera and returns a dictionary of outputs."""
+        """Takes in a camera and returns a dictionary of outputs for rendering."""
         if not isinstance(camera, Cameras):
             return {}
+        
+        if not hasattr(self, "scene"):
+            assert hasattr(self, "metadata"), "Model metadata not set"
+            assert "scene" in self.metadata, "Scene not found in metadata"
+            self.scene = self.metadata["scene"]
+            print(" Scene initialized from metadata")
 
-        # 1. Get time value for interpolation
-        time_value = 1.0
+        # 1. Get joint angles for the current frame from the scene definition
+        # We use camera.times as a proxy for the frame's timestamp or index.
+        time_value = 0.0  # Default to canonical pose (t=0)
         if hasattr(camera, "times") and camera.times is not None:
             time_value = float(camera.times.flatten()[0])
 
-        # 2. Prepare Gaussians for rendering using the new helper method
-        gaussians_to_render = self._get_gaussians_for_render(time=time_value, interp_mode="slerp")
+        print("camera metadata:", camera.metadata)
+        joint_angles = camera.metadata.get("joint_angle", None)
+        timestamp = camera.metadata.get("time", None)
+
+        import pdb; pdb.set_trace()
+
+        
+
+
+        # metadata = self.kwargs["metadata"]
+        # import pdb; pdb.set_trace()
+        # if "joint_angle" in metadata and "time" in metadata:
+        #     # If joint angles are provided in metadata, use them directly
+        #     joint_angles = metadata["joint_angle"]
+        #     timestamp = metadata["time"]
+        
+        # assert joint_angles is not None, "Joint angles missing for current frame!"
+        # assert timestamp is not None, "Timestamp missing for current frame!"
+
+        # print(f"joint_angles: {joint_angles}")
+        # print(f"timestamp: {timestamp}")
+
+        # import pdb; pdb.set_trace()
+        # Scene3D should provide the joint angles for this specific time
+
+        # 2. Prepare Gaussians for rendering by applying FK
+        gaussians_to_render = self._get_gaussians_for_render(joint_angles)
+        
+        # If no gaussians (e.g., empty scene), return black image
+        if not gaussians_to_render or gaussians_to_render["means"].shape[0] == 0:
+            H, W = int(camera.height.item()), int(camera.width.item())
+            return {"rgb": torch.zeros((H, W, 3), device=self.device)}
+
 
         # 3. Handle camera optimization
         optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera) if self.training else camera.camera_to_worlds
 
-        # As `load_state_dict` now handles merging, the crop logic and manual combining is simplified.
-        # The crop logic is omitted here for clarity but can be added back if needed,
-        # operating on the `gaussians_to_render` dictionary.
-        
         # 4. Setup for rasterization
         colors_crop = torch.cat(
-            (gaussians_to_render["features_dc"][:, None, :], gaussians_to_render["features_rest"]), dim=1
+            (gaussians_to_render["features_dc"], gaussians_to_render["features_rest"]), dim=1
         )
         camera_scale_fac = self._get_downscale_factor()
         camera.rescale_output_resolution(1 / camera_scale_fac)
@@ -365,7 +468,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         else:
             colors_crop = torch.sigmoid(colors_crop).squeeze(1)
             sh_degree_to_use = None
-        
+
         # 5. Rasterize the scene
         render, alpha, self.info = rasterization(
             means=gaussians_to_render["means"],
@@ -386,13 +489,14 @@ class ArtiSplatfactoModel(SplatfactoModel):
             absgrad=self.strategy.absgrad if isinstance(self.strategy, DefaultStrategy) else False,
             rasterize_mode=self.config.rasterize_mode,
         )
-        
-        # 6. Post-processing
+
+        # 6. Post-processing and returning outputs
         if self.training:
+            # Note: Densification and other strategies should only apply to trainable params
             self.strategy.step_pre_backward(
-                self.gauss_params, self.optimizers, self.strategy_state, self.step, self.info
+                self.gauss_params_canonical, self.optimizers, self.strategy_state, self.step, self.info
             )
-        
+
         background = self._get_background_color()
         rgb = render[..., :3] + (1 - alpha) * background
         rgb = torch.clamp(rgb, 0.0, 1.0)
@@ -404,4 +508,3 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "accumulation": alpha.squeeze(0),
             "background": background,
         }
-

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from arti_splatfacto.dataparser import ArtiSplatfactoDataParserConfig
+from arti_splatfacto.data.dataparser import ArtiSplatfactoDataParserConfig
 from arti_splatfacto.model import ArtiSplatfactoModelConfig
 
 
@@ -13,7 +13,7 @@ from nerfstudio.engine.schedulers import (
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.plugins.types import MethodSpecification
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
-from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig, FullImageDatamanager
+from arti_splatfacto.data.datamanager import FullImageDatamanagerConfig, FullImageDatamanager
 
 
 arti_splatfacto_config = MethodSpecification(
