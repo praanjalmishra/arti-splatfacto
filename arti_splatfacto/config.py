@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from arti_splatfacto.data.dataparser import ArtiSplatfactoDataParserConfig
-from arti_splatfacto.model import ArtiSplatfactoModelConfig
+from arti_splatfacto.model.model import ArtiSplatfactoModelConfig
 
 
 from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig
@@ -13,8 +13,8 @@ from nerfstudio.engine.schedulers import (
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.plugins.types import MethodSpecification
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
-from arti_splatfacto.data.datamanager import FullImageDatamanagerConfig, FullImageDatamanager
-
+# from arti_splatfacto.data.datamanager import FullImageDatamanagerConfig, FullImageDatamanager
+from arti_splatfacto.data.datamanager import ArtiSplatfactoManagerConfig
 
 arti_splatfacto_config = MethodSpecification(
     config=TrainerConfig(
@@ -24,10 +24,11 @@ arti_splatfacto_config = MethodSpecification(
         max_num_iterations=30000,
         mixed_precision=False,
         pipeline=VanillaPipelineConfig(
-            datamanager=FullImageDatamanagerConfig(
-                dataparser=ArtiSplatfactoDataParserConfig(),
+            datamanager=ArtiSplatfactoManagerConfig(
+                dataparser=ArtiSplatfactoDataParserConfig(load_dynamic_objects=True),
                 cache_images_type="uint8",
             ),
+
             model=ArtiSplatfactoModelConfig(
                 cull_alpha_thresh=0.005,
                 densify_grad_thresh=0.0005,

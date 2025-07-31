@@ -17,7 +17,7 @@ from nerfstudio.data.datamanagers.base_datamanager import (
 )
 from arti_splatfacto.data.datamanager import FullImageDatamanagerConfig, FullImageDatamanager
 from nerfstudio.models.base_model import Model, ModelConfig
-from arti_splatfacto.model import ArtiSplatfactoModelConfig
+from arti_splatfacto.model.model import ArtiSplatfactoModelConfig
 
 @dataclass
 class ArtiSplatfactoPipelineConfig(VanillaPipelineConfig):

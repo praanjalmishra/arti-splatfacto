@@ -13,7 +13,7 @@ from importlib_metadata import metadata
 import torch
 import torch.nn.functional as F
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-from nerfstudio.models.splatfacto import SplatfactoModelConfig, SplatfactoModel
+from arti_splatfacto.model.splatfacto import SplatfactoModelConfig, SplatfactoModel
 from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.utils.spherical_harmonics import RGB2SH, SH2RGB, num_sh_bases
 from nerfstudio.model_components.lib_bilagrid import BilateralGrid, color_correct, slice, total_variation_loss
@@ -70,8 +70,8 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
 
     _target: Type = field(default_factory=lambda: ArtiSplatfactoModel)
 
-    # background_model: SplatfactoModelConfig = field(default_factory=lambda: SplatfactoModelConfig)
-    # object_model: SplatfactoModelConfig = field(default_factory=lambda: SplatfactoModelConfig)
+    background_model: SplatfactoModelConfig = field(default_factory=lambda: SplatfactoModelConfig())
+    object_model: SplatfactoModelConfig = field(default_factory=lambda: SplatfactoModelConfig())
 
     # # obj_mask_file: Optional[Path] = None
     # fourier_features_dim: int = 5
@@ -87,12 +87,26 @@ class ArtiSplatfactoModel(SplatfactoModel):
         super().populate_modules()
 
         # Clean up: deregister inherited Gaussian parameter attributes (e.g., self.means, self.quats, etc.)
-        # for gs_param in list(self.gauss_params.keys()):
-        #     self._parameters.pop(gs_param, None)   # safe if it was a registered param
-        #     self._buffers.pop(gs_param, None)      # safe if it was a registered buffer
-        #     if hasattr(self, gs_param):
-        #         delattr(self, gs_param)            # now safe to delete
-        #     setattr(self, gs_param, None)  
+        for gs_param in list(self.gauss_params.keys()):
+
+            delattr(self, gs_param)            # now safe to delete
+            setattr(self, gs_param, None) 
+
+        self.metadata = self.kwargs["metadata"]
+
+        self.all_models = torch.nn.ModuleDict()
+        self.scene_path = self.metadata.get("scene_path", None)
+        self.joint_angles = self.metadata.get("joint_angles", None)
+        self.times = self.metadata.get("times", None)
+
+
+        # import pdb; pdb.set_trace()
+
+        self.all_models["background"] = self.config.background_model.setup(
+            scene_box=self.scene_box,
+            num_train_data=self.num_train_data,
+            **self.kwargs
+        )
 
         def make_param(shape, requires_grad=True):
             return torch.nn.Parameter(torch.zeros(shape).float().cuda(), requires_grad=requires_grad)
@@ -118,18 +132,12 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "opacities":     make_param((0, 1), requires_grad=False),
         })
 
-        metadata = self.kwargs.get("metadata", {})
 
-        if "scene_path" not in metadata:
-            raise ValueError("Scene path not found in metadata. Please provide a valid scene path.")
-        else:
-            print(f"Loading scene from path: {metadata['scene_path']}")
-            device = self.gauss_params_canonical["means"].device
-            self.scene = Scene3D.from_directory(metadata["scene_path"], device=device)
 
-        
-        # assert "scene" in self.kwargs["metadata"], "Scene is not available in metadata!!!"
-        # self.scene: Scene3D = self.kwargs["metadata"]["scene"]
+        device = self.gauss_params_canonical["means"].device
+        self.scene = Scene3D.from_directory(self.scene_path, device=device)
+
+
         self.register_buffer("gaussian_obj_ids", torch.empty(0, dtype=torch.long))
 
         # self.all_models = torch.nn.ModuleDict()
@@ -142,26 +150,26 @@ class ArtiSplatfactoModel(SplatfactoModel):
         #     **self.kwargs
         # )
 
-        # # setup object models
-        # for obj_id, obj in self.scene.objects.items():
-        #     self.config.object_model.sh_degree = self.config.sh_degree
-        #     obj_model = self.config.object_model.setup(
-        #         scene_box=self.scene_box,
-        #         num_train_data=self.num_train_data,
-        #         object_id=obj_id,
-        #         **self.kwargs
-        #     )
-        #     self.all_models[f"object_{obj_id}"] = obj_model
+        # setup object models
+        for obj_id, obj in self.scene.objects.items():
+            self.config.object_model.sh_degree = self.config.sh_degree
+            obj_model = self.config.object_model.setup(
+                scene_box=self.scene_box,
+                num_train_data=self.num_train_data,
+                object_id=obj_id,
+                **self.kwargs
+            )
+            self.all_models[f"object_{obj_id}"] = obj_model
 
         # setup object model
-        # print(f"✅ Scene3D with {len(self.scene.objects)} objects loaded.")
+        print(f"✅ Scene3D with {len(self.scene.objects)} objects loaded.")
 
-    # @property
-    # def background_model(self) -> SplatfactoModel:
-    #     return self.all_models["background"]
+    @property
+    def background_model(self) -> SplatfactoModel:
+        return self.all_models["background"]
 
-    # def get_object_model(self, object_id: int) -> SplatfactoModel:
-    #     return self.all_models[f"object_{object_id}"]
+    def get_object_model(self, object_id: int) -> SplatfactoModel:
+        return self.all_models[f"object_{object_id}"]
 
     def state_dict(self, *args, **kwargs):
         """
@@ -412,9 +420,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         if hasattr(camera, "times") and camera.times is not None:
             time_value = float(camera.times.flatten()[0])
 
-        print("camera metadata:", camera.metadata)
-        joint_angles = camera.metadata.get("joint_angle", None)
-        timestamp = camera.metadata.get("time", None)
+        print(f"metadata; {self.kwargs['metadata']}")
 
         import pdb; pdb.set_trace()
 
