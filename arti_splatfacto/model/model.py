@@ -45,7 +45,7 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
 
 
     _target: Type = field(default_factory=lambda: ArtiSplatfactoModel)
-    obj_mask_file: Optional[Path] = Path("/local/home/pmishra/cvg/arti-splatfacto/data/gs_t/obj_masks/obj3Dseg0.pt")
+    obj_mask_file: Optional[Path] = None
 
     # Joint configuration
     joint_pivot: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
@@ -164,53 +164,52 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
 
     def load_state_dict(self, state_dict, **kwargs):
-        """
-        Load the state_dict into the model.
-        """
         print(f"--- Loading state_dict (Training mode: {self.training}) ---")
+        print(f"obj_mask_file: {self.config.obj_mask_file}")
+        assert self.config.obj_mask_file is not None and self.config.obj_mask_file.exists()
 
+        # ✅ Always load articulation info from mask
+        if self.config.obj_mask_file is not None and self.config.obj_mask_file.exists():
+            self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
+            if hasattr(self.obj_3d_seg, 'joint_axis') and self.obj_3d_seg.joint_axis is not None:
+                self.joint_axis = self.obj_3d_seg.joint_axis.to(self.device)
+                print(f"📐 Updated joint axis from mask: {self.joint_axis}")
+            if hasattr(self.obj_3d_seg, 'joint_pivot') and self.obj_3d_seg.joint_pivot is not None:
+                self.joint_pivot = self.obj_3d_seg.joint_pivot.to(self.device)
+                print(f"📍 Updated joint pivot from mask: {self.joint_pivot}")
+
+        # === Checkpoint logic ===
         is_partitioned_checkpoint = "gauss_params_fixed.means" in state_dict
         GAUSSIAN_PARAM_NAMES: List[str] = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
         if is_partitioned_checkpoint:
             print("Resuming from a partitioned checkpoint...")
-            # Create a copy for the super() call to avoid modifying the original dict
             super_state_dict = state_dict.copy()
-            
-            # Manually load our custom parameter groups from the original state_dict
             for name in GAUSSIAN_PARAM_NAMES:
                 for param_group_name in ["gauss_params_fixed", "gauss_params_pre"]:
                     key = f"{param_group_name}.{name}"
                     if key in state_dict:
-                        # Ensure the parameter dictionary exists on the model
                         if not hasattr(self, param_group_name):
                             setattr(self, param_group_name, torch.nn.ParameterDict())
-                        
-                        # Load the data and create a new parameter
                         getattr(self, param_group_name)[name] = torch.nn.Parameter(
                             state_dict[key].to(self.device), requires_grad=False
                         )
-
-                        # Remove the key from the dictionary we pass to super()
                         if key in super_state_dict:
                             del super_state_dict[key]
-            
-            # Load all remaining standard parameters (e.g., trainable gauss_params)
             super().load_state_dict(super_state_dict, **kwargs)
             print("✅ State restored successfully into separate groups.")
-
+        
         elif self.config.obj_mask_file is not None:
-            if self.training:
-                self._initialize_and_partition(state_dict)
-            else:
-                print("⚡️ Loading full scene for inference.")
-                super().load_state_dict(state_dict, **kwargs)
+            print("⚡️ Loading full scene for inference.")
+            super().load_state_dict(state_dict, **kwargs)
+        
         else:
             print("Normal checkpoint loading.")
             super().load_state_dict(state_dict, **kwargs)
-            
+
         self.step = state_dict.get("step", 0)
         print("--- Loading complete. Gaussians are kept in separate groups. ---")
+
 
     
     def clear_optimizer_state(self, optimizers):
@@ -284,30 +283,25 @@ class ArtiSplatfactoModel(SplatfactoModel):
     
 
     def _get_joint_angle_for_camera(self, camera: Cameras) -> float:
-        """Extract joint angle from camera metadata or time"""
-        
-        # Method 1: From camera metadata (preferred)
-        if hasattr(camera, 'metadata') and camera.metadata is not None:
-            cam_idx = camera.metadata.get('cam_idx', None)
-            if cam_idx is not None and self.joint_angles is not None:
-                if cam_idx < len(self.joint_angles):
-                    joint_angle = self.joint_angles[cam_idx].item()
-                    if self.step % 500 == 0:  # Less frequent logging
-                        print(f"📹 Frame {cam_idx}: joint_angle = {joint_angle:.4f} rad ({joint_angle*180/3.14159:.1f}°)")
-                    return joint_angle
-        
-        # Method 2: From camera times
+        """Extract joint angle from camera.times (interpolated) or metadata (fixed)"""
+
+        # 🎯 Method 1: Use interpolated time slider
         if hasattr(camera, 'times') and camera.times is not None and self.joint_angles is not None:
             time_val = float(camera.times.flatten()[0])
             num_frames = len(self.joint_angles)
             frame_idx = int(time_val * (num_frames - 1))
             frame_idx = max(0, min(frame_idx, num_frames - 1))
             joint_angle = self.joint_angles[frame_idx].item()
-            if self.step % 500 == 0:
-                print(f"⏰ Time {time_val:.3f} -> Frame {frame_idx}: joint_angle = {joint_angle:.4f} rad")
+            print(f"⏰ Time {time_val:.3f} → Joint angle {joint_angle:.3f} rad")
             return joint_angle
-        
-        return 0.0  # No articulation
+
+        # ⛑️ Fallback: static camera with metadata
+        if hasattr(camera, 'metadata') and camera.metadata is not None:
+            joint_angle = camera.metadata.get("joint_angle", 0.0)
+            print(f"📦 Metadata fallback → Joint angle {joint_angle:.3f} rad")
+            return joint_angle
+
+        return 0.0
     
 
     def _apply_articulation_to_canonical_params(self, joint_angle: float) -> Dict[str, torch.Tensor]:
@@ -469,5 +463,8 @@ def apply_joint_transform(means, quats, joint_pivot, joint_axis, joint_angle):
         joint_quat.unsqueeze(0).expand_as(quats), 
         quats
     )
+    # print(f"Joint axis: {joint_axis.cpu().numpy()}, Pivot: {joint_pivot.cpu().numpy()}")
+    # print(f"Gaussian mean sample: {means[0].detach().cpu().numpy()}")
+
     
     return means_rotated, quats_rotated
