@@ -169,21 +169,20 @@ class ArtiSplatfactoModel(SplatfactoModel):
         assert self.config.obj_mask_file is not None and self.config.obj_mask_file.exists()
 
         # ✅ Always load articulation info from mask
-        if self.config.obj_mask_file is not None and self.config.obj_mask_file.exists():
-            self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
-            if hasattr(self.obj_3d_seg, 'joint_axis') and self.obj_3d_seg.joint_axis is not None:
-                self.joint_axis = self.obj_3d_seg.joint_axis.to(self.device)
-                print(f"📐 Updated joint axis from mask: {self.joint_axis}")
-            if hasattr(self.obj_3d_seg, 'joint_pivot') and self.obj_3d_seg.joint_pivot is not None:
-                self.joint_pivot = self.obj_3d_seg.joint_pivot.to(self.device)
-                print(f"📍 Updated joint pivot from mask: {self.joint_pivot}")
+        self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
+        if hasattr(self.obj_3d_seg, 'joint_axis') and self.obj_3d_seg.joint_axis is not None:
+            self.joint_axis = self.obj_3d_seg.joint_axis.to(self.device)
+            print(f"📐 Updated joint axis from mask: {self.joint_axis}")
+        if hasattr(self.obj_3d_seg, 'joint_pivot') and self.obj_3d_seg.joint_pivot is not None:
+            self.joint_pivot = self.obj_3d_seg.joint_pivot.to(self.device)
+            print(f"📍 Updated joint pivot from mask: {self.joint_pivot}")
 
         # === Checkpoint logic ===
         is_partitioned_checkpoint = "gauss_params_fixed.means" in state_dict
         GAUSSIAN_PARAM_NAMES: List[str] = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
         if is_partitioned_checkpoint:
-            print("Resuming from a partitioned checkpoint...")
+            print("✅ Resuming from a partitioned checkpoint...")
             super_state_dict = state_dict.copy()
             for name in GAUSSIAN_PARAM_NAMES:
                 for param_group_name in ["gauss_params_fixed", "gauss_params_pre"]:
@@ -194,21 +193,21 @@ class ArtiSplatfactoModel(SplatfactoModel):
                         getattr(self, param_group_name)[name] = torch.nn.Parameter(
                             state_dict[key].to(self.device), requires_grad=False
                         )
-                        if key in super_state_dict:
-                            del super_state_dict[key]
+                        del super_state_dict[key]
             super().load_state_dict(super_state_dict, **kwargs)
             print("✅ State restored successfully into separate groups.")
-        
-        elif self.config.obj_mask_file is not None:
-            print("⚡️ Loading full scene for inference.")
-            super().load_state_dict(state_dict, **kwargs)
-        
+
+        elif self.training:
+            print("🚀 Training mode: partitioning full scene into object + background...")
+            self._initialize_and_partition(state_dict)
+
         else:
-            print("Normal checkpoint loading.")
+            print("⚡️ Inference mode: loading full scene without partitioning.")
             super().load_state_dict(state_dict, **kwargs)
 
         self.step = state_dict.get("step", 0)
-        print("--- Loading complete. Gaussians are kept in separate groups. ---")
+        print("--- ✅ Loading complete. Gaussians are correctly set up. ---")
+
 
 
     
