@@ -18,18 +18,25 @@ class ArtiDataset(InputDataset):
     def __init__(self, dataparser_outputs: DataparserOutputs, scale_factor: float = 1.0):
         super().__init__(dataparser_outputs, scale_factor)
 
-        self.has_joint_angle = any("joint_angle" in (getattr(cam, "metadata", {}) or {}) for cam in self.cameras)
-        self.has_time = any("time" in (getattr(cam, "metadata", {}) or {}) for cam in self.cameras)
+        self.dp_metadata = dataparser_outputs.metadata or {}
+        self.has_joint_angle = "joint_angles" in self.dp_metadata
+        self.has_time = "times" in self.dp_metadata
 
     def get_metadata(self, data: Dict) -> Dict:
         """Returns per-frame metadata."""
         image_idx = data["image_idx"]
-        cam = self.cameras[image_idx]
 
         metadata = {}
         if self.has_joint_angle:
-            metadata["joint_angle"] = cam.metadata.get("joint_angle", None)
+            metadata["joint_angle"] = (
+                self.dp_metadata["joint_angles"][image_idx].item()
+                if self.dp_metadata["joint_angles"] is not None else None
+            )
         if self.has_time:
-            metadata["time"] = cam.metadata.get("time", None)
+            metadata["time"] = (
+                self.dp_metadata["times"][image_idx].item()
+                if self.dp_metadata["times"] is not None else None
+            )
         return metadata
+
 

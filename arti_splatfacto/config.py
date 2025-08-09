@@ -30,8 +30,8 @@ arti_splatfacto_config = MethodSpecification(
             ),
 
             model=ArtiSplatfactoModelConfig(
-                cull_alpha_thresh=0.005,
-                densify_grad_thresh=0.0005,
+                # cull_alpha_thresh=0.005,
+                # densify_grad_thresh=0.0005,
             ),
         ),
         optimizers={

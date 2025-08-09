@@ -12,7 +12,7 @@ except ImportError:
 import torch
 import torch.nn.functional as F
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-from nerfstudio.models.splatfacto import SplatfactoModelConfig, SplatfactoModel
+from arti_splatfacto.model.splatfacto import SplatfactoModelConfig, SplatfactoModel
 from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.utils.spherical_harmonics import RGB2SH, SH2RGB, num_sh_bases
 from nerfstudio.model_components.lib_bilagrid import BilateralGrid, color_correct, slice, total_variation_loss
@@ -64,6 +64,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         self.joint_pivot = torch.tensor(self.config.joint_pivot, dtype=torch.float32)
         self.joint_axis = torch.tensor(self.config.joint_axis, dtype=torch.float32)
         self.joint_axis = F.normalize(self.joint_axis, dim=0)
+        
         
         # Get joint angles from metadata if available
         self.metadata = kwargs.get("metadata", {})
@@ -172,10 +173,37 @@ class ArtiSplatfactoModel(SplatfactoModel):
         self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
         if hasattr(self.obj_3d_seg, 'joint_axis') and self.obj_3d_seg.joint_axis is not None:
             self.joint_axis = self.obj_3d_seg.joint_axis.to(self.device)
-            print(f"📐 Updated joint axis from mask: {self.joint_axis}")
+            print(f"Updated joint axis from mask: {self.joint_axis}")
         if hasattr(self.obj_3d_seg, 'joint_pivot') and self.obj_3d_seg.joint_pivot is not None:
             self.joint_pivot = self.obj_3d_seg.joint_pivot.to(self.device)
-            print(f"📍 Updated joint pivot from mask: {self.joint_pivot}")
+            print(f"Updated joint pivot from mask: {self.joint_pivot}")
+        if hasattr(self.obj_3d_seg, 'joint_angle') and self.obj_3d_seg.joint_angle is not None:
+            self.max_joint_angle = self.obj_3d_seg.joint_angle.to(self.device)
+            print(f"Updated joint angles from mask: {self.max_joint_angle}")
+
+        # === AUTO-DETECT IDFT USAGE AND RESIZE PARAMETERS ===
+        if "gauss_params.features_dc" in state_dict:
+            checkpoint_dc_dim = state_dict["gauss_params.features_dc"].shape[-1]
+            current_dc_dim = self.gauss_params["features_dc"].shape[-1]
+            
+            print(f"Checkpoint features_dc dim: {checkpoint_dc_dim}, Current model dim: {current_dc_dim}")
+            
+            if checkpoint_dc_dim == self.config.fourier_features_dim and current_dc_dim == 3:
+                print(f"🔄 Detected IDFT checkpoint, resizing model parameters from {current_dc_dim} to {checkpoint_dc_dim}")
+                self.config.use_idft_for_sh = True
+                # Resize the current model's parameters to match checkpoint
+                self._resize_features_dc_to_idft()
+                
+            elif checkpoint_dc_dim == 3 and current_dc_dim == self.config.fourier_features_dim:
+                print(f"🔄 Detected RGB checkpoint, will convert during loading")
+                self.config.use_idft_for_sh = False
+                # Keep current model size, but pad the checkpoint data
+                
+            elif checkpoint_dc_dim == current_dc_dim:
+                print(f"✅ Dimensions match ({checkpoint_dc_dim})")
+                self.config.use_idft_for_sh = (checkpoint_dc_dim == self.config.fourier_features_dim)
+            else:
+                print(f"WARNING: Unexpected dimension combination - checkpoint: {checkpoint_dc_dim}, model: {current_dc_dim}")
 
         # === Checkpoint logic ===
         is_partitioned_checkpoint = "gauss_params_fixed.means" in state_dict
@@ -183,6 +211,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         if is_partitioned_checkpoint:
             print("✅ Resuming from a partitioned checkpoint...")
+
             super_state_dict = state_dict.copy()
             for name in GAUSSIAN_PARAM_NAMES:
                 for param_group_name in ["gauss_params_fixed", "gauss_params_pre"]:
@@ -194,20 +223,90 @@ class ArtiSplatfactoModel(SplatfactoModel):
                             state_dict[key].to(self.device), requires_grad=False
                         )
                         del super_state_dict[key]
-            super().load_state_dict(super_state_dict, **kwargs)
+
+            # Handle dimension mismatch for partitioned checkpoints
+            if "gauss_params.features_dc" in super_state_dict:
+                checkpoint_dc_dim = super_state_dict["gauss_params.features_dc"].shape[-1]
+                current_dc_dim = self.gauss_params["features_dc"].shape[-1]
+                
+                if checkpoint_dc_dim == 3 and current_dc_dim == self.config.fourier_features_dim:
+                    # Pad RGB checkpoint to IDFT dimensions
+                    print(f"🛠️ Padding checkpoint features_dc from RGB to IDFT")
+                    rgb_data = super_state_dict["gauss_params.features_dc"]
+                    padded = torch.zeros((rgb_data.shape[0], self.config.fourier_features_dim), device=rgb_data.device)
+                    padded[:, :3] = rgb_data
+                    super_state_dict["gauss_params.features_dc"] = padded
+
+            # Important: load with strict=False to allow partitioned keys to be missing
+            load_kwargs = {k: v for k, v in kwargs.items() if k != 'strict'}
+            load_kwargs['strict'] = False
+            super().load_state_dict(super_state_dict, **load_kwargs)
             print("✅ State restored successfully into separate groups.")
 
         elif self.training:
+            # === HANDLE DIMENSION MISMATCH FOR TRAINING ===
+            checkpoint_dc_dim = state_dict["gauss_params.features_dc"].shape[-1]
+            if checkpoint_dc_dim == 3 and self.config.use_idft_for_sh:
+                # Pad RGB checkpoint to IDFT dimensions before partitioning
+                print(f"🛠️ Padding checkpoint features_dc from RGB({checkpoint_dc_dim}) to IDFT({self.config.fourier_features_dim})")
+                rgb_data = state_dict["gauss_params.features_dc"]
+                padded = torch.zeros((rgb_data.shape[0], self.config.fourier_features_dim), device=rgb_data.device)
+                padded[:, :3] = rgb_data
+                state_dict["gauss_params.features_dc"] = padded
+
             print("🚀 Training mode: partitioning full scene into object + background...")
             self._initialize_and_partition(state_dict)
 
         else:
             print("⚡️ Inference mode: loading full scene without partitioning.")
+            
+            # Handle dimension mismatch for inference
+            if "gauss_params.features_dc" in state_dict:
+                checkpoint_dc_dim = state_dict["gauss_params.features_dc"].shape[-1]
+                current_dc_dim = self.gauss_params["features_dc"].shape[-1]
+                
+                if checkpoint_dc_dim == 3 and current_dc_dim == self.config.fourier_features_dim:
+                    print(f"🛠️ Padding inference checkpoint features_dc from RGB to IDFT")
+                    rgb_data = state_dict["gauss_params.features_dc"]
+                    padded = torch.zeros((rgb_data.shape[0], self.config.fourier_features_dim), device=rgb_data.device)
+                    padded[:, :3] = rgb_data
+                    state_dict["gauss_params.features_dc"] = padded
+            
             super().load_state_dict(state_dict, **kwargs)
 
         self.step = state_dict.get("step", 0)
         print("--- ✅ Loading complete. Gaussians are correctly set up. ---")
 
+
+    def _resize_features_dc_to_idft(self):
+        """Resize the model's features_dc parameters to match IDFT dimensions"""
+        fdim = self.config.fourier_features_dim
+        
+        # Resize main gauss_params
+        current_dc = self.gauss_params["features_dc"].data
+        if current_dc.shape[-1] == 3:
+            new_dc = torch.zeros((current_dc.shape[0], fdim), device=current_dc.device, dtype=current_dc.dtype)
+            new_dc[:, :3] = current_dc
+            self.gauss_params["features_dc"] = torch.nn.Parameter(new_dc, requires_grad=True)
+            print(f"✅ Resized gauss_params.features_dc to {new_dc.shape}")
+        
+        # Resize fixed params if they exist
+        if hasattr(self, 'gauss_params_fixed') and self.gauss_params_fixed["features_dc"].shape[0] > 0:
+            current_fixed_dc = self.gauss_params_fixed["features_dc"].data
+            if current_fixed_dc.shape[-1] == 3:
+                new_fixed_dc = torch.zeros((current_fixed_dc.shape[0], fdim), device=current_fixed_dc.device, dtype=current_fixed_dc.dtype)
+                new_fixed_dc[:, :3] = current_fixed_dc
+                self.gauss_params_fixed["features_dc"] = torch.nn.Parameter(new_fixed_dc, requires_grad=False)
+                print(f"✅ Resized gauss_params_fixed.features_dc to {new_fixed_dc.shape}")
+        
+        # Resize canonical params if they exist  
+        if hasattr(self, 'gauss_params_canonical') and self.gauss_params_canonical["features_dc"].shape[0] > 0:
+            current_canonical_dc = self.gauss_params_canonical["features_dc"].data
+            if current_canonical_dc.shape[-1] == 3:
+                new_canonical_dc = torch.zeros((current_canonical_dc.shape[0], fdim), device=current_canonical_dc.device, dtype=current_canonical_dc.dtype)
+                new_canonical_dc[:, :3] = current_canonical_dc
+                self.gauss_params_canonical["features_dc"] = torch.nn.Parameter(new_canonical_dc, requires_grad=False)
+                print(f"✅ Resized gauss_params_canonical.features_dc to {new_canonical_dc.shape}")
 
 
     
@@ -369,6 +468,52 @@ class ArtiSplatfactoModel(SplatfactoModel):
         # 1. Prepare articulated Gaussians (maintaining gradient flow)
         gaussians_to_render = self._get_gaussians_for_render(camera)
 
+        # === IDFT COLOR MODULATION (FIXED) ===
+        if self.config.use_idft_for_sh:
+            # 1. Get joint angle & IDFT embedding
+            joint_angle = self._get_joint_angle_for_camera(camera)
+            theta = joint_angle / self.max_joint_angle if hasattr(self, 'max_joint_angle') else joint_angle
+            idft_embed = IDFT(torch.tensor([theta], device=self.device), self.config.fourier_features_dim)  # [1, D]
+
+            dc = gaussians_to_render["features_dc"]  # [N_total, D_or_3]
+
+            # 2. Determine object vs background split
+            if hasattr(self, "gauss_params_fixed") and self.gauss_params_fixed["means"].shape[0] > 0:
+                num_obj = self.gauss_params["means"].shape[0]
+                num_bg = self.gauss_params_fixed["means"].shape[0]
+                
+                # Object comes first, background second in concatenated tensors
+                dc_obj = dc[:num_obj]        # shape [N_obj, D]
+                dc_bg = dc[num_obj:]         # shape [N_bg, D_or_3]
+            else:
+                # No background, all are object Gaussians
+                dc_obj = dc
+                dc_bg = None
+
+            # 3. Modulate object Gaussians
+            if dc_obj.shape[-1] != self.config.fourier_features_dim:
+                raise ValueError(f"Expected object features_dc dim {self.config.fourier_features_dim}, got {dc_obj.shape[-1]}")
+
+            dc_obj_modulated = (dc_obj * idft_embed).sum(dim=-1, keepdim=True).expand(-1, 3)  # [N_obj, 3]
+
+            # 4. Handle background colors properly
+            if dc_bg is not None:
+                if dc_bg.shape[-1] == self.config.fourier_features_dim:
+                    # Background also has IDFT features - convert to RGB using identity (theta=0)
+                    identity_embed = IDFT(torch.tensor([0.0], device=self.device), self.config.fourier_features_dim)
+                    dc_bg_rgb = (dc_bg * identity_embed).sum(dim=-1, keepdim=True).expand(-1, 3)
+                elif dc_bg.shape[-1] == 3:
+                    # Background already in RGB
+                    dc_bg_rgb = dc_bg
+                else:
+                    print(f"WARNING: Unexpected background features_dc dimension: {dc_bg.shape[-1]}")
+                    dc_bg_rgb = dc_bg
+
+                # 5. Concatenate object + background
+                gaussians_to_render["features_dc"] = torch.cat([dc_obj_modulated, dc_bg_rgb], dim=0)
+            else:
+                gaussians_to_render["features_dc"] = dc_obj_modulated
+
         # 2. Handle camera optimization
         optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera) if self.training else camera.camera_to_worlds
 
@@ -395,8 +540,8 @@ class ArtiSplatfactoModel(SplatfactoModel):
         
         # 4. Rasterize (gradients flow through gaussians_to_render back to self.gauss_params)
         render, alpha, self.info = rasterization(
-            means=gaussians_to_render["means"],      # Has gradients from self.gauss_params["means"]
-            quats=gaussians_to_render["quats"],      # Has gradients from self.gauss_params["quats"]
+            means=gaussians_to_render["means"],
+            quats=gaussians_to_render["quats"],
             scales=torch.exp(gaussians_to_render["scales"]),
             opacities=torch.sigmoid(gaussians_to_render["opacities"]).squeeze(-1),
             colors=colors_crop,
@@ -436,7 +581,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "accumulation": alpha.squeeze(0),
             "background": background,
         }
-    
 
 def apply_joint_transform(means, quats, joint_pivot, joint_axis, joint_angle):
     """
@@ -467,3 +611,21 @@ def apply_joint_transform(means, quats, joint_pivot, joint_axis, joint_angle):
 
     
     return means_rotated, quats_rotated
+
+
+def IDFT(theta: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    Returns IDFT embedding for the given joint angle theta.
+    Shape: [B, dim] where B is batch size or 1
+    """
+    import math
+    if isinstance(theta, float):
+        theta = torch.tensor(theta)
+    t = theta.view(-1, 1)  # shape [B, 1]
+    idft = torch.zeros(t.shape[0], dim, dtype=t.dtype, device=t.device)
+    indices = torch.arange(dim, dtype=torch.int, device=t.device)
+    even_indices = indices[::2]
+    odd_indices = indices[1::2]
+    idft[:, even_indices] = torch.cos(t * even_indices * 2 * math.pi / dim)
+    idft[:, odd_indices] = torch.sin(t * (odd_indices + 1) * 2 * math.pi / dim)
+    return idft  # [B, dim]

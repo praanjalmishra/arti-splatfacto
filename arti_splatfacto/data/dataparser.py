@@ -1,73 +1,3 @@
-# from __future__ import annotations
-
-# from dataclasses import dataclass, field
-# from os import times
-# from typing import Literal, Type, Optional
-# from nerfstudio.data.dataparsers.nerfstudio_dataparser import NerfstudioDataParserConfig, Nerfstudio
-# from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserConfig, DataparserOutputs
-# from nerfstudio.utils.io import load_from_json
-# from arti_splatfacto.obj_3d_seg import Object3DSeg
-# from arti_splatfacto.scene_3d import Scene3D
-
-# import torch
-# import json
-
-# @dataclass
-# class ArtiSplatfactoDataParserConfig(NerfstudioDataParserConfig):
-#     _target: Type = field(default_factory=lambda: ArtiSplatfactoDataParser)
-#     metadata_file: str = "transforms.json"
-#     obj_mask_dir: str = "obj_masks/"
-#     load_dynamic_objects: bool = True
-
-# @dataclass
-# class ArtiSplatfactoDataParser(Nerfstudio):
-#     config: ArtiSplatfactoDataParserConfig
-#     includes_time: bool = True
-
-
-#     def _generate_dataparser_outputs(self, split="train"):
-#         dataparser_outputs: DataparserOutputs = super()._generate_dataparser_outputs(split)
-
-#         assert self.config.data.exists(), f"Data folder {self.config.data} does not exist."
-
-
-#         # Load your transform.json
-#         transform_path = self.config.data / self.config.metadata_file
-#         transform_json = load_from_json(transform_path)
-
-#         frames = transform_json.get("frames", [])
-#         joint_angles = []
-#         times = []
-
-#         for frame in frames:
-#             joint_angles.append(float(frame.get("joint_angle", 0.0)))
-#             times.append(float(frame.get("time", 0.0)))
-
-#         # Convert to tensors
-#         joint_angles = torch.tensor(joint_angles, dtype=torch.float32)
-#         times = torch.tensor(times, dtype=torch.float32)
-
-
-#         # Store these in metadata
-#         dataparser_outputs.metadata["joint_angle"] = joint_angles
-#         dataparser_outputs.metadata["time"] = times
-
-#         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#         if self.config.load_dynamic_objects:
-#             # Load object segments
-#             obj_seg_dir = self.config.data / self.config.obj_mask_dir
-#             if obj_seg_dir.exists():
-#                 scene = Scene3D.from_directory(obj_seg_dir, device=device)
-#                 dataparser_outputs.metadata["scene"] = scene
-#             else:
-#                 raise FileNotFoundError(f"Object segment directory {obj_seg_dir} does not exist.")
-            
-#         print(f"metadata keys: {list(dataparser_outputs.metadata.keys())}")
-#         print(f"joint_angle shape: {dataparser_outputs.metadata['joint_angle'].shape}")
-
-#         return dataparser_outputs
-
-
 """Data parser for nerfstudio datasets."""
 
 from __future__ import annotations
@@ -85,6 +15,12 @@ from nerfstudio.cameras import camera_utils
 from nerfstudio.cameras.cameras import CAMERA_MODEL_TO_TYPE, Cameras, CameraType
 from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserConfig, DataparserOutputs
 from nerfstudio.data.scene_box import SceneBox
+from nerfstudio.data.utils.dataparsers_utils import (
+    get_train_eval_split_all,
+    get_train_eval_split_filename,
+    get_train_eval_split_fraction,
+    get_train_eval_split_interval,
+)
 
 from nerfstudio.utils.io import load_from_json
 from nerfstudio.utils.rich_utils import CONSOLE
@@ -134,103 +70,359 @@ class ArtiSplatfactoDataParserConfig(DataParserConfig):
     load_dynamic_objects: bool = True
 
 
+# @dataclass
+# class ArtiSplatfactoDataParser(DataParser):
+#     """DataParser for ArtiSplatfacto scenes."""
+
+#     config: ArtiSplatfactoDataParserConfig
+#     downscale_factor: Optional[int] = None
+#     includes_time: bool = True
+
+#     def _generate_dataparser_outputs(self, split="train"):
+#         assert self.config.data.exists(), f"Data directory {self.config.data} does not exist."
+
+#         # Load transforms file
+#         meta = load_from_json(self.config.data / "transforms_post.json")
+#         data_dir = self.config.data
+#         frames = meta["frames"]
+
+#         # Initialize lists
+#         poses, image_filenames, depth_filenames = [], [], []
+#         times, joint_angles = [], []
+
+#         for frame in frames:
+#             image_filenames.append(data_dir / frame["file_path"])
+#             poses.append(np.array(frame["transform_matrix"], dtype=np.float32))
+
+#             depth_path = frame.get("depth_file_path", None)
+#             if depth_path is not None:
+#                 depth_filenames.append(data_dir / depth_path)
+#             else:
+#                 depth_filenames.append(None)
+
+#             # Only load time and joint if enabled
+#             if self.config.load_dynamic_objects:
+#                 times.append(frame.get("time", 0.0))
+#                 joint_angles.append(frame.get("joint_angle", 0.0))
+
+#         poses = torch.from_numpy(np.array(poses, dtype=np.float32))
+
+#         if self.config.load_dynamic_objects:
+#             times = torch.tensor(times, dtype=torch.float32)
+#             joint_angles = torch.tensor(joint_angles, dtype=torch.float32)
+
+#         # Scale the translation component
+#         scale_factor = self.config.scale_factor
+#         poses[:, :3, 3] *= scale_factor
+
+#         N = len(image_filenames)
+
+#         if "camera_model" in meta:
+#             camera_type = CAMERA_MODEL_TO_TYPE[meta["camera_model"]]
+#         else:
+#             camera_type = CameraType.PERSPECTIVE
+
+#         # Intrinsics
+#         distortion_params = torch.tensor([
+#             meta.get("k1", 0.0), meta.get("k2", 0.0),
+#             meta.get("p1", 0.0), meta.get("p2", 0.0)
+#         ], dtype=torch.float32).expand(N, -1)
+
+#         cameras = Cameras(
+#             fx=meta["fl_x"],
+#             fy=meta["fl_y"],
+#             cx=meta["cx"],
+#             cy=meta["cy"],
+#             height=meta["h"],
+#             width=meta["w"],
+#             camera_to_worlds=poses[:, :3, :4],
+#             camera_type=camera_type,
+#             distortion_params=distortion_params,
+#             times=times if self.config.load_dynamic_objects and self.includes_time else None,
+#         )
+
+#         # per-camera metadata
+#         if self.config.load_dynamic_objects:
+#             for i, cam in enumerate(cameras.flatten()):
+#                 if cam.metadata is None:
+#                     cam.metadata = {}
+#                 cam.metadata["joint_angle"] = joint_angles[i].item()
+#                 cam.metadata["time"] = times[i].item()
+
+
+#         # Scene bounding box
+#         aabb_scale = self.config.scene_scale
+#         scene_box = SceneBox(
+#             aabb=torch.tensor([[-aabb_scale] * 3, [aabb_scale] * 3], dtype=torch.float32)
+#         )
+
+#         # Collect metadata
+#         metadata = {
+#             "scene_path": str(data_dir / self.config.obj_mask_dir),
+#             "depth_filenames": depth_filenames,
+#         }
+#         if self.config.load_dynamic_objects:
+#             metadata["joint_angles"] = joint_angles
+#             metadata["times"] = times
+            
+#         return DataparserOutputs(
+#             image_filenames=image_filenames,
+#             cameras=cameras,
+#             scene_box=scene_box,
+#             metadata=metadata,
+#             dataparser_scale=scale_factor,
+#             dataparser_transform=torch.eye(4),
+#         )
+    
+
+
 @dataclass
 class ArtiSplatfactoDataParser(DataParser):
-    """DataParser for ArtiSplatfacto scenes."""
-
+    """DataParser for ArtiSplatfacto scenes with per-frame depth and joint info."""
     config: ArtiSplatfactoDataParserConfig
     downscale_factor: Optional[int] = None
-    includes_time: bool = True
+    includes_time: bool = True  # Cameras.times is supported
 
-    def _generate_dataparser_outputs(self, split="train"):
+    def _generate_dataparser_outputs(self, split: str = "train") -> DataparserOutputs:
         assert self.config.data.exists(), f"Data directory {self.config.data} does not exist."
 
-        # Load transforms file
-        meta = load_from_json(self.config.data / "transforms_post.json")
-        data_dir = self.config.data
+        # load metadata
+        if self.config.data.suffix == ".json":
+            meta = load_from_json(self.config.data)  
+            data_dir = self.config.data.parent
+        else:
+            meta = load_from_json(self.config.data / "transforms_post.json")
+            data_dir = self.config.data
+
+        fx_fixed = "fl_x" in meta
+        fy_fixed = "fl_y" in meta
+        cx_fixed = "cx" in meta
+        cy_fixed = "cy" in meta
+        h_fixed  = "h" in meta
+        w_fixed  = "w" in meta
+
+        distort_fixed = False
+        for k in ["distortion_params", "k1", "k2", "k3", "k4", "p1", "p2"]:
+            if k in meta:
+                distort_fixed = True
+                break
+
         frames = meta["frames"]
+        fnames_resolved = []
+        for fr in frames:
+            fp = Path(fr["file_path"])
+            fnames_resolved.append(self._get_fname(fp, data_dir))
+        order = np.argsort([str(p) for p in fnames_resolved])
+        frames = [frames[i] for i in order]
 
-        # Initialize lists
-        poses, image_filenames = [], []
-        times, joint_angles = [], []
+        poses = []
+        image_filenames, mask_filenames, depth_filenames = [], [], []
 
-        for frame in frames:
-            image_filenames.append(data_dir / frame["file_path"])
-            poses.append(np.array(frame["transform_matrix"], dtype=np.float32))
+        fx_list, fy_list, cx_list, cy_list = [], [], [], []
+        h_list, w_list, distort_list = [], [], []
 
-            # Only load time and joint if enabled
+        times_list, joint_list = [], []
+
+        for fr in frames:
+            img_path = self._get_fname(Path(fr["file_path"]), data_dir, downsample_folder_prefix="images_")
+            image_filenames.append(img_path)
+
+            poses.append(np.array(fr["transform_matrix"], dtype=np.float32))
+
+            if not fx_fixed: fx_list.append(float(fr["fl_x"]))
+            if not fy_fixed: fy_list.append(float(fr["fl_y"]))
+            if not cx_fixed: cx_list.append(float(fr["cx"]))
+            if not cy_fixed: cy_list.append(float(fr["cy"]))
+            if not h_fixed:  h_list.append(int(fr["h"]))
+            if not w_fixed:  w_list.append(int(fr["w"]))
+
+            if not distort_fixed:
+                if "distortion_params" in fr:
+                    distort_list.append(torch.tensor(fr["distortion_params"], dtype=torch.float32))
+                else:
+                    distort_list.append(
+                        camera_utils.get_distortion_params(
+                            k1=float(fr.get("k1", 0.0)),
+                            k2=float(fr.get("k2", 0.0)),
+                            k3=float(fr.get("k3", 0.0)),
+                            k4=float(fr.get("k4", 0.0)),
+                            p1=float(fr.get("p1", 0.0)),
+                            p2=float(fr.get("p2", 0.0)),
+                        )
+                    )
+
+            if "depth_file_path" in fr and fr["depth_file_path"] is not None:
+                depth_filenames.append(self._get_fname(Path(fr["depth_file_path"]), data_dir, "depths_"))
+            else:
+                depth_filenames.append(None)
+
+            # mask_rel = Path(fr.get("mask_path", "")) if "mask_path" in fr else None
+            # if mask_rel is not None and str(mask_rel) != "":
+            #     mask_filenames.append(self._get_fname(mask_rel, data_dir, "masks_"))
+            # else:
+            #     guess = (Path(self.config.obj_mask_dir) / Path(img_path).name)
+            #     guess_full = self._get_fname(guess, data_dir, "masks_")
+            #     mask_filenames.append(guess_full if guess_full.exists() else None)
+
             if self.config.load_dynamic_objects:
-                times.append(frame.get("time", 0.0))
-                joint_angles.append(frame.get("joint_angle", 0.0))
+                times_list.append(float(fr.get("time", 0.0)))
+                joint_list.append(float(fr.get("joint_angle", 0.0)))
 
-        poses = torch.from_numpy(np.array(poses, dtype=np.float32))
+        poses = torch.from_numpy(np.asarray(poses, dtype=np.float32))
+
+        times = torch.tensor(times_list, dtype=torch.float32) if self.config.load_dynamic_objects else None
+        joint_angles = torch.tensor(joint_list, dtype=torch.float32) if self.config.load_dynamic_objects else None
+
+        # eval split
+        img_names_for_split = [str(p) for p in image_filenames]
+        has_split_files_spec = any(f"{s}_filenames" in meta for s in ("train", "val", "test"))
+        if f"{split}_filenames" in meta:
+            split_set = set(str(self._get_fname(Path(x), data_dir)) for x in meta[f"{split}_filenames"])
+            indices = np.array([i for i, p in enumerate(img_names_for_split) if p in split_set], dtype=np.int32)
+            CONSOLE.log(f"[yellow] Dataset is overriding {split}_indices to {indices.tolist()}")
+        elif has_split_files_spec:
+            raise RuntimeError(f"The dataset's list of filenames for split {split} is missing.")
+        else:
+            if self.config.eval_mode == "fraction":
+                i_train, i_eval = get_train_eval_split_fraction(image_filenames, self.config.train_split_fraction)
+            elif self.config.eval_mode == "filename":
+                i_train, i_eval = get_train_eval_split_filename(image_filenames)
+            elif self.config.eval_mode == "interval":
+                i_train, i_eval = get_train_eval_split_interval(image_filenames, self.config.eval_interval)
+            elif self.config.eval_mode == "all":
+                CONSOLE.log("[yellow] Using '--eval-mode=all'. Be careful with camera optimization.")
+                i_train, i_eval = get_train_eval_split_all(image_filenames)
+            else:
+                raise ValueError(f"Unknown eval mode {self.config.eval_mode}")
+
+            indices = i_train if split == "train" else i_eval
+
+        idx = torch.as_tensor(indices, dtype=torch.long)
+
+        if "orientation_override" in meta:
+            orientation_method = meta["orientation_override"]
+            CONSOLE.log(f"[yellow] Dataset is overriding orientation method to {orientation_method}")
+        else:
+            orientation_method = self.config.orientation_method
+
+        poses_all, transform_matrix = camera_utils.auto_orient_and_center_poses(
+            poses, method=orientation_method, center_method=self.config.center_method
+        )
+
+        scale_factor = 1.0
+        if self.config.auto_scale_poses:
+            scale_factor /= float(torch.max(torch.abs(poses_all[:, :3, 3])))
+        scale_factor *= self.config.scale_factor
+        poses_all[:, :3, 3] *= scale_factor
+
+        image_filenames = [image_filenames[i] for i in indices]
+        # mask_filenames   = [mask_filenames[i] if mask_filenames[i] is not None else None for i in indices]
+        depth_filenames  = [depth_filenames[i] if depth_filenames[i] is not None else None for i in indices]
+        poses = poses_all[idx]
 
         if self.config.load_dynamic_objects:
-            times = torch.tensor(times, dtype=torch.float32)
-            joint_angles = torch.tensor(joint_angles, dtype=torch.float32)
+            times = times[idx] if times is not None else None
+            joint_angles = joint_angles[idx] if joint_angles is not None else None
 
-        # Scale the translation component
-        scale_factor = self.config.scale_factor
-        poses[:, :3, 3] *= scale_factor
+        camera_type = CAMERA_MODEL_TO_TYPE.get(meta.get("camera_model", ""), CameraType.PERSPECTIVE)
 
-        N = len(image_filenames)
+        # intrinsics tensors (fixed vs per-frame)
+        fx = float(meta["fl_x"]) if fx_fixed else torch.tensor(fx_list, dtype=torch.float32)[idx]
+        fy = float(meta["fl_y"]) if fy_fixed else torch.tensor(fy_list, dtype=torch.float32)[idx]
+        cx = float(meta["cx"])  if cx_fixed else torch.tensor(cx_list, dtype=torch.float32)[idx]
+        cy = float(meta["cy"])  if cy_fixed else torch.tensor(cy_list, dtype=torch.float32)[idx]
+        H  = int(meta["h"])     if h_fixed  else torch.tensor(h_list, dtype=torch.int32)[idx]
+        W  = int(meta["w"])     if w_fixed  else torch.tensor(w_list, dtype=torch.int32)[idx]
 
-        if "camera_model" in meta:
-            camera_type = CAMERA_MODEL_TO_TYPE[meta["camera_model"]]
+        if distort_fixed:
+            distortion_params = (
+                torch.tensor(meta["distortion_params"], dtype=torch.float32)
+                if "distortion_params" in meta
+                else camera_utils.get_distortion_params(
+                    k1=float(meta.get("k1", 0.0)),
+                    k2=float(meta.get("k2", 0.0)),
+                    k3=float(meta.get("k3", 0.0)),
+                    k4=float(meta.get("k4", 0.0)),
+                    p1=float(meta.get("p1", 0.0)),
+                    p2=float(meta.get("p2", 0.0)),
+                )
+            )
         else:
-            camera_type = CameraType.PERSPECTIVE
-
-        # Intrinsics
-        distortion_params = torch.tensor([
-            meta.get("k1", 0.0), meta.get("k2", 0.0),
-            meta.get("p1", 0.0), meta.get("p2", 0.0)
-        ], dtype=torch.float32).expand(N, -1)
+            distortion_params = torch.stack(distort_list, dim=0)[idx]
 
         cameras = Cameras(
-            fx=meta["fl_x"],
-            fy=meta["fl_y"],
-            cx=meta["cx"],
-            cy=meta["cy"],
-            height=meta["h"],
-            width=meta["w"],
+            fx=fx, fy=fy, cx=cx, cy=cy,
+            distortion_params=distortion_params,
+            height=H, width=W,
             camera_to_worlds=poses[:, :3, :4],
             camera_type=camera_type,
-            distortion_params=distortion_params,
-            times=times if self.config.load_dynamic_objects and self.includes_time else None,
+            times=times if (self.config.load_dynamic_objects and self.includes_time) else None,
         )
 
-        # per-camera metadata
-        if self.config.load_dynamic_objects:
-            for i, cam in enumerate(cameras.flatten()):
-                if cam.metadata is None:
-                    cam.metadata = {}
-                cam.metadata["joint_angle"] = joint_angles[i].item()
-                cam.metadata["time"] = times[i].item()
+        assert self.downscale_factor is not None
+        cameras.rescale_output_resolution(scaling_factor=1.0 / self.downscale_factor)
 
+        dataparser_transform = transform_matrix
+        if "applied_scale" in meta:
+            applied_scale = float(meta["applied_scale"])
+            scale_factor *= applied_scale
 
-        # Scene bounding box
         aabb_scale = self.config.scene_scale
         scene_box = SceneBox(
-            aabb=torch.tensor([[-aabb_scale] * 3, [aabb_scale] * 3], dtype=torch.float32)
+            aabb=torch.tensor([[-aabb_scale, -aabb_scale, -aabb_scale],
+                               [ aabb_scale,  aabb_scale,  aabb_scale]], dtype=torch.float32)
         )
 
-        # Collect metadata
+        # pack metadata
         metadata = {
+            "depth_filenames": depth_filenames if any(x is not None for x in depth_filenames) else None,
+            "depth_unit_scale_factor": self.config.depth_unit_scale_factor,
+            "mask_filenames": mask_filenames if any(x is not None for x in mask_filenames) else None,
             "scene_path": str(data_dir / self.config.obj_mask_dir),
         }
         if self.config.load_dynamic_objects:
-            metadata["joint_angles"] = joint_angles
-            metadata["times"] = times
+            metadata["times"] = times  # (N,)
+            metadata["joint_angles"] = joint_angles  # (N,)
 
-        print(f"metadata keys: {list(metadata.keys())}")
-        print(f"joint angles shape: {metadata['joint_angles'].shape if 'joint_angles' in metadata else None}")
-        print(f"times shape: {metadata['times'].shape if 'times' in metadata else None}")
 
         return DataparserOutputs(
             image_filenames=image_filenames,
             cameras=cameras,
             scene_box=scene_box,
-            metadata=metadata,
+            mask_filenames=metadata["mask_filenames"],
             dataparser_scale=scale_factor,
-            dataparser_transform=torch.eye(4),
+            dataparser_transform=dataparser_transform,
+            metadata=metadata,
         )
+
+    def _get_fname(self, filepath: Path, data_dir: Path, downsample_folder_prefix="images_") -> Path:
+        """Get the filename of the image file.
+        downsample_folder_prefix can be used to point to auxiliary image data, e.g. masks
+
+        filepath: the base file name of the transformations.
+        data_dir: the directory of the data that contains the transform file
+        downsample_folder_prefix: prefix of the newly generated downsampled images
+        """
+
+        if self.downscale_factor is None:
+            if self.config.downscale_factor is None:
+                test_img = Image.open(data_dir / filepath)
+                h, w = test_img.size
+                max_res = max(h, w)
+                df = 0
+                while True:
+                    if (max_res / 2 ** (df)) <= MAX_AUTO_RESOLUTION:
+                        break
+                    if not (data_dir / f"{downsample_folder_prefix}{2 ** (df + 1)}" / filepath.name).exists():
+                        break
+                    df += 1
+
+                self.downscale_factor = 2**df
+                CONSOLE.log(f"Auto image downscale factor of {self.downscale_factor}")
+            else:
+                self.downscale_factor = self.config.downscale_factor
+            assert self.downscale_factor is not None
+
+        if self.downscale_factor > 1:
+            return data_dir / f"{downsample_folder_prefix}{self.downscale_factor}" / filepath.name
+        return data_dir / filepath
