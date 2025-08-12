@@ -88,7 +88,7 @@ class SplatfactoModelConfig(ModelConfig):
     _target: Type = field(default_factory=lambda: SplatfactoModel)
     warmup_length: int = 500
     """period of steps where refinement is turned off"""
-    refine_every: int = 100
+    refine_every: int = 10
     """period of steps where gaussians are culled and densified"""
     resolution_schedule: int = 3000
     """training starts at 1/d resolution, every n steps this is doubled"""
@@ -156,7 +156,7 @@ class SplatfactoModelConfig(ModelConfig):
     """Shape of the bilateral grid (X, Y, W)"""
     color_corrected_metrics: bool = False
     """If True, apply color correction to the rendered images before computing the metrics."""
-    strategy: Literal["default", "mcmc"] = "default"
+    strategy: Literal["default", "mcmc", "arti_splat"] = "default"
     """The default strategy will be used if strategy is not specified. Other strategies, e.g. mcmc, can be used."""
     max_gs_num: int = 1_000_000
     """Maximum number of GSs. Default to 1_000_000."""
@@ -167,6 +167,9 @@ class SplatfactoModelConfig(ModelConfig):
     mcmc_scale_reg: float = 0.01
     """Regularization term for scale in MCMC strategy. Only enabled when using MCMC strategy"""
 
+
+    fourier_features_dim: int = 2
+    use_idft_for_sh: bool = True
 
 class SplatfactoModel(Model):
     """Nerfstudio's implementation of Gaussian Splatting
@@ -190,19 +193,29 @@ class SplatfactoModel(Model):
         if self.seed_points is not None and not self.config.random_init:
             means = torch.nn.Parameter(self.seed_points[0])  # (Location, Color)
         else:
-            means = torch.nn.Parameter((torch.rand((self.config.num_random, 3)) - 0.5) * self.config.random_scale)
+            means = torch.nn.Parameter(
+                (torch.rand((self.config.num_random, 3)) - 0.5) * self.config.random_scale
+            )
+
         distances, _ = k_nearest_sklearn(means.data, 3)
-        # find the average of the three nearest neighbors for each point and use that as the scale
         avg_dist = distances.mean(dim=-1, keepdim=True)
         scales = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 3)))
         num_points = means.shape[0]
         quats = torch.nn.Parameter(random_quat_tensor(num_points))
         dim_sh = num_sh_bases(self.config.sh_degree)
 
-        if (
+        # === IDFT Feature Modulation Mode ===
+        if getattr(self.config, "use_idft_for_sh", False):
+            # Use fourier features instead of RGB
+            features_dc = torch.nn.Parameter(
+                torch.randn(num_points, self.config.fourier_features_dim) * 0.1
+            )
+            features_rest = torch.nn.Parameter(torch.zeros((num_points, dim_sh - 1, 3)))
+
+        # === Standard RGB or SH Initialization ===
+        elif (
             self.seed_points is not None
             and not self.config.random_init
-            # We can have colors without points.
             and self.seed_points[1].shape[0] > 0
         ):
             shs = torch.zeros((self.seed_points[1].shape[0], dim_sh, 3)).float().cuda()
@@ -212,13 +225,16 @@ class SplatfactoModel(Model):
             else:
                 CONSOLE.log("use color only optimization with sigmoid activation")
                 shs[:, 0, :3] = torch.logit(self.seed_points[1] / 255, eps=1e-10)
+
             features_dc = torch.nn.Parameter(shs[:, 0, :])
             features_rest = torch.nn.Parameter(shs[:, 1:, :])
+
         else:
             features_dc = torch.nn.Parameter(torch.rand(num_points, 3))
             features_rest = torch.nn.Parameter(torch.zeros((num_points, dim_sh - 1, 3)))
 
         opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
+
         self.gauss_params = torch.nn.ParameterDict(
             {
                 "means": means,

@@ -26,7 +26,7 @@ class ArtiSplatfactoManagerConfig(FullImageDatamanagerConfig):
 
 
 class ArtiSplatfactoDataManager(FullImageDatamanager):
-    """Simplified DataManager for ArtiSplatfacto (no depth, mask, normals)"""
+    """Simplified DataManager for ArtiSplatfacto"""
 
     config: ArtiSplatfactoManagerConfig
     train_dataset: ArtiDataset

@@ -28,10 +28,10 @@ arti_splatfacto_config = MethodSpecification(
                 dataparser=ArtiSplatfactoDataParserConfig(load_dynamic_objects=True),
                 cache_images_type="uint8",
             ),
-
             model=ArtiSplatfactoModelConfig(
-                # cull_alpha_thresh=0.005,
-                # densify_grad_thresh=0.0005,
+                refine_every=50,
+                cull_alpha_thresh=0.01,     
+                densify_grad_thresh=6e-4,
             ),
         ),
         optimizers={

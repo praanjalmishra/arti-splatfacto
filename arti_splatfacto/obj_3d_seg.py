@@ -217,40 +217,79 @@ class Object3DSeg:
         voxel[under_object_mask] = True
         return voxel
 
-    def query(self, points, dilate=True, voxel=None):
-        """
-        Query the object 3D seg at points to determine whether they are inside
+    # def query(self, points, dilate=True, voxel=None, thresh=0.1):
+    #     """
+    #     Query the object 3D seg at points to determine whether they are inside
+    #     """
+    #     assert points.shape[-1] == 3
+    #     device = points.device
 
-        Args:
-            points (..., 3): 3D query points
-            dilate (bool): Whether to use dilated voxel grid for query
-            voxel (N, M, K tensor or None): another voxel grid to query
+    #     bbox_min = self.bbox_min.to(device)
+    #     bbox_max = self.bbox_max.to(device)
+    #     dims = self.dims.to(device)
 
-        Returns:
-            inside (...,): Whether the points are inside the object
-        """
+    #     in_bbox = ((points >= bbox_min) & (points <= bbox_max)).all(dim=-1)
+    #     points_in_bbox = points[in_bbox]
+    #     if points_in_bbox.numel() == 0:
+    #         return torch.zeros_like(in_bbox).bool()
+
+    #     # Normalize to [-1, 1]
+    #     points_in_bbox = (points_in_bbox - bbox_min) / dims * 2 - 1
+    #     grid = points_in_bbox.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+    #     grid = torch.flip(grid, dims=(-1,))  # zyx order
+
+    #     # Ensure voxel is on the same device
+    #     voxel = self.voxel if voxel is None else voxel
+    #     voxel = voxel.to(device)
+
+    #     occupancy = torch.nn.functional.grid_sample(
+    #         voxel.float().unsqueeze(0).unsqueeze(0), grid.float(),
+    #         align_corners=True
+    #     ).squeeze()
+
+    #     inside = torch.zeros_like(in_bbox, device=device).bool()
+    #     inside[in_bbox] = occupancy > thresh
+    #     return inside
+
+    def query(self, points, dilate=True, voxel=None, thresh=0.1, grow=1, bbox_margin=0.0):
         assert points.shape[-1] == 3
-        in_bbox = (
-            (points >= self.bbox_min) & (points <= self.bbox_max)
-        ).all(dim=-1)
-        points_in_bbox = points[in_bbox]
-        if points_in_bbox.numel() == 0:
+        device = points.device
+
+        # Expand bbox slightly so near-boundary points don't get cut
+        bbox_min = (self.bbox_min - bbox_margin).to(device)
+        bbox_max = (self.bbox_max + bbox_margin).to(device)
+        dims = (bbox_max - bbox_min)
+
+        in_bbox = ((points >= bbox_min) & (points <= bbox_max)).all(dim=-1)
+        pts = points[in_bbox]
+        if pts.numel() == 0:
             return torch.zeros_like(in_bbox).bool()
-        # Normalize the points to the bounding box
-        points_in_bbox = (points_in_bbox - self.bbox_min) / self.dims * 2 - 1
-        # Convert to voxel indices
-        grid = points_in_bbox.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-        grid = torch.flip(grid, dims=(-1,)) # grid_sample 3D uses zyx order
-        # Trilinear interpolation to extract occupancy values
-        voxel = self.voxel if voxel is None else voxel
-        occupancy = torch.nn.functional.grid_sample(
-            voxel.float().unsqueeze(0).unsqueeze(0), grid.float(),
-            align_corners=True
+
+        # [-1, 1] grid (zyx order for grid_sample 3D)
+        pts = (pts - bbox_min) / dims * 2 - 1
+        grid = torch.flip(pts, dims=(-1,)).view(1,1,1,-1,3)  # (N=1,C=1,D=1,P,3)
+
+        v = self.voxel if voxel is None else voxel
+        v = v.to(device)
+
+        # On-the-fly dilation: cheap and effective
+        if dilate and grow > 0:
+            vv = v[None, None].float()  # (1,1,X,Y,Z)
+            vv = torch.nn.functional.max_pool3d(
+                vv, kernel_size=(2*grow+1), stride=1, padding=grow
+            )
+            v = (vv > 0).squeeze(0).squeeze(0)
+
+        # Sample with border padding so bbox_margin actually helps
+        occ = torch.nn.functional.grid_sample(
+            v.float().unsqueeze(0).unsqueeze(0), grid.float(),
+            align_corners=True, padding_mode='border'  # <- key
         ).squeeze()
-        # Occupancy check
-        inside = torch.zeros_like(in_bbox).to(points.device)
-        inside[in_bbox] = occupancy > 0.1
+
+        inside = torch.zeros_like(in_bbox, device=device).bool()
+        inside[in_bbox] = occ > thresh
         return inside
+
     
     def sample_random_points(self, num_points):
         """
@@ -340,59 +379,6 @@ class Object3DSeg:
         inside = torch.zeros_like(in_bbox).to(points.device).bool()
         inside[in_bbox] = occupancy > 0.5
         return inside
-
-    # def project(self, poses, Ks, dist_coeffs, H, W, kernel_size=0):
-    #     """
-    #     Project the object points to camera views
-
-    #     Args:
-    #         poses (Nx4x4 tensor): Camera poses
-    #         Ks (Nx3x3 tensor): Camera intrinsics
-    #         dist_coeffs (Nx4 tensor): Camera distortion coefficients
-    #         H (int): Image height
-    #         W (int): Image width
-    #         kernel_size (int): Kernel size for closing the mask
-        
-    #     Returns:
-    #         masks (Nx1xHxW tensor): Projected masks
-    #     """
-    #     obj_pts = self.get_obj_coords()
-    #     verts_proj, proj_valid = project_points(
-    #         obj_pts, poses, Ks, dist_coeffs, H, W
-    #     )
-    #     masks = points2D_to_point_masks(
-    #         verts_proj, proj_valid, H, W, kernel_size
-    #     )
-    #     return masks
-
-    # def project_new(self, poses, Ks, dist_coeffs, H, W, kernel_size=0):
-    #     """
-    #     Project reconfigured objects' points to camera views
-
-    #     Args:
-    #         poses (Nx4x4 tensor): Camera poses
-    #         Ks (Nx3x3 tensor): Camera intrinsics
-    #         dist_coeffs (Nx4 tensor): Camera distortion coefficients
-    #         H (int): Image height
-    #         W (int): Image width
-    #         kernel_size (int): Kernel size for closing the mask
-        
-    #     Returns:
-    #         masks (Nx1xHxW tensor): Projected 2D masks
-    #     """
-    #     obj_pts = self.get_obj_coords()
-    #     if self.pose_change is None:
-    #         pose_change = torch.eye(4, device=poses.device)
-    #     else:
-    #         pose_change = self.pose_change
-    #     obj_pts_moved = (
-    #         pose_change[:3, :3] @ obj_pts.T + pose_change[:3, 3:]
-    #     ).T.reshape(-1, 3)
-    #     obj_proj, in_img = project_points(
-    #         obj_pts_moved, poses, Ks, dist_coeffs, H, W
-    #     )
-    #     masks = points2D_to_point_masks(obj_proj, in_img, H, W, kernel_size)
-    #     return masks
 
     def save(self, output):
         """
