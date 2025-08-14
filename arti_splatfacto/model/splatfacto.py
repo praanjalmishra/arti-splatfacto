@@ -190,61 +190,24 @@ class SplatfactoModel(Model):
         super().__init__(*args, **kwargs)
 
     def populate_modules(self):
-        if self.seed_points is not None and not self.config.random_init:
-            means = torch.nn.Parameter(self.seed_points[0])  # (Location, Color)
-        else:
-            means = torch.nn.Parameter(
-                (torch.rand((self.config.num_random, 3)) - 0.5) * self.config.random_scale
-            )
+        # means = torch.empty((0, 3)).float().cuda()
+        # scales = torch.empty((0, 3)).float().cuda()
+        # quats = torch.empty((0, 4)).float().cuda()
+        # dim_sh = num_sh_bases(self.config.sh_degree)
+        # features_dc = torch.empty((0, 3)).float().cuda()
+        # features_rest = torch.empty((0, dim_sh-1, 3)).float().cuda()
+        # opacities = torch.empty((0, 1)).float().cuda()
 
-        distances, _ = k_nearest_sklearn(means.data, 3)
-        avg_dist = distances.mean(dim=-1, keepdim=True)
-        scales = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 3)))
-        num_points = means.shape[0]
-        quats = torch.nn.Parameter(random_quat_tensor(num_points))
-        dim_sh = num_sh_bases(self.config.sh_degree)
-
-        # === IDFT Feature Modulation Mode ===
-        if getattr(self.config, "use_idft_for_sh", False):
-            # Use fourier features instead of RGB
-            features_dc = torch.nn.Parameter(
-                torch.randn(num_points, self.config.fourier_features_dim) * 0.1
-            )
-            features_rest = torch.nn.Parameter(torch.zeros((num_points, dim_sh - 1, 3)))
-
-        # === Standard RGB or SH Initialization ===
-        elif (
-            self.seed_points is not None
-            and not self.config.random_init
-            and self.seed_points[1].shape[0] > 0
-        ):
-            shs = torch.zeros((self.seed_points[1].shape[0], dim_sh, 3)).float().cuda()
-            if self.config.sh_degree > 0:
-                shs[:, 0, :3] = RGB2SH(self.seed_points[1] / 255)
-                shs[:, 1:, 3:] = 0.0
-            else:
-                CONSOLE.log("use color only optimization with sigmoid activation")
-                shs[:, 0, :3] = torch.logit(self.seed_points[1] / 255, eps=1e-10)
-
-            features_dc = torch.nn.Parameter(shs[:, 0, :])
-            features_rest = torch.nn.Parameter(shs[:, 1:, :])
-
-        else:
-            features_dc = torch.nn.Parameter(torch.rand(num_points, 3))
-            features_rest = torch.nn.Parameter(torch.zeros((num_points, dim_sh - 1, 3)))
-
-        opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
-
-        self.gauss_params = torch.nn.ParameterDict(
-            {
-                "means": means,
-                "scales": scales,
-                "quats": quats,
-                "features_dc": features_dc,
-                "features_rest": features_rest,
-                "opacities": opacities,
-            }
-        )
+        # self.gauss_params = torch.nn.ParameterDict(
+        #     {
+        #         "means": means,
+        #         "scales": scales,
+        #         "quats": quats,
+        #         "features_dc": features_dc,
+        #         "features_rest": features_rest,
+        #         "opacities": opacities,
+        #     }
+        # )
 
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
@@ -405,20 +368,20 @@ class SplatfactoModel(Model):
     def opacities(self):
         del self.gauss_params.opacities
 
-    def load_state_dict(self, dict, **kwargs):  # type: ignore
-        # resize the parameters to match the new number of points
-        self.step = 30000
-        if "means" in dict:
-            # For backwards compatibility, we remap the names of parameters from
-            # means->gauss_params.means since old checkpoints have that format
-            for p in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]:
-                dict[f"gauss_params.{p}"] = dict[p]
-        newp = dict["gauss_params.means"].shape[0]
-        for name, param in self.gauss_params.items():
-            old_shape = param.shape
-            new_shape = (newp,) + old_shape[1:]
-            self.gauss_params[name] = torch.nn.Parameter(torch.zeros(new_shape, device=self.device))
-        super().load_state_dict(dict, **kwargs)
+    # def load_state_dict(self, dict, **kwargs):  # type: ignore
+    #     # resize the parameters to match the new number of points
+    #     self.step = 30000
+    #     if "means" in dict:
+    #         # For backwards compatibility, we remap the names of parameters from
+    #         # means->gauss_params.means since old checkpoints have that format
+    #         for p in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]:
+    #             dict[f"gauss_params.{p}"] = dict[p]
+    #     newp = dict["gauss_params.means"].shape[0]
+    #     for name, param in self.gauss_params.items():
+    #         old_shape = param.shape
+    #         new_shape = (newp,) + old_shape[1:]
+    #         self.gauss_params[name] = torch.nn.Parameter(torch.zeros(new_shape, device=self.device))
+    #     super().load_state_dict(dict, **kwargs)
 
     def set_crop(self, crop_box: Optional[OrientedBox]):
         self.crop_box = crop_box

@@ -72,41 +72,69 @@ class ArtiSplatfactoModel(SplatfactoModel):
     def populate_modules(self):
         """Populates the modules of the model."""
         super().populate_modules()
+        print("Populating ArtiSplatfactoModel modules...")
 
         def make_param(shape, requires_grad=True):
-            return torch.nn.Parameter(torch.zeros(shape).float().cuda(), requires_grad=requires_grad)
+            return torch.nn.Parameter(
+                torch.empty(shape, device="cuda" if torch.cuda.is_available() else "cpu", dtype=torch.float32),
+                requires_grad=requires_grad,
+            )
 
         dim_sh = num_sh_bases(self.config.sh_degree)
 
-        # Post transformation Gaussians (trainable)
         self.gauss_params = torch.nn.ParameterDict({
-            "means":         make_param((1, 3)),
-            "scales":        make_param((1, 3)),
-            "quats":         make_param((1, 4)),
-            "features_dc":   make_param((1, 3)),
-            "features_rest": make_param((1, dim_sh - 1, 3)),
-            "opacities":     make_param((1, 1)),
+            "means":         make_param((0, 3)),
+            "scales":        make_param((0, 3)),
+            "quats":         make_param((0, 4)),
+            "features_dc":   make_param((0, 3)),
+            "features_rest": make_param((0, dim_sh - 1, 3)),
+            "opacities":     make_param((0, 1)),
+        })
+
+        # # CANONICAL object state (for exposing revealed part)
+        self.gauss_params_canonical = torch.nn.ParameterDict({
+            "means":         make_param((0, 3)),
+            "scales":        make_param((0, 3)),
+            "quats":         make_param((0, 4)),
+            "features_dc":   make_param((0, 3)),
+            "features_rest": make_param((0, dim_sh - 1, 3)),
+            "opacities":     make_param((0, 1)),
         })
 
         # Fixed (non-trainable) Gaussians 
-        self.gauss_params_fixed = torch.nn.ParameterDict({
-            "means":         make_param((0, 3), requires_grad=False),
-            "scales":        make_param((0, 3), requires_grad=False),
-            "quats":         make_param((0, 4), requires_grad=False),
-            "features_dc":   make_param((0, 3), requires_grad=False),
-            "features_rest": make_param((0, dim_sh - 1, 3), requires_grad=False),
-            "opacities":     make_param((0, 1), requires_grad=False),
-        })
+        self.gauss_params_fixed = {}
 
-        # # CANONICAL object state (for articulation reference)
-        # self.gauss_params_canonical = torch.nn.ParameterDict({
-        #     "means":         make_param((0, 3), requires_grad=False),
-        #     "scales":        make_param((0, 3), requires_grad=False),
-        #     "quats":         make_param((0, 4), requires_grad=False),
-        #     "features_dc":   make_param((0, 3), requires_grad=False),
-        #     "features_rest": make_param((0, dim_sh - 1, 3), requires_grad=False),
-        #     "opacities":     make_param((0, 1), requires_grad=False),
-        # })
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.register_buffer("gauss_ids_obj", torch.empty((0,), dtype=torch.long, device=device))
+        self.register_buffer("gauss_ids_canon", torch.empty((0,), dtype=torch.long, device=device))
+        self.register_buffer("gauss_ids_fixed", torch.empty((0,), dtype=torch.long, device=device))
+        self.register_buffer("next_gauss_id", torch.tensor(0, dtype=torch.long, device=device))
+
+
+
+
+    def alloc_ids(self, n: int):
+        """Allocate Gaussian IDs."""
+        if n <= 0:
+            return torch.empty((0,), dtype=torch.long, device=self.gauss_ids_obj.device)
+        start_id = int(self.next_gauss_id.item())
+        ids = torch.arange(start_id, start_id + n, dtype=torch.long, device=self.gauss_ids_obj.device)
+        self.next_gauss_id += n
+        return ids
+    
+    @property
+    def ids_obj(self):
+        """ IDs of trainable gaussians (object only) """
+        return self.gauss_ids_obj
+
+    
+    @property
+    def ids_all(self):
+        """IDs of all gaussians for rendering (trainable obj + canonical + fixed)"""
+        return torch.cat(
+            [self.gauss_ids_obj, self.gauss_ids_canon, self.gauss_ids_fixed],
+            dim=0
+        )
 
 
     def state_dict(self, *args, **kwargs):
@@ -119,48 +147,59 @@ class ArtiSplatfactoModel(SplatfactoModel):
     
     def _initialize_and_partition(self, state_dict: Dict[str, torch.Tensor]):
         """
-        Initialize from full scene and partition into trainable object + fixed background.
+        From a full-scene checkpoint: split into trainable object + fixed background.
+        (Canonical stays empty here; you can fill it later if you have an exposed mask.)
         """
         print("Initializing from full scene: partitioning Gaussians...")
 
         self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
         self.obj_3d_seg.refine_mask(dilate_k=4, erode_k=1)
-        
-        # Identify object vs background Gaussians
-        all_means = state_dict["gauss_params.means"]
-        obj_mask = self.obj_3d_seg.query(
-            all_means.to(self.device),
-            grow=1,            
-            thresh=0.01,       
-            bbox_margin=0.01   
-        ).cpu()
-        non_obj_mask = ~obj_mask
 
-        GAUSSIAN_PARAM_NAMES = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
-        
-        # Partition data
-        obj_data = {name: state_dict[f"gauss_params.{name}"][obj_mask] for name in GAUSSIAN_PARAM_NAMES}
-        bg_data = {name: state_dict[f"gauss_params.{name}"][non_obj_mask] for name in GAUSSIAN_PARAM_NAMES}
+        GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
-        for name, data in obj_data.items():
-            self.gauss_params[name].data = data.to(self.device)
+        all_means = state_dict["gauss_params.means"].to(self.device)
+        obj_mask = self.obj_3d_seg.query(all_means, grow=1, thresh=0.01, bbox_margin=0.01).to(torch.bool).cpu()
+        bg_mask  = ~obj_mask
 
-        for name, data in bg_data.items():
-            self.gauss_params_fixed[name] = torch.nn.Parameter(data.to(self.device), requires_grad=False)
+        # trainable object subset
+        for p in GAUSS:
+            subset = state_dict[f"gauss_params.{p}"][obj_mask].to(self.device)
+            self.gauss_params[p] = torch.nn.Parameter(subset)
 
-        if hasattr(self.obj_3d_seg, 'joint_axis') and self.obj_3d_seg.joint_axis is not None:
-            self.joint_axis = self.obj_3d_seg.joint_axis.to(self.device)
-            print(f"joint axis from mask: {self.joint_axis}")
+        # trainable canonical subset
+        for p in GAUSS:
+            subset = state_dict[f"gauss_params.{p}"][obj_mask].to(self.device)
+            self.gauss_params_canonical[p] = torch.nn.Parameter(subset)
+
+        # Fixed background (plain tensors)
+        self.gauss_params_fixed = {p: state_dict[f"gauss_params.{p}"][bg_mask].to(self.device) for p in GAUSS}
+
+        # IDs: reuse if present, else allocate
+
+        n_obj = self.gauss_params["means"].shape[0]
+        n_canon = self.gauss_params_canonical["means"].shape[0]
+        n_bg = self.gauss_params_fixed["means"].shape[0]
+
+        if "gauss_ids" in state_dict:
+            ids_all = state_dict["gauss_ids"].to(self.device)
+            self.gauss_ids_obj   = ids_all[obj_mask.to(ids_all.device)]
+            self.gauss_ids_fixed = ids_all[bg_mask .to(ids_all.device)]
+            self.gauss_ids_canonical = ids_all[obj_mask.to(ids_all.device)]
+            self.next_gauss_id   = torch.tensor(int(ids_all.max().item()) + 1, dtype=torch.long, device=self.device)
+        else:
+            self.gauss_ids_obj   = self.alloc_ids(n_obj)
+            self.gauss_ids_canonical = self.alloc_ids(n_canon)
+            self.gauss_ids_fixed = self.alloc_ids(n_bg)
             
-        if hasattr(self.obj_3d_seg, 'joint_pivot') and self.obj_3d_seg.joint_pivot is not None:
-            self.joint_pivot = self.obj_3d_seg.joint_pivot.to(self.device)
-            print(f"joint pivot from mask: {self.joint_pivot}")
 
-        print(f"Partitioning complete. Trainable: {obj_data['means'].shape[0]}, Fixed: {bg_data['means'].shape[0]}")
+        print(f"Partitioning complete. Trainable: {self.gauss_params['means'].shape[0]}, Canonical: {self.gauss_params_canonical['means'].shape[0]}, Fixed: {self.gauss_params_fixed['means'].shape[0]}")
+        print(f"obj ID <{self.gauss_ids_obj}>, fixed ID <{self.gauss_ids_fixed}>, canon ID <{self.gauss_ids_canonical}>")
 
-    def load_state_dict(self, state_dict, **kwargs):
+    def load_state_dict(self, state_dict: Dict[str, torch.Tensor], **kwargs):
+        self.step = 20000
         print(f"Loading state_dict (Training mode: {self.training})")
         assert self.config.obj_mask_file is not None and self.config.obj_mask_file.exists()
+
         self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
         if hasattr(self.obj_3d_seg, 'joint_axis') and self.obj_3d_seg.joint_axis is not None:
             self.joint_axis = self.obj_3d_seg.joint_axis.to(self.device)
@@ -172,41 +211,54 @@ class ArtiSplatfactoModel(SplatfactoModel):
             self.max_joint_angle = self.obj_3d_seg.joint_angle.to(self.device)
             print(f"Updated joint angles from mask: {self.max_joint_angle}")
 
-        is_partitioned_checkpoint = "gauss_params_fixed.means" in state_dict
-        GAUSSIAN_PARAM_NAMES: List[str] = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+        GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
-        if is_partitioned_checkpoint:
-            super_state_dict = state_dict.copy()
-            for name in GAUSSIAN_PARAM_NAMES:
-                for param_group_name in ["gauss_params_fixed", "gauss_params_pre"]:
-                    key = f"{param_group_name}.{name}"
-                    if key in state_dict:
-                        if not hasattr(self, param_group_name):
-                            setattr(self, param_group_name, torch.nn.ParameterDict())
-                        getattr(self, param_group_name)[name] = torch.nn.Parameter(
-                            state_dict[key].to(self.device), requires_grad=False
-                        )
-                        del super_state_dict[key]
+        # Backward compatibility for old checkpoints
+        if "means" in state_dict:
+            for p in GAUSS:
+                state_dict[f"gauss_params.{p}"] = state_dict[p]
 
-            if "gauss_params.features_dc" in super_state_dict:
-                checkpoint_dc_dim = super_state_dict["gauss_params.features_dc"].shape[-1]
-                current_dc_dim = self.gauss_params["features_dc"].shape[-1]
+        is_partitioned = "gauss_params_fixed.means" in state_dict
 
-            # Important: load with strict=False to allow partitioned keys to be missing
-            load_kwargs = {k: v for k, v in kwargs.items() if k != 'strict'}
-            load_kwargs['strict'] = False
-            super().load_state_dict(super_state_dict, **load_kwargs)
+        if is_partitioned:
+            # Directly load partitioned checkpoint (already separated into 3 groups)
+            for p in GAUSS:
+                if f"gauss_params.{p}" in state_dict:
+                    self.gauss_params[p] = torch.nn.Parameter(state_dict[f"gauss_params.{p}"].to(self.device))
+                if f"gauss_params_canonical.{p}" in state_dict:
+                    self.gauss_params_canonical[p] = torch.nn.Parameter(state_dict[f"gauss_params_canonical.{p}"].to(self.device))
+                if f"gauss_params_fixed.{p}" in state_dict:
+                    self.gauss_params_fixed[p] = state_dict[f"gauss_params_fixed.{p}"].to(self.device)
 
-        elif self.training:
-            print("Training mode: partitioning full scene into object + background...")
-            self._initialize_and_partition(state_dict)
+            # IDs if present
+            self.gauss_ids        = state_dict.get("gauss_ids", torch.empty((0,), dtype=torch.long, device=self.device)).to(self.device)
+            self.gauss_ids_canon  = state_dict.get("gauss_ids_canon", torch.empty((0,), dtype=torch.long, device=self.device)).to(self.device)
+            self.gauss_ids_fixed  = state_dict.get("gauss_ids_fixed", torch.empty((0,), dtype=torch.long, device=self.device)).to(self.device)
 
         else:
-            # Inference Mode            
-            super().load_state_dict(state_dict, **kwargs)
+            print("Partitioning full scene into obj/canonical/bg...")
+            self._initialize_and_partition(state_dict)
+
+        non_gauss_state = {
+            k: v for k, v in state_dict.items()
+            if not (
+                k.startswith("gauss_params.") or
+                k.startswith("gauss_params_canonical.") or
+                k.startswith("gauss_params_fixed.") or
+                k.startswith("gauss_ids")
+            )
+        }
+
+        super().load_state_dict(non_gauss_state, strict=False)
+
 
         self.step = state_dict.get("step", 0)
-        print("--- ✅ Loading complete. Gaussians are correctly set up. ---")
+        print(f"Load complete — obj={self.gauss_params['means'].shape[0]}, "
+            f"canon={self.gauss_params_canonical['means'].shape[0]}, "
+            f"bg={self.gauss_params_fixed['means'].shape[0]}")
+        # import pdb; pdb.set_trace()
+
+
     
     def clear_optimizer_state(self, optimizers):
         """Clear optimizer state after parameter resizing"""
@@ -225,8 +277,8 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
     def step_cb(self, optimizers: Optimizers, step):
 
-        if step == 20000:  
-            self.clear_optimizer_state(optimizers)
+        # if step == 20000:  
+        #     self.clear_optimizer_state(optimizers)
         self.step = step
         self.optimizers = optimizers.optimizers
         self.schedulers = optimizers.schedulers
