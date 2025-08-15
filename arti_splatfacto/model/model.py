@@ -11,6 +11,7 @@ except ImportError:
 
 import torch
 import torch.nn.functional as F
+from torch.nn import Parameter
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from arti_splatfacto.model.splatfacto import SplatfactoModelConfig, SplatfactoModel
 from nerfstudio.engine.optimizers import Optimizers
@@ -69,6 +70,40 @@ class ArtiSplatfactoModel(SplatfactoModel):
         self.metadata = kwargs.get("metadata", {})
         self.joint_angles = self.metadata.get("joint_angles", None)
 
+    #     self._apply_optimizer_patch()
+
+    # def _apply_optimizer_patch(self):
+    #     """Patch torch.optim.Optimizer.load_state_dict to handle parameter size mismatches"""
+    #     import torch.optim
+        
+    #     # Only patch once globally
+    #     if hasattr(torch.optim.Optimizer, '_artisplat_patched'):
+    #         return
+        
+    #     # Store the original method
+    #     original_load_state_dict = torch.optim.Optimizer.load_state_dict
+        
+    #     def patched_load_state_dict(optimizer_self, state_dict):
+    #         """Patched version that gracefully handles parameter group size mismatches"""
+    #         try:
+    #             return original_load_state_dict(optimizer_self, state_dict)
+    #         except ValueError as e:
+    #             error_msg = str(e)
+    #             if "doesn't match the size of optimizer's group" in error_msg:
+    #                 print("🔧 OPTIMIZER PATCH ACTIVATED")
+    #                 print("   Detected parameter group size mismatch (expected with ArtiSplatfacto)")
+    #                 print("   Skipping optimizer state loading - optimizer will restart fresh")
+    #                 print("   This is normal when loading vanilla checkpoints into ArtiSplatfacto")
+    #                 return  # Gracefully skip loading
+    #             else:
+    #                 # Re-raise any other errors
+    #                 raise e
+        
+    #     # Apply the global patch
+    #     torch.optim.Optimizer.load_state_dict = patched_load_state_dict
+    #     torch.optim.Optimizer._artisplat_patched = True
+    #     print("✅ Applied ArtiSplatfacto optimizer compatibility patch")
+
     def populate_modules(self):
         """Populates the modules of the model."""
         super().populate_modules()
@@ -110,8 +145,9 @@ class ArtiSplatfactoModel(SplatfactoModel):
         self.register_buffer("gauss_ids_fixed", torch.empty((0,), dtype=torch.long, device=device))
         self.register_buffer("next_gauss_id", torch.tensor(0, dtype=torch.long, device=device))
 
-
-
+        print(f"densification strategy: {self.strategy}")
+        print(f"densification parameter: {self.config.warmup_length}, {self.config.stop_split_at}")
+        
 
     def alloc_ids(self, n: int):
         """Allocate Gaussian IDs."""
@@ -137,13 +173,13 @@ class ArtiSplatfactoModel(SplatfactoModel):
         )
 
 
-    def state_dict(self, *args, **kwargs):
-        state = super().state_dict(*args, **kwargs)
-        if hasattr(self, "gauss_params_fixed"):
-            for name, param in self.gauss_params_fixed.items():
-                state[f"gauss_params_fixed.{name}"] = param.data
+    # def state_dict(self, *args, **kwargs):
+    #     state = super().state_dict(*args, **kwargs)
+    #     if hasattr(self, "gauss_params_fixed"):
+    #         for name, param in self.gauss_params_fixed.items():
+    #             state[f"gauss_params_fixed.{name}"] = param.data
 
-        return state
+    #     return state
     
     def _initialize_and_partition(self, state_dict: Dict[str, torch.Tensor]):
         """
@@ -196,7 +232,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
         print(f"obj ID <{self.gauss_ids_obj}>, fixed ID <{self.gauss_ids_fixed}>, canon ID <{self.gauss_ids_canonical}>")
 
     def load_state_dict(self, state_dict: Dict[str, torch.Tensor], **kwargs):
-        self.step = 20000
         print(f"Loading state_dict (Training mode: {self.training})")
         assert self.config.obj_mask_file is not None and self.config.obj_mask_file.exists()
 
@@ -231,7 +266,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
                     self.gauss_params_fixed[p] = state_dict[f"gauss_params_fixed.{p}"].to(self.device)
 
             # IDs if present
-            self.gauss_ids        = state_dict.get("gauss_ids", torch.empty((0,), dtype=torch.long, device=self.device)).to(self.device)
+            self.gauss_ids_obj        = state_dict.get("gauss_ids_obj", torch.empty((0,), dtype=torch.long, device=self.device)).to(self.device)
             self.gauss_ids_canon  = state_dict.get("gauss_ids_canon", torch.empty((0,), dtype=torch.long, device=self.device)).to(self.device)
             self.gauss_ids_fixed  = state_dict.get("gauss_ids_fixed", torch.empty((0,), dtype=torch.long, device=self.device)).to(self.device)
 
@@ -239,6 +274,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             print("Partitioning full scene into obj/canonical/bg...")
             self._initialize_and_partition(state_dict)
 
+        # Load non-gaussian parameters
         non_gauss_state = {
             k: v for k, v in state_dict.items()
             if not (
@@ -250,42 +286,147 @@ class ArtiSplatfactoModel(SplatfactoModel):
         }
 
         super().load_state_dict(non_gauss_state, strict=False)
-
-
         self.step = state_dict.get("step", 0)
+        
         print(f"Load complete — obj={self.gauss_params['means'].shape[0]}, "
             f"canon={self.gauss_params_canonical['means'].shape[0]}, "
-            f"bg={self.gauss_params_fixed['means'].shape[0]}")
-        # import pdb; pdb.set_trace()
+            f"bg={self.gauss_params_fixed['means'].shape[0] if self.gauss_params_fixed else 0}")
 
 
-    
-    def clear_optimizer_state(self, optimizers):
-        """Clear optimizer state after parameter resizing"""
-        # print("!!! Clearing optimizer state after parameter resizing...")
+    def _update_optimizer_param_references(self):
+        """
+        CRITICAL: Update optimizer parameter references after loading checkpoint.
+        This fixes the 'in_optimizer=False' issue by making optimizers point to the new parameters.
+        """
+        if not hasattr(self, 'optimizers') or not self.optimizers:
+            print("⚠️  No optimizers found - skipping parameter reference update")
+            return
+            
+        print("🔧 Updating optimizer parameter references...")
         
-        for name, optimizer in optimizers.optimizers.items():
-            if name in ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]:
-                # Clear the optimizer state for this parameter group
-                for param_group in optimizer.param_groups:
-                    for param in param_group['params']:
-                        if param in optimizer.state:
-                            print(f"Clearing state for {name}")
-                            optimizer.state[param].clear()
-                            # Re-initialize the state
-                            optimizer.state[param] = {}
+        # Map of parameter names to their new tensors
+        param_mapping = {
+            "means": self.gauss_params["means"],
+            "scales": self.gauss_params["scales"], 
+            "quats": self.gauss_params["quats"],
+            "features_dc": self.gauss_params["features_dc"],
+            "features_rest": self.gauss_params["features_rest"],
+            "opacities": self.gauss_params["opacities"],
+        }
+        
+        for param_name, new_param in param_mapping.items():
+            if param_name in self.optimizers:
+                optimizer = self.optimizers[param_name]
+                
+                # Update the parameter reference in the optimizer
+                for group in optimizer.param_groups:
+                    if len(group['params']) > 0:
+                        # Replace the old parameter with the new one
+                        old_param = group['params'][0]
+                        group['params'][0] = new_param
+                        
+                        print(f"  {param_name}: {old_param.shape} → {new_param.shape}")
+                        
+                        # Clear optimizer state for the old parameter and initialize for new
+                        if old_param in optimizer.state:
+                            del optimizer.state[old_param]
+                        optimizer.state[new_param] = {}
+        
+        print("✅ Optimizer parameter references updated")
 
+
+    # Add this method to be called after optimizers are set up
     def step_cb(self, optimizers: Optimizers, step):
-
-        # if step == 20000:  
-        #     self.clear_optimizer_state(optimizers)
+        """Called by trainer when optimizers are ready"""
         self.step = step
         self.optimizers = optimizers.optimizers
         self.schedulers = optimizers.schedulers
+        
+        # CRITICAL: Update optimizer parameter references if we've loaded a checkpoint
+        if hasattr(self, 'gauss_params') and self.gauss_params['means'].shape[0] > 0:
+            self._update_optimizer_param_references()
+
+
+    # # Alternative approach - override the parameter groups method to be called after loading
+    # def get_gaussian_param_groups(self) -> Dict[str, List[torch.nn.Parameter]]:
+    #     """Get parameter groups for optimizers"""
+    #     GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+    #     param_groups = {}
+
+    #     print("DEBUG: Building parameter groups:")
+    #     for name in GAUSS:
+    #         if name in self.gauss_params and self.gauss_params[name].numel() > 0:
+    #             param_groups[name] = [self.gauss_params[name]]
+    #             print(f"  {name}: {self.gauss_params[name].shape}")
+    #         else:
+    #             print(f"  {name}: MISSING or EMPTY!")
+
+    #     print(f"Final parameter groups: {list(param_groups.keys())}")
+    #     return param_groups
+
+
+    # EMERGENCY FIX: If the above doesn't work, add this to step_post_backward
+    def step_post_backward(self, step):
+        """Strategy step after backward pass"""
+        print(f"🚨 step_post_backward CALLED at step {step}")
+        assert step == self.step
+
+        print(f"Strategy step_post_backward with {self.gauss_params['means'].shape[0]} object Gaussians")
+
+        # Check if any Gaussians are visible
+        if self.info.get("gaussian_ids") is None:
+            print("⚠️  No visible Gaussians - skipping strategy step_post_backward")
+            return
+        
+        print(f"✅ Found {len(self.info['gaussian_ids'])} visible Gaussians")
+
+        n_gaussians = self.gauss_params['means'].shape[0]
+        print(f"Before strategy: obj={n_gaussians}")
+
+
+        # Verify parameters are now in optimizers
+        print("DEBUG: Final optimizer verification:")
+        for opt_name, optimizer in self.optimizers.items():
+            if opt_name in self.gauss_params:
+                param = self.gauss_params[opt_name]
+                in_opt = any(param is p for group in optimizer.param_groups for p in group['params'])
+                print(f"  {opt_name}: shape={param.shape}, in_optimizer={in_opt}")
+
+        if isinstance(self.strategy, DefaultStrategy):
+            self.strategy.step_post_backward(
+                params=self.gauss_params,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                step=self.step,
+                info=self.info,
+                packed=True,
+            )
+        elif isinstance(self.strategy, MCMCStrategy):
+            self.strategy.step_post_backward(
+                params=self.gauss_params,  
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                step=step,
+                info=self.info,
+                lr=self.schedulers["means"].get_last_lr()[0],
+            )
+        else:
+            raise ValueError(f"Unknown strategy {self.strategy}")
+        
+        print(f"After strategy: obj={self.gauss_params['means'].shape[0]}")
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         pred_img = outputs["rgb"]
+
+        if "mask" in batch:
+            # batch["mask"] : [H, W, 1]
+            mask = self._downscale_if_required(batch["mask"])
+            mask = mask.to(self.device)
+            assert mask.shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
+            gt_img = gt_img * mask
+            pred_img = pred_img * mask
+
 
         # === Losses ===
         Ll1 = torch.abs(gt_img - pred_img).mean()
@@ -348,6 +489,71 @@ class ArtiSplatfactoModel(SplatfactoModel):
         return 0.0
     
 
+    def _get_gaussians_for_render(self, camera: Cameras) -> Dict[str, torch.Tensor]:
+        """
+        Prepare Gaussians for rendering with per-frame articulation.
+        CRITICAL: Must return the exact same parameters that the optimizers know about
+        """
+        # Get joint angle for this camera
+        joint_angle = self._get_joint_angle_for_camera(camera)
+        
+        # During training: MUST use the exact same parameters that optimizers track
+        if self.training:
+            print(f"Training mode: rendering {self.gauss_params['means'].shape[0]} trainable Gaussians")
+            
+            # Apply articulation to the actual optimizer parameters
+            if joint_angle != 0.0:
+                # Apply articulation while preserving gradient connection
+                articulated_params = self._apply_articulation_to_optimizer_params(joint_angle)
+                return articulated_params
+            else:
+                # No articulation - return optimizer parameters directly
+                return {name: param for name, param in self.gauss_params.items()}
+
+        # During evaluation: can use full scene (trainable + fixed)
+        joint_angle = self._get_joint_angle_for_camera(camera)
+        articulated_obj_params = self._apply_articulation_to_canonical_params(joint_angle)
+        
+        if hasattr(self, "gauss_params_fixed") and self.gauss_params_fixed["means"].shape[0] > 0:
+            full_scene_params = {}
+            for name in articulated_obj_params.keys():
+                full_scene_params[name] = torch.cat(
+                    [articulated_obj_params[name], self.gauss_params_fixed[name]], dim=0
+                )
+            print(f"Eval mode: rendering {full_scene_params['means'].shape[0]} total Gaussians")
+            return full_scene_params
+
+        return articulated_obj_params
+
+    def _apply_articulation_to_optimizer_params(self, joint_angle: float) -> Dict[str, torch.Tensor]:
+        """
+        Apply articulation directly to optimizer parameters during training.
+        This ensures the strategy operations work on the same tensors.
+        """
+        if joint_angle == 0.0:
+            return {name: param for name, param in self.gauss_params.items()}
+        
+        # Apply joint transform to the optimizer parameters directly
+        means_articulated, quats_articulated = apply_joint_transform(
+            means=self.gauss_params["means"],  
+            quats=self.gauss_params["quats"],  
+            joint_pivot=self.joint_pivot.to(self.device),
+            joint_axis=self.joint_axis.to(self.device),
+            joint_angle=joint_angle
+        )
+        
+        # Return modified parameters while preserving gradient connections
+        articulated_params = {}
+        for name, param in self.gauss_params.items():
+            if name == "means":
+                articulated_params[name] = means_articulated
+            elif name == "quats":
+                articulated_params[name] = quats_articulated
+            else:
+                articulated_params[name] = param
+        
+        return articulated_params
+
     def _apply_articulation_to_canonical_params(self, joint_angle: float) -> Dict[str, torch.Tensor]:
         """
         Apply per-frame articulation to the canonical object parameters.
@@ -375,30 +581,25 @@ class ArtiSplatfactoModel(SplatfactoModel):
         
         return articulated_params
 
-    def _get_gaussians_for_render(self, camera: Cameras) -> Dict[str, torch.Tensor]:
-        """
-        Prepare Gaussians for rendering with per-frame articulation.
-        """
-        joint_angle = self._get_joint_angle_for_camera(camera)
-        articulated_obj_params = self._apply_articulation_to_canonical_params(joint_angle)
-        if hasattr(self, "gauss_params_fixed") and self.gauss_params_fixed["means"].shape[0] > 0:
-            full_scene_params = {}
-            for name in articulated_obj_params.keys():
-                # Concatenate  object + fixed background
-                full_scene_params[name] = torch.cat(
-                    [articulated_obj_params[name], self.gauss_params_fixed[name]], dim=0
-                )
-            return full_scene_params
-        
-        return articulated_obj_params
-
-
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         """Takes in a camera and returns a dictionary of outputs with articulation."""
         if not isinstance(camera, Cameras):
             return {}
 
         gaussians_to_render = self._get_gaussians_for_render(camera)
+        
+        # Debug: Check Gaussian properties before rendering
+        if self.training and self.step % 100 == 0:  # Debug every 100 steps
+            means = gaussians_to_render["means"]
+            opacities = torch.sigmoid(gaussians_to_render["opacities"])
+            scales = torch.exp(gaussians_to_render["scales"])
+            
+            print(f"🔍 Gaussian Debug:")
+            print(f"   Means range: {means.min():.3f} to {means.max():.3f}")
+            print(f"   Opacity range: {opacities.min():.3f} to {opacities.max():.3f}")
+            print(f"   Scale range: {scales.min():.3f} to {scales.max():.3f}")
+            print(f"   High opacity count: {(opacities > 0.1).sum()}/{len(opacities)}")
+        
         optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera) if self.training else camera.camera_to_worlds
         colors_crop = torch.cat(
             (gaussians_to_render["features_dc"][:, None, :], gaussians_to_render["features_rest"]), dim=1
@@ -429,7 +630,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             Ks=K,
             width=W,
             height=H,
-            packed=False,
+            packed=True,
             near_plane=0.01,
             far_plane=1e10,
             render_mode=render_mode,
@@ -439,15 +640,34 @@ class ArtiSplatfactoModel(SplatfactoModel):
             rasterize_mode=self.config.rasterize_mode,
         )
         
+        # Debug info
+        n_rendered = gaussians_to_render["means"].shape[0]
+        print(f"Rendering {n_rendered} Gaussians")
+        if self.info.get("gaussian_ids") is not None:
+            print(f"Gaussian IDs shape: {self.info['gaussian_ids'].shape}")
+            print(f"ID range: {self.info['gaussian_ids'].min()} to {self.info['gaussian_ids'].max()}")
+        else:
+            print("gaussian_ids is None - NO VISIBLE GAUSSIANS!")
+            if self.training and self.step % 100 == 0:
+                print("🚨 This means all Gaussians are being culled!")
+                print("   Check: camera position, Gaussian positions, opacities, scales")
+
         if self.training:
+            print(f"Strategy gets {self.gauss_params['means'].shape[0]} Gaussians (object only)")
+            
+            # Ensure perfect match between render and strategy
+            assert self.gauss_params['means'].shape[0] == n_rendered, \
+                f"Mismatch: rendered {n_rendered}, strategy gets {self.gauss_params['means'].shape[0]}"
+            
             self.strategy.step_pre_backward(
-                self.gauss_params, 
-                self.optimizers, 
-                self.strategy_state, 
-                self.step, 
+                self.gauss_params,
+                self.optimizers,
+                self.strategy_state,
+                self.step,
                 self.info
             )
-        
+            print(f"Strategy step pre-backward complete at step {self.step}")
+
         background = self._get_background_color()
         rgb = render[..., :3] + (1 - alpha) * background
         rgb = torch.clamp(rgb, 0.0, 1.0)
@@ -459,6 +679,28 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "accumulation": alpha.squeeze(0),
             "background": background,
         }
+
+    def _get_combined_trainable_params(self) -> Dict[str, torch.Tensor]:
+        """Get combined object + canonical parameters for strategy operations"""
+        combined_params = {}
+        
+        for param_name in self.gauss_params.keys():
+            obj_param = self.gauss_params[param_name]
+            canon_param = self.gauss_params_canonical[param_name]
+                        
+            if obj_param.numel() > 0 and canon_param.numel() > 0:
+                combined_params[param_name] = torch.cat([obj_param, canon_param], dim=0)
+            elif obj_param.numel() > 0:
+                combined_params[param_name] = obj_param
+            elif canon_param.numel() > 0:
+                combined_params[param_name] = canon_param
+            else:
+                # Both empty - this is the problem!
+                print(f"❌ WARNING: Both {param_name} tensors are empty!")
+                combined_params[param_name] = obj_param
+        
+        return combined_params
+    
 
 def apply_joint_transform(means, quats, joint_pivot, joint_axis, joint_angle):
     """
