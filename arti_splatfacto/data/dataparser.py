@@ -150,13 +150,9 @@ class ArtiSplatfactoDataParser(DataParser):
             else:
                 depth_filenames.append(None)
 
-            # mask_rel = Path(fr.get("mask_path", "")) if "mask_path" in fr else None
-            # if mask_rel is not None and str(mask_rel) != "":
-            #     mask_filenames.append(self._get_fname(mask_rel, data_dir, "masks_"))
-            # else:
-            #     guess = (Path(self.config.obj_mask_dir) / Path(img_path).name)
-            #     guess_full = self._get_fname(guess, data_dir, "masks_")
-            #     mask_filenames.append(guess_full if guess_full.exists() else None)
+            mask_rel = Path(fr.get("mask_path", "")) if "mask_path" in fr else None
+            if mask_rel is not None and str(mask_rel) != "":
+                mask_filenames.append(self._get_fname(mask_rel, data_dir, "masks_"))
 
             if self.config.load_dynamic_objects:
                 times_list.append(float(fr.get("time", 0.0)))
@@ -210,7 +206,7 @@ class ArtiSplatfactoDataParser(DataParser):
         poses_all[:, :3, 3] *= scale_factor
 
         image_filenames = [image_filenames[i] for i in indices]
-        # mask_filenames   = [mask_filenames[i] if mask_filenames[i] is not None else None for i in indices]
+        mask_filenames   = [mask_filenames[i] if mask_filenames[i] is not None else None for i in indices]
         depth_filenames  = [depth_filenames[i] if depth_filenames[i] is not None else None for i in indices]
         poses = poses_all[idx]
 

@@ -63,9 +63,7 @@ def world_to_cam_opencv_from_nerf_c2w_gl(c2w):
 
 def project_points_cv(Xw, R, t, K, w, h):
     """
-    Xw: Nx3 world points; R:3x3, t:3x1 (OpenCV, z forward, y down)
-    K: 3x3 pixel intrinsics; w,h: image size
-    Returns a boolean mask HxW with projected points set True.
+    Projects 3D points into a filled silhouette mask.
     """
     Xc = (R @ Xw.T + t).T  # Nx3
     Z = Xc[:, 2]
@@ -76,16 +74,22 @@ def project_points_cv(Xw, R, t, K, w, h):
     Xc = Xc[valid]
     x = Xc[:, 0] / Xc[:, 2]
     y = Xc[:, 1] / Xc[:, 2]
-    u = K[0,0]*x + K[0,2]
-    v = K[1,1]*y + K[1,2]
+    u = (K[0, 0] * x + K[0, 2]).cpu().numpy()
+    v = (K[1, 1] * y + K[1, 2]).cpu().numpy()
 
-    # rasterize
-    u = torch.round(u).long()
-    v = torch.round(v).long()
+    # Keep only points inside image
     inb = (u >= 0) & (u < w) & (v >= 0) & (v < h)
     u, v = u[inb], v[inb]
+
+    if len(u) < 3:
+        return np.zeros((h, w), dtype=np.uint8)
+
+    pts = np.stack([u, v], axis=1).astype(np.int32)
+    hull = cv2.convexHull(pts)
+
     mask = np.zeros((h, w), dtype=np.uint8)
-    mask[v.numpy(), u.numpy()] = 255
+    cv2.fillConvexPoly(mask, hull, 255)
+
     return mask
 
 def guess_mask_path(rgb_rel: str, masks_dir: str):
@@ -114,10 +118,15 @@ def guess_mask_path(rgb_rel: str, masks_dir: str):
 # ---------- main ----------
 def main(data_dir="data/gs_t_multi_post", out_dir="masks_new",
          write_overlays=True, update_json=True, backup_json=True,
-         flip_angle=True, close_kernel=9, close_iters=8):
+         flip_angle=True, close_kernel=9, close_iters=1, rest=False):
+    
     data_dir = Path(data_dir)
     out_dir = data_dir / out_dir
     out_dir.mkdir(exist_ok=True)
+
+    # if rest:
+    #     out_dir_rest = data_dir / "masks"
+    #     out_dir_rest.mkdir(exist_ok=True)
 
     T, M = load_data(data_dir)
 
@@ -149,46 +158,70 @@ def main(data_dir="data/gs_t_multi_post", out_dir="masks_new",
         img_rel = f["file_path"]
         angle = float(f.get("joint_angle", 0.0))
         if flip_angle:
-            angle = -angle  # flip rotation direction if needed
+            angle = -angle
 
         c2w = f["transform_matrix"]
-
-        # rotate articulated object in world
-        Xw = rotate_about_pivot(Xw0, joint_pivot, joint_axis, angle)
-
-        # project
         R, t = world_to_cam_opencv_from_nerf_c2w_gl(c2w)
-        mask = project_points_cv(Xw, R, t, K, W, H)
 
-        # densify (morph close)
-        if mask.any():
+        # Articulated mask
+        Xw_art = rotate_about_pivot(Xw0, joint_pivot, joint_axis, angle)
+        mask_art = project_points_cv(Xw_art, R, t, K, W, H)
+
+        if mask_art.any():
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel, close_kernel))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=close_iters)
+            mask_art = cv2.morphologyEx(mask_art, cv2.MORPH_CLOSE, kernel, iterations=close_iters)
 
-        # save mask
-        img_name = Path(img_rel).stem
-        mask_rel = f"{out_subdir}/{img_name}.png"
-        cv2.imwrite(str(data_dir / mask_rel), mask)
+        if not rest:
+            img_name = Path(img_rel).stem
+            mask_art_rel = f"{out_subdir}/{img_name}.png"
+            cv2.imwrite(str(data_dir / mask_art_rel), mask_art)
 
-        # overlay for sanity
+        if rest:
+            # Rest pose mask (no articulation)
+            mask_rest = project_points_cv(Xw0, R, t, K, W, H)
+            if mask_rest.any():
+                mask_rest = cv2.morphologyEx(mask_rest, cv2.MORPH_CLOSE, kernel, iterations=close_iters)
+            mask_rest_rel = f"{out_subdir}/{img_name}_rest.png"
+            # cv2.imwrite(str(data_dir / mask_rest_rel), mask_rest)
+
+            # Combined mask = union of articulated + rest
+            mask_combined = np.maximum(mask_art, mask_rest)
+            mask_comb_rel = f"{out_subdir}/{img_name}.png"
+            cv2.imwrite(str(data_dir / mask_comb_rel), mask_combined)
+
+            # Update JSON with combined mask path
+            if update_json:
+                f["mask_path"] = mask_comb_rel
+
+        else:
+            # No rest pose → use only articulated mask path
+            if update_json:
+                f["mask_path"] = mask_art_rel
+
+        # Overlays (optional)
         if write_overlays:
             img_path = data_dir / img_rel
             if img_path.exists():
                 rgb = cv2.imread(str(img_path))
                 if rgb is not None and rgb.shape[1] == W and rgb.shape[0] == H:
-                    overlay = rgb.copy()
-                    overlay[mask > 0] = [0, 255, 0]
-                    blend = cv2.addWeighted(rgb, 0.7, overlay, 0.3, 0)
-                    cv2.imwrite(str(out_dir / f"{img_name}_overlay.png"), blend)
+                    overlay_art = rgb.copy()
+                    overlay_art[mask_art > 0] = [0, 255, 0]
+                    # cv2.imwrite(str(out_dir / f"{img_name}_art_overlay.png"),
+                    #             cv2.addWeighted(rgb, 0.7, overlay_art, 0.3, 0))
 
-        # attach path into JSON
-        if update_json:
-            f["mask_path"] = mask_rel  # consistent with file_path/depth_file_path (relative)
+                    # if rest:
+                        # overlay_rest = rgb.copy()
+                        # overlay_rest[mask_rest > 0] = [255, 0, 0]
+                        # cv2.imwrite(str(out_dir / f"{img_name}_rest_overlay.png"),
+                        #             cv2.addWeighted(rgb, 0.7, overlay_rest, 0.3, 0))
 
-        if i % 25 == 0 or i == len(frames):
-            print(f"  {i}/{len(frames)}")
+                        # overlay_comb = rgb.copy()
+                        # overlay_comb[mask_combined > 0] = [0, 0, 255]
+                        # cv2.imwrite(str(out_dir / f"{img_name}_overlay.png"),
+                        #             cv2.addWeighted(rgb, 0.7, overlay_comb, 0.3, 0))
 
-    # write JSON back
+
+    # after the for loop
     if update_json:
         tj = data_dir / "transforms_post.json"
         if backup_json and tj.exists():
@@ -198,7 +231,6 @@ def main(data_dir="data/gs_t_multi_post", out_dir="masks_new",
             json.dump(T, g, indent=2)
         print("✅ Updated transforms_post.json with mask_path for all frames.")
 
-    print(f"✅ Done. Masks in: {out_dir}")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser("Generate 2D masks and update transforms JSON")
@@ -210,6 +242,7 @@ if __name__ == "__main__":
     ap.add_argument("--no-flip-angle", action="store_true", help="Use +angle instead of -angle for articulation")
     ap.add_argument("--close-kernel", type=int, default=9, help="Morph close kernel size")
     ap.add_argument("--close-iters", type=int, default=8, help="Morph close iterations")
+    ap.add_argument("--rest", action="store_true", help="Also save rest pose masks for each frame")
     args = ap.parse_args()
 
     main(
@@ -220,5 +253,6 @@ if __name__ == "__main__":
         backup_json=args.backup_json,
         flip_angle=not args.no_flip_angle,
         close_kernel=args.close_kernel,
-        close_iters=args.close_iters
+        close_iters=args.close_iters,
+        rest=args.rest
     )

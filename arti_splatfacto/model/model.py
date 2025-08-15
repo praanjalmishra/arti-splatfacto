@@ -52,6 +52,15 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
     joint_pivot: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     joint_axis: List[float] = field(default_factory=lambda: [0.0, 0.0, 1.0])
 
+    continue_cull_post_densification: bool = True
+    """If True, continue to cull problematic gaussians even after densification stops"""
+    
+    # Enhanced culling parameters
+    cull_post_densification_every: int = 50
+    """How often to cull post-densification (in steps)"""
+    
+    cull_boundary_gaussians: bool = True
+    """If True, cull Gaussians that drift outside object boundaries"""
 
 class ArtiSplatfactoModel(SplatfactoModel):    
 
@@ -70,39 +79,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
         self.metadata = kwargs.get("metadata", {})
         self.joint_angles = self.metadata.get("joint_angles", None)
 
-    #     self._apply_optimizer_patch()
-
-    # def _apply_optimizer_patch(self):
-    #     """Patch torch.optim.Optimizer.load_state_dict to handle parameter size mismatches"""
-    #     import torch.optim
-        
-    #     # Only patch once globally
-    #     if hasattr(torch.optim.Optimizer, '_artisplat_patched'):
-    #         return
-        
-    #     # Store the original method
-    #     original_load_state_dict = torch.optim.Optimizer.load_state_dict
-        
-    #     def patched_load_state_dict(optimizer_self, state_dict):
-    #         """Patched version that gracefully handles parameter group size mismatches"""
-    #         try:
-    #             return original_load_state_dict(optimizer_self, state_dict)
-    #         except ValueError as e:
-    #             error_msg = str(e)
-    #             if "doesn't match the size of optimizer's group" in error_msg:
-    #                 print("🔧 OPTIMIZER PATCH ACTIVATED")
-    #                 print("   Detected parameter group size mismatch (expected with ArtiSplatfacto)")
-    #                 print("   Skipping optimizer state loading - optimizer will restart fresh")
-    #                 print("   This is normal when loading vanilla checkpoints into ArtiSplatfacto")
-    #                 return  # Gracefully skip loading
-    #             else:
-    #                 # Re-raise any other errors
-    #                 raise e
-        
-    #     # Apply the global patch
-    #     torch.optim.Optimizer.load_state_dict = patched_load_state_dict
-    #     torch.optim.Optimizer._artisplat_patched = True
-    #     print("✅ Applied ArtiSplatfacto optimizer compatibility patch")
 
     def populate_modules(self):
         """Populates the modules of the model."""
@@ -347,27 +323,9 @@ class ArtiSplatfactoModel(SplatfactoModel):
             self._update_optimizer_param_references()
 
 
-    # # Alternative approach - override the parameter groups method to be called after loading
-    # def get_gaussian_param_groups(self) -> Dict[str, List[torch.nn.Parameter]]:
-    #     """Get parameter groups for optimizers"""
-    #     GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
-    #     param_groups = {}
-
-    #     print("DEBUG: Building parameter groups:")
-    #     for name in GAUSS:
-    #         if name in self.gauss_params and self.gauss_params[name].numel() > 0:
-    #             param_groups[name] = [self.gauss_params[name]]
-    #             print(f"  {name}: {self.gauss_params[name].shape}")
-    #         else:
-    #             print(f"  {name}: MISSING or EMPTY!")
-
-    #     print(f"Final parameter groups: {list(param_groups.keys())}")
-    #     return param_groups
-
-
-    # EMERGENCY FIX: If the above doesn't work, add this to step_post_backward
+    # Enhanced step_post_backward implementation
     def step_post_backward(self, step):
-        """Strategy step after backward pass"""
+        """Strategy step after backward pass with continue_cull_post_densification"""
         print(f"🚨 step_post_backward CALLED at step {step}")
         assert step == self.step
 
@@ -380,45 +338,148 @@ class ArtiSplatfactoModel(SplatfactoModel):
         
         print(f"✅ Found {len(self.info['gaussian_ids'])} visible Gaussians")
 
-        n_gaussians = self.gauss_params['means'].shape[0]
-        print(f"Before strategy: obj={n_gaussians}")
+        n_gaussians_before = self.gauss_params['means'].shape[0]
+        print(f"Before strategy: obj={n_gaussians_before}")
 
-
-        # Verify parameters are now in optimizers
-        print("DEBUG: Final optimizer verification:")
-        for opt_name, optimizer in self.optimizers.items():
-            if opt_name in self.gauss_params:
-                param = self.gauss_params[opt_name]
-                in_opt = any(param is p for group in optimizer.param_groups for p in group['params'])
-                print(f"  {opt_name}: shape={param.shape}, in_optimizer={in_opt}")
-
-        if isinstance(self.strategy, DefaultStrategy):
-            self.strategy.step_post_backward(
-                params=self.gauss_params,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=self.step,
-                info=self.info,
-                packed=True,
-            )
-        elif isinstance(self.strategy, MCMCStrategy):
-            self.strategy.step_post_backward(
-                params=self.gauss_params,  
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=self.info,
-                lr=self.schedulers["means"].get_last_lr()[0],
-            )
-        else:
-            raise ValueError(f"Unknown strategy {self.strategy}")
+        # Determine if we should do densification
+        should_densify = step < self.config.stop_split_at
         
-        print(f"After strategy: obj={self.gauss_params['means'].shape[0]}")
+        if should_densify:
+            print("🌱 Applying densification strategy")
+            # Apply regular strategy operations (densification + culling)
+            if isinstance(self.strategy, DefaultStrategy):
+                self.strategy.step_post_backward(
+                    params=self.gauss_params,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=self.step,
+                    info=self.info,
+                    packed=True,
+                )
+            elif isinstance(self.strategy, MCMCStrategy):
+                self.strategy.step_post_backward(
+                    params=self.gauss_params,  
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=self.info,
+                    lr=self.schedulers["means"].get_last_lr()[0],
+                )
+            else:
+                raise ValueError(f"Unknown strategy {self.strategy}")
+        
+        elif self.config.continue_cull_post_densification:
+            print("✂️  Post-densification culling phase")
+            # Only do culling, no more densification
+            if step % self.config.cull_post_densification_every == 0:
+                self._cull_post_densification()
+        
+        n_gaussians_after = self.gauss_params['means'].shape[0]
+        print(f"After strategy: obj={n_gaussians_after}")
 
+
+    def _cull_post_densification(self):
+        """
+        Cull problematic Gaussians after densification has stopped
+        Similar to Street Gaussians approach
+        """
+        if not hasattr(self, 'gauss_params') or self.gauss_params['means'].shape[0] == 0:
+            return
+        
+        print("🔍 Analyzing Gaussians for post-densification culling...")
+        
+        # Get current parameters
+        means = self.gauss_params["means"]
+        scales = torch.exp(self.gauss_params["scales"])
+        opacities = torch.sigmoid(self.gauss_params["opacities"])
+        
+        n_total = len(means)
+        cull_masks = {}
+        
+        # 1. Low opacity culling (standard)
+        low_opacity_mask = opacities.squeeze() < self.config.cull_alpha_thresh
+        cull_masks["low_opacity"] = low_opacity_mask
+        
+        # 2. Large scale culling
+        large_scale_mask = scales.max(dim=-1)[0] > self.config.cull_scale_thresh
+        cull_masks["large_scale"] = large_scale_mask
+        
+        # 3. High aspect ratio culling (anti-spikiness)
+        aspect_ratios = scales.max(dim=-1)[0] / (scales.min(dim=-1)[0] + 1e-8)
+        spiky_mask = aspect_ratios > self.config.max_gauss_ratio
+        cull_masks["spiky"] = spiky_mask
+        
+        # 4. Boundary-based culling (if enabled and available)
+        boundary_mask = torch.zeros_like(low_opacity_mask)
+        if (self.config.cull_boundary_gaussians and 
+            hasattr(self, 'obj_3d_seg') and 
+            self.obj_3d_seg is not None):
+            
+            obj_confidence = self.obj_3d_seg.query(means, thresh=0.0)
+            boundary_mask = obj_confidence < 0.3  # Outside object with low confidence
+            cull_masks["boundary"] = boundary_mask
+        
+        # 5. Very large Gaussians (emergency culling)
+        huge_mask = scales.max(dim=-1)[0] > 0.5  # 50cm - emergency threshold
+        cull_masks["huge"] = huge_mask
+        
+        # Combine all culling criteria
+        final_cull_mask = torch.zeros_like(low_opacity_mask)
+        for criterion, mask in cull_masks.items():
+            final_cull_mask |= mask
+        
+        n_cull = final_cull_mask.sum().item()
+        
+        if n_cull > 0:
+            print(f"📊 Culling breakdown:")
+            for criterion, mask in cull_masks.items():
+                count = mask.sum().item()
+                if count > 0:
+                    print(f"   - {criterion}: {count}")
+            
+            print(f"🗑️  Culling {n_cull}/{n_total} Gaussians ({n_cull/n_total*100:.1f}%)")
+            
+            # Apply culling
+            keep_mask = ~final_cull_mask
+            for param_name, param in self.gauss_params.items():
+                if param.numel() > 0:
+                    new_param = param[keep_mask].contiguous()
+                    self.gauss_params[param_name] = torch.nn.Parameter(new_param)
+            
+            # Update optimizer references
+            self._update_optimizer_param_references()
+            
+            n_remaining = keep_mask.sum().item()
+            print(f"✅ Remaining Gaussians: {n_remaining}")
+            
+            # Update strategy state if it exists
+            if hasattr(self, 'strategy_state') and self.strategy_state is not None:
+                self._update_strategy_state_after_culling(keep_mask)
+        else:
+            print("✅ No Gaussians need culling")
+
+
+    def _update_strategy_state_after_culling(self, keep_mask):
+        """Update strategy state arrays after culling"""
+        if not hasattr(self, 'strategy_state') or self.strategy_state is None:
+            return
+        
+        state = self.strategy_state
+        
+        # Update state arrays that track per-Gaussian statistics
+        for key in ["grad2d", "count", "radii"]:
+            if key in state and state[key] is not None:
+                if len(state[key]) == len(keep_mask):
+                    state[key] = state[key][keep_mask]
+                    print(f"🔧 Updated strategy state '{key}': {len(keep_mask)} → {len(state[key])}")
+
+
+    # Enhanced get_loss_dict with background accumulation penalty
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         pred_img = outputs["rgb"]
 
+        mask = None
         if "mask" in batch:
             # batch["mask"] : [H, W, 1]
             mask = self._downscale_if_required(batch["mask"])
@@ -427,28 +488,45 @@ class ArtiSplatfactoModel(SplatfactoModel):
             gt_img = gt_img * mask
             pred_img = pred_img * mask
 
-
         # === Losses ===
         Ll1 = torch.abs(gt_img - pred_img).mean()
         simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
 
+        loss_dict = {
+            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
+        }
+
+        # Background accumulation penalty (Street Gaussians inspired)
+        if mask is not None and "accumulation" in outputs:
+            accumulation = outputs["accumulation"]
+            background_mask = ~mask.bool()  # Inverse of object mask
+            background_acc_loss = (background_mask * accumulation).mean()
+            loss_dict["background_acc_penalty"] = 0.1 * background_acc_loss
+            
+            # if self.step % 100 == 0:  # Log occasionally
+            #     print(f"🚫 Background accumulation penalty: {background_acc_loss.item():.4f}")
+
+        # Enhanced scale regularization
         if self.config.use_scale_regularization and self.step % 10 == 0:
-            scale_exp = torch.exp(self.scales)
-            scale_reg = (
-                torch.maximum(
-                    scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1),
-                    torch.tensor(self.config.max_gauss_ratio),
-                )
-                - self.config.max_gauss_ratio
-            )
-            scale_reg = 0.1 * scale_reg.mean()
+            scales = torch.exp(self.gauss_params["scales"])
+            
+            # Multiple scale penalties
+            # 1. Aspect ratio penalty
+            scale_ratios = scales.max(dim=-1)[0] / (scales.min(dim=-1)[0] + 1e-8)
+            ratio_penalty = torch.clamp(scale_ratios - self.config.max_gauss_ratio, min=0.0)
+            
+            # 2. Absolute size penalty
+            size_penalty = torch.clamp(scales.max(dim=-1)[0] - 0.15, min=0.0)  # Max 15cm
+            
+            # 3. Total scale regularization
+            scale_reg = 0.1 * (ratio_penalty.mean() + size_penalty.mean())
+            
+            if self.step % 100 == 0:  # Log occasionally
+                print(f"📏 Scale reg - ratio: {ratio_penalty.mean():.4f}, size: {size_penalty.mean():.4f}")
         else:
             scale_reg = torch.tensor(0.0).to(self.device)
 
-        loss_dict = {
-            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
-            "scale_reg": scale_reg,
-        }
+        loss_dict["scale_reg"] = scale_reg
 
         # MCMC extras
         if self.config.strategy == "mcmc":
@@ -680,26 +758,26 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "background": background,
         }
 
-    def _get_combined_trainable_params(self) -> Dict[str, torch.Tensor]:
-        """Get combined object + canonical parameters for strategy operations"""
-        combined_params = {}
+    # def _get_combined_trainable_params(self) -> Dict[str, torch.Tensor]:
+    #     """Get combined object + canonical parameters for strategy operations"""
+    #     combined_params = {}
         
-        for param_name in self.gauss_params.keys():
-            obj_param = self.gauss_params[param_name]
-            canon_param = self.gauss_params_canonical[param_name]
+    #     for param_name in self.gauss_params.keys():
+    #         obj_param = self.gauss_params[param_name]
+    #         canon_param = self.gauss_params_canonical[param_name]
                         
-            if obj_param.numel() > 0 and canon_param.numel() > 0:
-                combined_params[param_name] = torch.cat([obj_param, canon_param], dim=0)
-            elif obj_param.numel() > 0:
-                combined_params[param_name] = obj_param
-            elif canon_param.numel() > 0:
-                combined_params[param_name] = canon_param
-            else:
-                # Both empty - this is the problem!
-                print(f"❌ WARNING: Both {param_name} tensors are empty!")
-                combined_params[param_name] = obj_param
+    #         if obj_param.numel() > 0 and canon_param.numel() > 0:
+    #             combined_params[param_name] = torch.cat([obj_param, canon_param], dim=0)
+    #         elif obj_param.numel() > 0:
+    #             combined_params[param_name] = obj_param
+    #         elif canon_param.numel() > 0:
+    #             combined_params[param_name] = canon_param
+    #         else:
+    #             # Both empty - this is the problem!
+    #             print(f"❌ WARNING: Both {param_name} tensors are empty!")
+    #             combined_params[param_name] = obj_param
         
-        return combined_params
+    #     return combined_params
     
 
 def apply_joint_transform(means, quats, joint_pivot, joint_axis, joint_angle):
