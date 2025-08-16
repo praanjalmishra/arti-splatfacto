@@ -170,7 +170,8 @@ class ArtiSplatfactoModel(SplatfactoModel):
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
         all_means = state_dict["gauss_params.means"].to(self.device)
-        obj_mask = self.obj_3d_seg.query(all_means, grow=1, thresh=0.01, bbox_margin=0.01).to(torch.bool).cpu()
+        obj_mask = self.obj_3d_seg.query_refine(all_means, grow=1, thresh=0.01, bbox_margin=0.01).to(torch.bool).cpu()
+        # obj_mask = self.obj_3d_seg.query(all_means).to(torch.bool).cpu()
         bg_mask  = ~obj_mask
 
         # trainable object subset
@@ -262,7 +263,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         }
 
         super().load_state_dict(non_gauss_state, strict=False)
-        self.step = state_dict.get("step", 0)
+        self.step = 0
         
         print(f"Load complete — obj={self.gauss_params['means'].shape[0]}, "
             f"canon={self.gauss_params_canonical['means'].shape[0]}, "
@@ -331,10 +332,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         print(f"Strategy step_post_backward with {self.gauss_params['means'].shape[0]} object Gaussians")
 
-        # Check if any Gaussians are visible
-        if self.info.get("gaussian_ids") is None:
-            print("⚠️  No visible Gaussians - skipping strategy step_post_backward")
-            return
         
         print(f"✅ Found {len(self.info['gaussian_ids'])} visible Gaussians")
 
@@ -345,7 +342,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         should_densify = step < self.config.stop_split_at
         
         if should_densify:
-            print("🌱 Applying densification strategy")
+            print("Applying densification strategy")
             # Apply regular strategy operations (densification + culling)
             if isinstance(self.strategy, DefaultStrategy):
                 self.strategy.step_post_backward(
@@ -386,7 +383,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         if not hasattr(self, 'gauss_params') or self.gauss_params['means'].shape[0] == 0:
             return
         
-        print("🔍 Analyzing Gaussians for post-densification culling...")
+        print("Analyzing Gaussians for post-densification culling...")
         
         # Get current parameters
         means = self.gauss_params["means"]
@@ -396,20 +393,16 @@ class ArtiSplatfactoModel(SplatfactoModel):
         n_total = len(means)
         cull_masks = {}
         
-        # 1. Low opacity culling (standard)
         low_opacity_mask = opacities.squeeze() < self.config.cull_alpha_thresh
         cull_masks["low_opacity"] = low_opacity_mask
         
-        # 2. Large scale culling
         large_scale_mask = scales.max(dim=-1)[0] > self.config.cull_scale_thresh
         cull_masks["large_scale"] = large_scale_mask
         
-        # 3. High aspect ratio culling (anti-spikiness)
         aspect_ratios = scales.max(dim=-1)[0] / (scales.min(dim=-1)[0] + 1e-8)
         spiky_mask = aspect_ratios > self.config.max_gauss_ratio
         cull_masks["spiky"] = spiky_mask
         
-        # 4. Boundary-based culling (if enabled and available)
         boundary_mask = torch.zeros_like(low_opacity_mask)
         if (self.config.cull_boundary_gaussians and 
             hasattr(self, 'obj_3d_seg') and 
@@ -419,7 +412,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
             boundary_mask = obj_confidence < 0.3  # Outside object with low confidence
             cull_masks["boundary"] = boundary_mask
         
-        # 5. Very large Gaussians (emergency culling)
         huge_mask = scales.max(dim=-1)[0] > 0.5  # 50cm - emergency threshold
         cull_masks["huge"] = huge_mask
         
@@ -431,7 +423,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         n_cull = final_cull_mask.sum().item()
         
         if n_cull > 0:
-            print(f"📊 Culling breakdown:")
+            print(f"Culling breakdown:")
             for criterion, mask in cull_masks.items():
                 count = mask.sum().item()
                 if count > 0:
@@ -479,53 +471,53 @@ class ArtiSplatfactoModel(SplatfactoModel):
         gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         pred_img = outputs["rgb"]
 
-        mask = None
-        if "mask" in batch:
-            # batch["mask"] : [H, W, 1]
-            mask = self._downscale_if_required(batch["mask"])
-            mask = mask.to(self.device)
+        time_val = float(batch["time"])  
+        mask_pre = batch.get("mask_pre", None)
+        mask_post = batch.get("mask_post", None)
+
+        if mask_pre is not None:
+            mask_pre = self._downscale_if_required(mask_pre.to(self.device))
+        if mask_post is not None:
+            mask_post = self._downscale_if_required(mask_post.to(self.device))
+
+        # If door is still mostly closed, supervise only with mask_post
+        if time_val <= 0.25 and mask_post is not None:
+            mask = mask_post
+        # If door is opening/opened, use mask_post (revealed area + door)
+        elif time_val >= 0.25 and mask_pre is not None and mask_post is not None:
+            mask = torch.clamp(mask_pre + mask_post, 0.0, 1.0)
+        else:
+            mask = None
+
+        if mask is not None:
             assert mask.shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
             gt_img = gt_img * mask
             pred_img = pred_img * mask
 
         # === Losses ===
         Ll1 = torch.abs(gt_img - pred_img).mean()
-        simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
-
+        simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...],
+                                pred_img.permute(2, 0, 1)[None, ...])
         loss_dict = {
             "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
         }
 
-        # Background accumulation penalty (Street Gaussians inspired)
+        # Background accumulation penalty
         if mask is not None and "accumulation" in outputs:
             accumulation = outputs["accumulation"]
-            background_mask = ~mask.bool()  # Inverse of object mask
+            background_mask = ~mask.bool()
             background_acc_loss = (background_mask * accumulation).mean()
             loss_dict["background_acc_penalty"] = 0.1 * background_acc_loss
-            
-            # if self.step % 100 == 0:  # Log occasionally
-            #     print(f"🚫 Background accumulation penalty: {background_acc_loss.item():.4f}")
 
-        # Enhanced scale regularization
+        # Scale regularization
         if self.config.use_scale_regularization and self.step % 10 == 0:
             scales = torch.exp(self.gauss_params["scales"])
-            
-            # Multiple scale penalties
-            # 1. Aspect ratio penalty
             scale_ratios = scales.max(dim=-1)[0] / (scales.min(dim=-1)[0] + 1e-8)
             ratio_penalty = torch.clamp(scale_ratios - self.config.max_gauss_ratio, min=0.0)
-            
-            # 2. Absolute size penalty
-            size_penalty = torch.clamp(scales.max(dim=-1)[0] - 0.15, min=0.0)  # Max 15cm
-            
-            # 3. Total scale regularization
+            size_penalty = torch.clamp(scales.max(dim=-1)[0] - 0.15, min=0.0)
             scale_reg = 0.1 * (ratio_penalty.mean() + size_penalty.mean())
-            
-            if self.step % 100 == 0:  # Log occasionally
-                print(f"📏 Scale reg - ratio: {ratio_penalty.mean():.4f}, size: {size_penalty.mean():.4f}")
         else:
             scale_reg = torch.tensor(0.0).to(self.device)
-
         loss_dict["scale_reg"] = scale_reg
 
         # MCMC extras
@@ -546,6 +538,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 loss_dict["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)
 
         return loss_dict
+
     
 
     def _get_joint_angle_for_camera(self, camera: Cameras) -> float:
@@ -570,22 +563,16 @@ class ArtiSplatfactoModel(SplatfactoModel):
     def _get_gaussians_for_render(self, camera: Cameras) -> Dict[str, torch.Tensor]:
         """
         Prepare Gaussians for rendering with per-frame articulation.
-        CRITICAL: Must return the exact same parameters that the optimizers know about
         """
-        # Get joint angle for this camera
         joint_angle = self._get_joint_angle_for_camera(camera)
         
-        # During training: MUST use the exact same parameters that optimizers track
         if self.training:
             print(f"Training mode: rendering {self.gauss_params['means'].shape[0]} trainable Gaussians")
             
-            # Apply articulation to the actual optimizer parameters
             if joint_angle != 0.0:
-                # Apply articulation while preserving gradient connection
                 articulated_params = self._apply_articulation_to_optimizer_params(joint_angle)
                 return articulated_params
             else:
-                # No articulation - return optimizer parameters directly
                 return {name: param for name, param in self.gauss_params.items()}
 
         # During evaluation: can use full scene (trainable + fixed)
@@ -611,7 +598,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
         if joint_angle == 0.0:
             return {name: param for name, param in self.gauss_params.items()}
         
-        # Apply joint transform to the optimizer parameters directly
         means_articulated, quats_articulated = apply_joint_transform(
             means=self.gauss_params["means"],  
             quats=self.gauss_params["quats"],  
@@ -620,7 +606,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
             joint_angle=joint_angle
         )
         
-        # Return modified parameters while preserving gradient connections
         articulated_params = {}
         for name, param in self.gauss_params.items():
             if name == "means":
@@ -665,18 +650,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
             return {}
 
         gaussians_to_render = self._get_gaussians_for_render(camera)
-        
-        # Debug: Check Gaussian properties before rendering
-        if self.training and self.step % 100 == 0:  # Debug every 100 steps
-            means = gaussians_to_render["means"]
-            opacities = torch.sigmoid(gaussians_to_render["opacities"])
-            scales = torch.exp(gaussians_to_render["scales"])
-            
-            print(f"🔍 Gaussian Debug:")
-            print(f"   Means range: {means.min():.3f} to {means.max():.3f}")
-            print(f"   Opacity range: {opacities.min():.3f} to {opacities.max():.3f}")
-            print(f"   Scale range: {scales.min():.3f} to {scales.max():.3f}")
-            print(f"   High opacity count: {(opacities > 0.1).sum()}/{len(opacities)}")
         
         optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera) if self.training else camera.camera_to_worlds
         colors_crop = torch.cat(
@@ -757,27 +730,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "accumulation": alpha.squeeze(0),
             "background": background,
         }
-
-    # def _get_combined_trainable_params(self) -> Dict[str, torch.Tensor]:
-    #     """Get combined object + canonical parameters for strategy operations"""
-    #     combined_params = {}
-        
-    #     for param_name in self.gauss_params.keys():
-    #         obj_param = self.gauss_params[param_name]
-    #         canon_param = self.gauss_params_canonical[param_name]
-                        
-    #         if obj_param.numel() > 0 and canon_param.numel() > 0:
-    #             combined_params[param_name] = torch.cat([obj_param, canon_param], dim=0)
-    #         elif obj_param.numel() > 0:
-    #             combined_params[param_name] = obj_param
-    #         elif canon_param.numel() > 0:
-    #             combined_params[param_name] = canon_param
-    #         else:
-    #             # Both empty - this is the problem!
-    #             print(f"❌ WARNING: Both {param_name} tensors are empty!")
-    #             combined_params[param_name] = obj_param
-        
-    #     return combined_params
     
 
 def apply_joint_transform(means, quats, joint_pivot, joint_axis, joint_angle):
@@ -801,8 +753,5 @@ def apply_joint_transform(means, quats, joint_pivot, joint_axis, joint_angle):
         joint_quat.unsqueeze(0).expand_as(quats), 
         quats
     )
-    # print(f"Joint axis: {joint_axis.cpu().numpy()}, Pivot: {joint_pivot.cpu().numpy()}")
-    # print(f"Gaussian mean sample: {means[0].detach().cpu().numpy()}")
-
     
     return means_rotated, quats_rotated

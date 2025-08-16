@@ -11,4 +11,4 @@ echo "Data directory: $DATA_DIR"
 echo "Output directory: $OUTPUT_DIR"
 
 # Run the mask generation script
-python arti_splatfacto/utils/generate_2d_masks.py "$DATA_DIR" 
+python arti_splatfacto/utils/generate_2d_masks.py "$DATA_DIR" --backup-json

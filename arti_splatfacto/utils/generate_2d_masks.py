@@ -117,12 +117,12 @@ def guess_mask_path(rgb_rel: str, masks_dir: str):
     return candidates
 # ---------- main ----------
 def main(data_dir="data/gs_t_multi_post", out_dir="masks_new",
-         write_overlays=True, update_json=True, backup_json=True,
+         write_overlays=False, update_json=True, backup_json=True,
          flip_angle=True, close_kernel=9, close_iters=1, rest=False):
     
     data_dir = Path(data_dir)
     out_dir = data_dir / out_dir
-    out_dir.mkdir(exist_ok=True)
+    # out_dir.mkdir(exist_ok=True)
 
     # if rest:
     #     out_dir_rest = data_dir / "masks"
@@ -163,62 +163,54 @@ def main(data_dir="data/gs_t_multi_post", out_dir="masks_new",
         c2w = f["transform_matrix"]
         R, t = world_to_cam_opencv_from_nerf_c2w_gl(c2w)
 
-        # Articulated mask
+        # --- POST mask (articulated pose at current joint angle) ---
         Xw_art = rotate_about_pivot(Xw0, joint_pivot, joint_axis, angle)
-        mask_art = project_points_cv(Xw_art, R, t, K, W, H)
+        mask_post = project_points_cv(Xw_art, R, t, K, W, H)
 
-        if mask_art.any():
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel, close_kernel))
-            mask_art = cv2.morphologyEx(mask_art, cv2.MORPH_CLOSE, kernel, iterations=close_iters)
+        # --- PRE mask (rest pose, i.e., closed door t=0) ---
+        mask_pre = project_points_cv(Xw0, R, t, K, W, H)
 
-        if not rest:
-            img_name = Path(img_rel).stem
-            mask_art_rel = f"{out_subdir}/{img_name}.png"
-            cv2.imwrite(str(data_dir / mask_art_rel), mask_art)
+        # Apply morphological close if non-empty
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel, close_kernel))
+        if mask_post.any():
+            mask_post = cv2.morphologyEx(mask_post, cv2.MORPH_CLOSE, kernel, iterations=close_iters)
+        if mask_pre.any():
+            mask_pre = cv2.morphologyEx(mask_pre, cv2.MORPH_CLOSE, kernel, iterations=close_iters)
 
-        if rest:
-            # Rest pose mask (no articulation)
-            mask_rest = project_points_cv(Xw0, R, t, K, W, H)
-            if mask_rest.any():
-                mask_rest = cv2.morphologyEx(mask_rest, cv2.MORPH_CLOSE, kernel, iterations=close_iters)
-            mask_rest_rel = f"{out_subdir}/{img_name}_rest.png"
-            # cv2.imwrite(str(data_dir / mask_rest_rel), mask_rest)
+     # --- Create subfolders ---
+        out_pre  = data_dir / "masks_pre"
+        out_post = data_dir / "masks_post"
+        out_pre.mkdir(exist_ok=True)
+        out_post.mkdir(exist_ok=True)
 
-            # Combined mask = union of articulated + rest
-            mask_combined = np.maximum(mask_art, mask_rest)
-            mask_comb_rel = f"{out_subdir}/{img_name}.png"
-            cv2.imwrite(str(data_dir / mask_comb_rel), mask_combined)
+        # Save masks (keep same filename as RGB stem)
+        img_name = Path(img_rel).stem
+        mask_pre_rel  = f"masks_pre/{img_name}.png"
+        mask_post_rel = f"masks_post/{img_name}.png"
 
-            # Update JSON with combined mask path
-            if update_json:
-                f["mask_path"] = mask_comb_rel
+        cv2.imwrite(str(data_dir / mask_pre_rel), mask_pre)
+        cv2.imwrite(str(data_dir / mask_post_rel), mask_post)
 
-        else:
-            # No rest pose → use only articulated mask path
-            if update_json:
-                f["mask_path"] = mask_art_rel
+        # Update JSON (store both paths)
+        if update_json:
+            f["mask_pre_path"]  = mask_pre_rel
+            f["mask_post_path"] = mask_post_rel
 
-        # Overlays (optional)
+        # Overlays (optional, for debugging)
         if write_overlays:
             img_path = data_dir / img_rel
             if img_path.exists():
                 rgb = cv2.imread(str(img_path))
                 if rgb is not None and rgb.shape[1] == W and rgb.shape[0] == H:
-                    overlay_art = rgb.copy()
-                    overlay_art[mask_art > 0] = [0, 255, 0]
-                    # cv2.imwrite(str(out_dir / f"{img_name}_art_overlay.png"),
-                    #             cv2.addWeighted(rgb, 0.7, overlay_art, 0.3, 0))
+                    overlay_pre = rgb.copy()
+                    overlay_pre[mask_pre > 0] = [255, 0, 0]   # red for pre
+                    overlay_post = rgb.copy()
+                    overlay_post[mask_post > 0] = [0, 255, 0] # green for post
+                    cv2.imwrite(str(out_pre / f"{img_name}_overlay.png"),
+                                cv2.addWeighted(rgb, 0.7, overlay_pre, 0.3, 0))
+                    cv2.imwrite(str(out_post / f"{img_name}_overlay.png"),
+                                cv2.addWeighted(rgb, 0.7, overlay_post, 0.3, 0))
 
-                    # if rest:
-                        # overlay_rest = rgb.copy()
-                        # overlay_rest[mask_rest > 0] = [255, 0, 0]
-                        # cv2.imwrite(str(out_dir / f"{img_name}_rest_overlay.png"),
-                        #             cv2.addWeighted(rgb, 0.7, overlay_rest, 0.3, 0))
-
-                        # overlay_comb = rgb.copy()
-                        # overlay_comb[mask_combined > 0] = [0, 0, 255]
-                        # cv2.imwrite(str(out_dir / f"{img_name}_overlay.png"),
-                        #             cv2.addWeighted(rgb, 0.7, overlay_comb, 0.3, 0))
 
 
     # after the for loop
@@ -248,7 +240,7 @@ if __name__ == "__main__":
     main(
         data_dir=args.data_dir,
         out_dir=args.out,
-        write_overlays=not args.no_overlays,
+        write_overlays=args.no_overlays,
         update_json=not args.no_update_json,
         backup_json=args.backup_json,
         flip_angle=not args.no_flip_angle,

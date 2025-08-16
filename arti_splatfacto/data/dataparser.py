@@ -111,6 +111,7 @@ class ArtiSplatfactoDataParser(DataParser):
 
         poses = []
         image_filenames, mask_filenames, depth_filenames = [], [], []
+        mask_pre_filenames, mask_post_filenames = [], []
 
         fx_list, fy_list, cx_list, cy_list = [], [], [], []
         h_list, w_list, distort_list = [], [], []
@@ -150,9 +151,23 @@ class ArtiSplatfactoDataParser(DataParser):
             else:
                 depth_filenames.append(None)
 
-            mask_rel = Path(fr.get("mask_path", "")) if "mask_path" in fr else None
-            if mask_rel is not None and str(mask_rel) != "":
-                mask_filenames.append(self._get_fname(mask_rel, data_dir, "masks_"))
+
+
+
+            # NEW: separate pre- and post-masks
+            mask_pre_rel = Path(fr.get("mask_pre_path", "")) if "mask_pre_path" in fr else None
+            mask_post_rel = Path(fr.get("mask_post_path", "")) if "mask_post_path" in fr else None
+
+            if mask_pre_rel is not None and str(mask_pre_rel) != "":
+                mask_pre_filenames.append(self._get_fname(mask_pre_rel, data_dir, "masks_"))
+            else:
+                mask_pre_filenames.append(None)
+
+            if mask_post_rel is not None and str(mask_post_rel) != "":
+                mask_post_filenames.append(self._get_fname(mask_post_rel, data_dir, "masks_"))
+            else:
+                mask_post_filenames.append(None)
+
 
             if self.config.load_dynamic_objects:
                 times_list.append(float(fr.get("time", 0.0)))
@@ -206,7 +221,9 @@ class ArtiSplatfactoDataParser(DataParser):
         poses_all[:, :3, 3] *= scale_factor
 
         image_filenames = [image_filenames[i] for i in indices]
-        mask_filenames   = [mask_filenames[i] if mask_filenames[i] is not None else None for i in indices]
+        # mask_filenames   = [mask_filenames[i] if mask_filenames[i] is not None else None for i in indices]
+        mask_pre_filenames = [mask_pre_filenames[i] if mask_pre_filenames[i] is not None else None for i in indices]
+        mask_post_filenames = [mask_post_filenames[i] if mask_post_filenames[i] is not None else None for i in indices]
         depth_filenames  = [depth_filenames[i] if depth_filenames[i] is not None else None for i in indices]
         poses = poses_all[idx]
 
@@ -267,7 +284,9 @@ class ArtiSplatfactoDataParser(DataParser):
         metadata = {
             "depth_filenames": depth_filenames if any(x is not None for x in depth_filenames) else None,
             "depth_unit_scale_factor": self.config.depth_unit_scale_factor,
-            "mask_filenames": mask_filenames if any(x is not None for x in mask_filenames) else None,
+            # "mask_filenames": mask_filenames if any(x is not None for x in mask_filenames) else None,
+            "mask_pre_filenames": mask_pre_filenames if any(x is not None for x in mask_pre_filenames) else None,
+            "mask_post_filenames": mask_post_filenames if any(x is not None for x in mask_post_filenames) else None,
             "scene_path": str(data_dir / self.config.obj_mask_dir),
         }
         if self.config.load_dynamic_objects:
@@ -279,7 +298,7 @@ class ArtiSplatfactoDataParser(DataParser):
             image_filenames=image_filenames,
             cameras=cameras,
             scene_box=scene_box,
-            mask_filenames=metadata["mask_filenames"],
+            mask_filenames=None,
             dataparser_scale=scale_factor,
             dataparser_transform=dataparser_transform,
             metadata=metadata,
