@@ -276,7 +276,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         This fixes the 'in_optimizer=False' issue by making optimizers point to the new parameters.
         """
         if not hasattr(self, 'optimizers') or not self.optimizers:
-            print("⚠️  No optimizers found - skipping parameter reference update")
+            print("No optimizers found - skipping parameter reference update")
             return
             
         print("🔧 Updating optimizer parameter references...")
@@ -327,7 +327,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
     # Enhanced step_post_backward implementation
     def step_post_backward(self, step):
         """Strategy step after backward pass with continue_cull_post_densification"""
-        print(f"🚨 step_post_backward CALLED at step {step}")
+        print(f"step_post_backward CALLED at step {step}")
         assert step == self.step
 
         print(f"Strategy step_post_backward with {self.gauss_params['means'].shape[0]} object Gaussians")
@@ -366,7 +366,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 raise ValueError(f"Unknown strategy {self.strategy}")
         
         elif self.config.continue_cull_post_densification:
-            print("✂️  Post-densification culling phase")
+            print(" Post-densification culling phase")
             # Only do culling, no more densification
             if step % self.config.cull_post_densification_every == 0:
                 self._cull_post_densification()
