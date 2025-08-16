@@ -309,7 +309,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
                             del optimizer.state[old_param]
                         optimizer.state[new_param] = {}
         
-        print("✅ Optimizer parameter references updated")
+        print("Optimizer parameter references updated")
 
 
     # Add this method to be called after optimizers are set up
@@ -333,7 +333,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         print(f"Strategy step_post_backward with {self.gauss_params['means'].shape[0]} object Gaussians")
 
         
-        print(f"✅ Found {len(self.info['gaussian_ids'])} visible Gaussians")
+        print(f"Found {len(self.info['gaussian_ids'])} visible Gaussians")
 
         n_gaussians_before = self.gauss_params['means'].shape[0]
         print(f"Before strategy: obj={n_gaussians_before}")
@@ -442,13 +442,13 @@ class ArtiSplatfactoModel(SplatfactoModel):
             self._update_optimizer_param_references()
             
             n_remaining = keep_mask.sum().item()
-            print(f"✅ Remaining Gaussians: {n_remaining}")
+            print(f" Remaining Gaussians: {n_remaining}")
             
             # Update strategy state if it exists
             if hasattr(self, 'strategy_state') and self.strategy_state is not None:
                 self._update_strategy_state_after_culling(keep_mask)
         else:
-            print("✅ No Gaussians need culling")
+            print(" No Gaussians need culling")
 
 
     def _update_strategy_state_after_culling(self, keep_mask):
