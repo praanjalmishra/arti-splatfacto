@@ -7,7 +7,6 @@ import numpy as np
 import cv2
 import json, re
 import argparse
-# ---------- helpers ----------
 def load_data(data_dir: Path):
     with open(data_dir / "transforms_post.json", "r") as f:
         T = json.load(f)

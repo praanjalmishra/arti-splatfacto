@@ -293,6 +293,15 @@ class ArtiSplatfactoDataParser(DataParser):
             metadata["times"] = times  # (N,)
             metadata["joint_angles"] = joint_angles  # (N,)
 
+        # print("=== ArtiSplatfactoDataParser DEBUG ===")
+        # print(f"Split={split}, num_images={len(image_filenames)}")
+        # for i in range(min(5, len(image_filenames))):
+        #     print(f"[{i}] img={image_filenames[i]}")
+        #     print(f"    mask_pre={mask_pre_filenames[i]}")
+        #     print(f"    mask_post={mask_post_filenames[i]}")
+        #     if self.config.load_dynamic_objects:
+        #         print(f"    time={times[i].item():.3f}, joint={joint_angles[i].item():.3f}")
+        # print("======================================")
 
         return DataparserOutputs(
             image_filenames=image_filenames,
