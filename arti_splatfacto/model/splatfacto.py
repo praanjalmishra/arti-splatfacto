@@ -45,6 +45,7 @@ from nerfstudio.utils.misc import torch_compile
 from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.utils.spherical_harmonics import RGB2SH, SH2RGB, num_sh_bases
 
+from arti_splatfacto.utils.strategy import SpatialArtiStrategy
 
 def resize_image(image: torch.Tensor, d: int):
     """
@@ -88,11 +89,11 @@ class SplatfactoModelConfig(ModelConfig):
     _target: Type = field(default_factory=lambda: SplatfactoModel)
     warmup_length: int = 500
     """period of steps where refinement is turned off"""
-    refine_every: int = 10
+    refine_every: int = 100
     """period of steps where gaussians are culled and densified"""
     resolution_schedule: int = 3000
     """training starts at 1/d resolution, every n steps this is doubled"""
-    background_color: Literal["random", "black", "white"] = "random"
+    background_color: Literal["random", "black", "white"] = "black"
     """Whether to randomize the background color."""
     num_downscales: int = 2
     """at the beginning, resolution is 1/2^d, where d is this number"""
@@ -240,7 +241,8 @@ class SplatfactoModel(Model):
         # Strategy for GS densification
         if self.config.strategy == "default":
             # Strategy for GS densification
-            self.strategy = DefaultStrategy(
+            self.strategy = SpatialArtiStrategy(
+                owner=self,
                 prune_opa=self.config.cull_alpha_thresh,
                 grow_grad2d=self.config.densify_grad_thresh,
                 grow_scale3d=self.config.densify_size_thresh,
@@ -255,7 +257,7 @@ class SplatfactoModel(Model):
                 pause_refine_after_reset=self.num_train_data + self.config.refine_every,
                 absgrad=self.config.use_absgrad,
                 revised_opacity=False,
-                verbose=True,
+                verbose=True,             
             )
             self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
         elif self.config.strategy == "mcmc":
@@ -272,6 +274,44 @@ class SplatfactoModel(Model):
         else:
             raise ValueError(f"""Splatfacto does not support strategy {self.config.strategy}
                              Currently, the supported strategies include default and mcmc.""")
+
+
+        # # Strategy for GS densification
+        # if self.config.strategy == "default":
+        #     # Strategy for GS densification
+        #     self.strategy = DefaultStrategy(
+        #         prune_opa=self.config.cull_alpha_thresh,
+        #         grow_grad2d=self.config.densify_grad_thresh,
+        #         grow_scale3d=self.config.densify_size_thresh,
+        #         grow_scale2d=self.config.split_screen_size,
+        #         prune_scale3d=self.config.cull_scale_thresh,
+        #         prune_scale2d=self.config.cull_screen_size,
+        #         refine_scale2d_stop_iter=self.config.stop_screen_size_at,
+        #         refine_start_iter=self.config.warmup_length,
+        #         refine_stop_iter=self.config.stop_split_at,
+        #         reset_every=self.config.reset_alpha_every * self.config.refine_every,
+        #         refine_every=self.config.refine_every,
+        #         pause_refine_after_reset=self.num_train_data + self.config.refine_every,
+        #         absgrad=self.config.use_absgrad,
+        #         revised_opacity=False,
+        #         verbose=True,
+        #     )
+        #     self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
+        # elif self.config.strategy == "mcmc":
+        #     self.strategy = MCMCStrategy(
+        #         cap_max=self.config.max_gs_num,
+        #         noise_lr=self.config.noise_lr,
+        #         refine_start_iter=self.config.warmup_length,
+        #         refine_stop_iter=self.config.stop_split_at,
+        #         refine_every=self.config.refine_every,
+        #         min_opacity=self.config.cull_alpha_thresh,
+        #         verbose=False,
+        #     )
+        #     self.strategy_state = self.strategy.initialize_state()
+        # else:
+        #     raise ValueError(f"""Splatfacto does not support strategy {self.config.strategy}
+        #                      Currently, the supported strategies include default and mcmc.""")
+
 
     @property
     def colors(self):
@@ -489,6 +529,8 @@ class SplatfactoModel(Model):
             background = torch.ones(3, device=self.device)
         elif self.config.background_color == "black":
             background = torch.zeros(3, device=self.device)
+        elif self.config.background_color == "green":
+            background = torch.tensor([0.0, 1.0, 0.0], device=self.device)  # Pure green
         else:
             raise ValueError(f"Unknown background color {self.config.background_color}")
         return background
