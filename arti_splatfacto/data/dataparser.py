@@ -224,7 +224,7 @@ class ArtiSplatfactoDataParser(DataParser):
         # mask_filenames   = [mask_filenames[i] if mask_filenames[i] is not None else None for i in indices]
         mask_pre_filenames = [mask_pre_filenames[i] if mask_pre_filenames[i] is not None else None for i in indices]
         mask_post_filenames = [mask_post_filenames[i] if mask_post_filenames[i] is not None else None for i in indices]
-        depth_filenames  = [depth_filenames[i] if depth_filenames[i] is not None else None for i in indices]
+        depth_filenames = [depth_filenames[i] for i in indices] if len(depth_filenames) > 0 else []
         poses = poses_all[idx]
 
         if self.config.load_dynamic_objects:
@@ -297,6 +297,7 @@ class ArtiSplatfactoDataParser(DataParser):
         # print(f"Split={split}, num_images={len(image_filenames)}")
         # for i in range(min(5, len(image_filenames))):
         #     print(f"[{i}] img={image_filenames[i]}")
+        #     print(f"    depth={depth_filenames[i] if depth_filenames is not None else None}")
         #     print(f"    mask_pre={mask_pre_filenames[i]}")
         #     print(f"    mask_post={mask_post_filenames[i]}")
         #     if self.config.load_dynamic_objects:

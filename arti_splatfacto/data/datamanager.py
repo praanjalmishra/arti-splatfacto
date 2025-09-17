@@ -6,7 +6,7 @@ from importlib import metadata
 import random
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Dict, Literal, Tuple, Type, Union
+from typing import Dict, Literal, Tuple, Type, Union, Generic
 
 import torch
 from arti_splatfacto.data.dataset import ArtiDataset
@@ -16,6 +16,7 @@ from nerfstudio.data.datamanagers.full_images_datamanager import (
     FullImageDatamanagerConfig,
 )
 from nerfstudio.data.datasets.base_dataset import InputDataset
+from nerfstudio.data.datamanagers.base_datamanager import DataManager, DataManagerConfig, TDataset
 
 
 @dataclass
@@ -25,7 +26,7 @@ class ArtiSplatfactoManagerConfig(FullImageDatamanagerConfig):
     camera_res_scale_factor: float = 1.0
 
 
-class ArtiSplatfactoDataManager(FullImageDatamanager):
+class ArtiSplatfactoDataManager(FullImageDatamanager[TDataset], Generic[TDataset]):
     """Simplified DataManager for ArtiSplatfacto"""
 
     config: ArtiSplatfactoManagerConfig

@@ -29,6 +29,10 @@ from pytorch3d.transforms import axis_angle_to_matrix, matrix_to_quaternion, qua
 from arti_splatfacto.metrics import RGBMetrics, DepthMetrics
 import torchvision.transforms.functional as TF
 
+from arti_splatfacto.utils.debug_utils import decode_id_map, save_debug_id_maps, depth_debug
+from arti_splatfacto.utils.img_utils import psnr_masked, crop_imgs_w_masks, compute_2D_bbox, batch_crop_resize,batch_crop_resize
+from arti_splatfacto.utils.articulation_utils import apply_joint_transform, apply_joint_transform_prismatic, apply_articulation_to_optimizer_params
+
 @torch_compile()
 def get_viewmat(optimized_camera_to_world):
     """
@@ -59,7 +63,7 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
     joint_pivot: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     joint_axis: List[float] = field(default_factory=lambda: [0.0, 0.0, 1.0])
 
-    joint_type: str = field(default="prismatic")
+    joint_type: str = field(default="prismatic")  # "revolute" or "prismatic"
 
     continue_cull_post_densification: bool = True
     """If True, continue to cull problematic gaussians even after densification stops"""
@@ -80,6 +84,8 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
     output_depth_during_training: bool = True
     """If True, output depth information during training"""
 
+    depth_debug: bool = False
+
 
 class ArtiSplatfactoModel(SplatfactoModel):    
 
@@ -98,7 +104,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         self.metadata = kwargs.get("metadata", {})
         self.joint_angles = self.metadata.get("joint_angles", None)
 
-        self._needs_optimizer_recreation = False
+    
 
     def populate_modules(self):
         """Populates the modules of the model."""
@@ -143,6 +149,45 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "features_rest": torch.nn.Parameter(torch.empty((0, dim_sh - 1, 3), device=device), requires_grad=False),
             "opacities":     torch.nn.Parameter(torch.empty((0, 1), device=device), requires_grad=False),
         })
+
+        self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=device)
+           
+        # if self.config.strategy == "default":
+        #     # Strategy for GS densification
+        #     self.strategy = SpatialArtiStrategy(
+        #         owner=self.obj_3d_seg,
+        #         prune_opa=self.config.cull_alpha_thresh,
+        #         grow_grad2d=self.config.densify_grad_thresh,
+        #         grow_scale3d=self.config.densify_size_thresh,
+        #         grow_scale2d=self.config.split_screen_size,
+        #         prune_scale3d=self.config.cull_scale_thresh,
+        #         prune_scale2d=self.config.cull_screen_size,
+        #         refine_scale2d_stop_iter=self.config.stop_screen_size_at,
+        #         refine_start_iter=self.config.warmup_length,
+        #         refine_stop_iter=self.config.stop_split_at,
+        #         reset_every=self.config.reset_alpha_every * self.config.refine_every,
+        #         refine_every=self.config.refine_every,
+        #         pause_refine_after_reset=self.num_train_data + self.config.refine_every,
+        #         absgrad=self.config.use_absgrad,
+        #         revised_opacity=False,
+        #         verbose=True
+        #     )
+        #     self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
+        # elif self.config.strategy == "mcmc":
+        #     self.strategy = MCMCStrategy(
+        #         cap_max=self.config.max_gs_num,
+        #         noise_lr=self.config.noise_lr,
+        #         refine_start_iter=self.config.warmup_length,
+        #         refine_stop_iter=self.config.stop_split_at,
+        #         refine_every=self.config.refine_every,
+        #         min_opacity=self.config.cull_alpha_thresh,
+        #         verbose=False,
+        #     )
+        #     self.strategy_state = self.strategy.initialize_state()
+        # else:
+        #     raise ValueError(f"""Splatfacto does not support strategy {self.config.strategy}
+        #                      Currently, the supported strategies include default and mcmc.""")
+
 
         self.rgb_metrics = RGBMetrics()
         self.depth_metrics = DepthMetrics()
@@ -211,7 +256,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         """
         print("Initializing from full scene: partitioning Gaussians...")
 
-        self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
+        # self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
         print("obj mask points:", self.obj_3d_seg)
         self.obj_3d_seg.refine_mask(dilate_k=4, erode_k=1)
 
@@ -219,15 +264,13 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         all_means = state_dict["gauss_params.means"].to(self.device)
         obj_mask = self.obj_3d_seg.query_refine(all_means, grow=1, thresh=0.01, bbox_margin=0.01).to(torch.bool).cpu()
-        # obj_mask = self.obj_3d_seg.query(all_means).to(torch.bool).cpu()
         bg_mask  = ~obj_mask
 
         for p in GAUSS:
             subset = state_dict[f"gauss_params.{p}"][obj_mask].to(self.device)
-            # Create new Parameter with requires_grad=True
             param = torch.nn.Parameter(subset.clone().detach(), requires_grad=True)
             self.gauss_params[p] = param
-            print(f"✅ Object {p}: {param.shape}, requires_grad={param.requires_grad}")
+            print(f"Object {p}: {param.shape}, requires_grad={param.requires_grad}")
 
         # Canonical gaussians (trainable)
         for p in GAUSS:
@@ -235,7 +278,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             # Create new Parameter with requires_grad=True
             param = torch.nn.Parameter(subset.clone().detach(), requires_grad=True)
             self.gauss_params_canonical[p] = param
-            print(f"✅ Canonical {p}: {param.shape}, requires_grad={param.requires_grad}")
+            print(f"Canonical {p}: {param.shape}, requires_grad={param.requires_grad}")
 
         # Fixed background gaussians (non-trainable)
         for p in GAUSS:
@@ -243,9 +286,8 @@ class ArtiSplatfactoModel(SplatfactoModel):
             # Create new Parameter with requires_grad=False
             param = torch.nn.Parameter(subset.clone().detach(), requires_grad=False)
             self.gauss_params_fixed[p] = param
-            print(f"✅ Background {p}: {param.shape}, requires_grad={param.requires_grad}")
+            print(f"Background {p}: {param.shape}, requires_grad={param.requires_grad}")
 
-        # IDs: reuse if present, else allocate
 
         n_obj = self.gauss_params["means"].shape[0]
         n_canon = self.gauss_params_canonical["means"].shape[0]
@@ -258,7 +300,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         print(f"Loading state_dict (Training mode: {self.training})")
         assert self.config.obj_mask_file is not None and self.config.obj_mask_file.exists()
 
-        self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
+        # self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
         if hasattr(self.obj_3d_seg, 'joint_axis') and self.obj_3d_seg.joint_axis is not None:
             self.joint_axis = self.obj_3d_seg.joint_axis.to(self.device)
             print(f"Updated joint axis from mask: {self.joint_axis}")
@@ -270,35 +312,18 @@ class ArtiSplatfactoModel(SplatfactoModel):
             print(f"Updated joint angles from mask: {self.max_joint_angle}")
 
 
-        # # Align mask (extended → rest)
-        # if self.config.joint_type == "prismatic":
-        #     self.max_joint_angle = torch.tensor(0.3, device=self.device)
-        #     translation = -self.joint_axis * self.max_joint_angle
-
-        #     # Shift the mask bbox
-        #     self.obj_3d_seg.bbox_min = self.obj_3d_seg.bbox_min + translation
-        #     self.obj_3d_seg.bbox_max = self.obj_3d_seg.bbox_max + translation
-
-        #     # NOTE: voxel grid stays the same (local coords inside bbox).
-        #     # We just shift the bbox so query() and query_refine() match the Gaussians.
-        #     print(f"[Mask Alignment] Shifted mask bbox into rest space by {translation}")
-
-
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
-        # Backward compatibility for old checkpoints
         if "means" in state_dict:
             for p in GAUSS:
                 state_dict[f"gauss_params.{p}"] = state_dict[p]
 
         if not self.training:
-            # At eval, trust checkpoint background if any fixed gaussians exist
             is_partitioned = any(k.startswith("gauss_params_fixed.") for k in state_dict)
         else:
             is_partitioned = "gauss_params_fixed.means" in state_dict
 
         if is_partitioned:
-            # Directly load partitioned checkpoint
             self.gauss_params = torch.nn.ParameterDict()
             self.gauss_params_canonical = torch.nn.ParameterDict()
             self.gauss_params_fixed = torch.nn.ParameterDict()
@@ -350,10 +375,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
         
         if not isinstance(self.strategy, DefaultStrategy):
             raise ValueError(f"Only DefaultStrategy supported, got {self.strategy}")
-        
-        # print(f" Applying strategy to both object and canonical parameters")
-        # print(f"   Object: {self.gauss_params['means'].shape[0]} Gaussians")
-        # print(f"   Canonical: {self.gauss_params_canonical['means'].shape[0]} Gaussians")
 
         def create_empty_info_with_absgrad():
             """Create empty info dict with proper absgrad tensor"""
@@ -369,12 +390,10 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 # Fallback - means2d is typically (N, 2)
                 empty_tensor = torch.empty((0, 2), device=self.device, dtype=torch.float32)
             
-            # CRITICAL: Attach absgrad attribute
             empty_tensor.absgrad = torch.empty_like(empty_tensor)
             
             return {"gaussian_ids": empty_ids, key: empty_tensor}
         
-        # Split the combined info for object and canonical
         if hasattr(self, 'combined_info') and self.combined_info and self.combined_info.get("gaussian_ids") is not None:
             visible_ids = self.combined_info["gaussian_ids"]
             n_obj = self.n_obj_rendered
@@ -404,7 +423,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
                     else:
                         obj_info[k] = v
             else:
-                # No visible object Gaussians
                 obj_info = create_empty_info_with_absgrad()
             
             # Create canonical info with proper absgrad handling
@@ -417,10 +435,9 @@ class ArtiSplatfactoModel(SplatfactoModel):
                         continue
                         
                     if isinstance(v, torch.Tensor) and v.shape[0] == len(visible_ids):
-                        # Extract canonical portion
                         canon_tensor = v[canon_mask].contiguous()
                         
-                        # Handle absgrad if present
+
                         if hasattr(v, 'absgrad') and v.absgrad is not None:
                             canon_tensor.absgrad = v.absgrad[canon_mask].contiguous()
                         
@@ -428,10 +445,8 @@ class ArtiSplatfactoModel(SplatfactoModel):
                     else:
                         canon_info[k] = v
             else:
-                # No visible canonical Gaussians
                 canon_info = create_empty_info_with_absgrad()
         else:
-            # No visible Gaussians at all
             obj_info = create_empty_info_with_absgrad()
             canon_info = create_empty_info_with_absgrad()
         
@@ -445,20 +460,23 @@ class ArtiSplatfactoModel(SplatfactoModel):
             print(f"WARNING: Canonical info missing absgrad for {gradient_key}")
             canon_info[gradient_key].absgrad = torch.empty_like(canon_info[gradient_key])
         
-        # 1. Apply strategy to OBJECT parameters
         obj_optimizers = {name.replace('obj_', ''): opt for name, opt in self.optimizers.items() if name.startswith('obj_')}
         
         print(f"Object: {len(obj_info['gaussian_ids'])} visible Gaussians")
         n_obj_before = self.gauss_params['means'].shape[0]
         
-        self.strategy.step_post_backward(
-            params=self.gauss_params,
-            optimizers=obj_optimizers,
-            state=self.strategy_state,
-            step=self.step,
-            info=obj_info,
-            packed=True,
-        )
+        if obj_info["gaussian_ids"].numel() > 0:
+            self.strategy.step_post_backward(
+                params=self.gauss_params,
+                optimizers=obj_optimizers,
+                state=self.strategy_state,
+                step=self.step,
+                info=obj_info,
+                packed=True,
+            )
+        else:
+            print(f"[Debug] Step {step}: Skipping object strategy (0 visible object Gaussians)")
+
         
         n_obj_after = self.gauss_params['means'].shape[0]
         print(f"   Object strategy complete: {n_obj_before} → {n_obj_after} Gaussians")
@@ -473,22 +491,17 @@ class ArtiSplatfactoModel(SplatfactoModel):
         if not hasattr(self, 'strategy_state_canonical'):
             self.strategy_state_canonical = self.strategy.initialize_state(scene_scale=0.1)
 
-        self.strategy.step_post_backward(
-            params=self.gauss_params_canonical,
-            optimizers=canon_optimizers,
-            state=self.strategy_state_canonical,
-            step=self.step,
-            info=canon_info,
-            packed=True,
-        )
-        
-        n_canon_after = self.gauss_params_canonical['means'].shape[0]
-        # print(f"   Canonical strategy complete: {n_canon_before} → {n_canon_after} Gaussians")
-        
-        # print(f" Both strategies complete:")
-        # print(f"   Object: {n_obj_before} → {n_obj_after}")
-        # print(f"   Canonical: {n_canon_before} → {n_canon_after}")
-
+        if canon_info["gaussian_ids"].numel() > 0:
+            self.strategy.step_post_backward(
+                params=self.gauss_params_canonical,
+                optimizers=canon_optimizers,
+                state=self.strategy_state_canonical,
+                step=self.step,
+                info=canon_info,
+                packed=True,
+            )
+        else:
+            print(f"⚠️ Step {step}: Skipping canonical strategy (0 visible canonical Gaussians)")
 
 
     # get_loss_dict with background accumulation penalty
@@ -518,6 +531,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             assert mask.shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
             gt_img = gt_img * mask
             pred_img = pred_img * mask
+        
 
         # === Losses ===
         Ll1 = torch.abs(gt_img - pred_img).mean()
@@ -527,7 +541,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
         }
 
-        # Background accumulation penalty
+        # # Background accumulation penalty
         if mask is not None and "accumulation" in outputs:
             accumulation = outputs["accumulation"]
             background_mask = ~mask.bool()
@@ -564,73 +578,28 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         if self.config.use_depth and "depth_image" in batch:
             depth_out = outputs['depth']
-            depth_batch = self.get_gt_img(batch["depth_image"])
+            depth_gt = self.get_gt_img(batch["depth_image"])
 
             if mask is not None:
-                assert mask.shape[:2] == depth_out.shape[:2] == depth_batch.shape[:2]
-                # depth_out = depth_out * mask
-                # depth_batch = depth_batch * mask
+                assert mask.shape[:2] == depth_out.shape[:2] == depth_gt.shape[:2]
+                # depth_out, depth_gt = depth_out * mask, depth_gt * mask
 
-            debug = False  # Set to True to enable debug saving
-         
+            # Debug visualization (toggle with flag)
+            if self.depth_debug and self.step % 1000 == 0:
+                depth_debug(self.step, depth_out, depth_gt, mask)
 
-            if self.step % 1000 == 0 and debug:
-                import os
-                import torchvision.utils as vutils
-                debug_dir = os.path.join("/local/home/pmishra/cvg/arti-splatfacto", "debug_depth")
-                os.makedirs(debug_dir, exist_ok=True)
-                
-                # Print depth value ranges for debugging
-                print(f"Step {self.step} - Depth Analysis:")
-                print(f"  Predicted depth range: {depth_out.min():.4f} to {depth_out.max():.4f}")
-                print(f"  Ground truth depth range: {depth_batch.min():.4f} to {depth_batch.max():.4f}")
-                print(f"  Depth ratio (pred/gt): {depth_out.mean()/depth_batch.mean():.4f}")
-                
-                
-                # Normalize for visualization (0-1 range)
-                if depth_out.max() > depth_out.min():
-                    depth_out_norm = (depth_out - depth_out.min()) / (depth_out.max() - depth_out.min())
-                else:
-                    depth_out_norm = torch.zeros_like(depth_out)
-                    
-                if depth_batch.max() > depth_batch.min():
-                    depth_gt_norm = (depth_batch - depth_batch.min()) / (depth_batch.max() - depth_batch.min())
-                else:
-                    depth_gt_norm = torch.zeros_like(depth_batch)
-                
-                # Save images (convert HWC to CHW for save_image)
-                vutils.save_image(depth_out_norm.permute(2,0,1), f"{debug_dir}/step{self.step:06d}_pred_depth.png")
-                vutils.save_image(depth_gt_norm.permute(2,0,1), f"{debug_dir}/step{self.step:06d}_gt_depth.png")
-                
-                # Save difference map
-                diff = torch.abs(depth_out_norm - depth_gt_norm)
-                vutils.save_image(diff.permute(2,0,1), f"{debug_dir}/step{self.step:06d}_depth_diff.png")
-                
-                if mask is not None:
-                    mask_to_save = mask.float().permute(2,0,1)  # (1,H,W), float in [0,1]
-                    vutils.save_image(mask_to_save, f"{debug_dir}/step{self.step:06d}_mask.png")
+            # Depth loss (log-scale L1)
+            valid = torch.isfinite(depth_out) & torch.isfinite(depth_gt)
+            if valid.any():
+                depth_loss = (torch.log(depth_out[valid]) - torch.log(depth_gt[valid])).abs().mean()
+            else:
+                depth_loss = torch.tensor(0.0, device=depth_out.device)
 
-                # import pdb; pdb.set_trace()
-            
-            valid_mask = torch.isfinite(depth_out) & torch.isfinite(depth_batch)
-            valid_depth_out = depth_out[valid_mask]
-            valid_depth_batch = depth_batch[valid_mask]
-
-            # if valid_depth_out.numel() > 0: 
-            #     numerator = torch.sum(valid_depth_out * valid_depth_batch)
-            #     denominator = torch.sum(valid_depth_out * valid_depth_out)
-            #     scale = numerator / (denominator + 1e-8)
-            #     scaled_pred_depth = scale * valid_depth_out
-            #     depth_loss = torch.abs(scaled_pred_depth - valid_depth_batch).mean()
-            # else:
-            #     depth_loss = torch.tensor(0.0, device=depth_out.device) 
-            depth_loss = (torch.log(valid_depth_out) - torch.log(valid_depth_batch)).abs().mean()
-
-            loss_dict['depth_loss'] = self.config.depth_lambda * depth_loss
+            loss_dict["depth_loss"] = self.config.depth_lambda * depth_loss
 
         if self.step % 1000 == 0 and not getattr(self, '_debug_saved_this_step', False):
             self._debug_saved_this_step = True
-            self._save_debug_id_maps(batch)
+            save_debug_id_maps(self, batch)
             # import pdb; pdb.set_trace()
         elif self.step % 1000 != 0:
             self._debug_saved_this_step = False
@@ -714,7 +683,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         return metrics_dict
 
-    def _get_joint_angle_for_camera(self, camera: Cameras) -> float:
+    def get_joint_angle_for_camera(self, camera: Cameras) -> float:
         """Extract joint angle from camera.times (interpolated) or metadata (fixed)"""
 
         if hasattr(camera, 'times') and camera.times is not None and self.joint_angles is not None:
@@ -733,25 +702,18 @@ class ArtiSplatfactoModel(SplatfactoModel):
         return 0.0
     
 
-    def _get_gaussians_for_render(self, camera: Cameras) -> Dict[str, torch.Tensor]:
+    def get_gaussians_for_render(self, camera: Cameras) -> Dict[str, torch.Tensor]:
         """
         Prepare Gaussians for rendering with per-frame articulation.
         Training: object (articulated) + canonical (identity)
         Eval: object (articulated) + canonical (identity) + background
         """
-        # DEBUG: Check gradients at start
-        # for name, param in self.gauss_params.items():
-        #     print(f"   {name}: requires_grad={param.requires_grad}")
         
-        joint_angle = self._get_joint_angle_for_camera(camera)
+        joint_angle = self.get_joint_angle_for_camera(camera)
         
-        # Apply articulation to object parameters
-        # print(f"[render gauss] Applying articulation with angle {joint_angle}")
-        articulated_obj_params = self._apply_articulation_to_optimizer_params(joint_angle)
+        articulated_obj_params = apply_articulation_to_optimizer_params(self, joint_angle)
 
         if self.training:
-            # Training mode: combine articulated object + canonical (at identity pose)
-            # print(f" Training mode: combining object + canonical Gaussians")
             
             combined_params = {}
             for name in articulated_obj_params.keys():
@@ -807,69 +769,35 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 
                 return full_scene_params
             else:
-                print("⚠️  No background gaussians found - rendering object + canonical only")
+                print("[!!] No background gaussians found - rendering object + canonical only")
                 return combined_params
-    
-    def _apply_articulation_to_optimizer_params(self, joint_angle: float) -> Dict[str, torch.Tensor]:
-        articulated_params = {}
-
-        # Only apply articulation to object Gaussians
-        obj_means = self.gauss_params["means"]
-        obj_quats = self.gauss_params["quats"]
-
-        if joint_angle != 0.0:
-            if self.joint_type == "revolute":
-                obj_means, obj_quats = apply_joint_transform(
-                    means=obj_means, quats=obj_quats,
-                    joint_pivot=self.joint_pivot,
-                    joint_axis=self.joint_axis,
-                    joint_angle=joint_angle
-                )
-            elif self.joint_type == "prismatic":
-                obj_means, obj_quats = apply_joint_transform_prismatic(
-                    means=obj_means, quats=obj_quats,
-                    joint_pivot=self.joint_pivot,
-                    joint_axis=self.joint_axis,
-                    joint_disp=joint_angle
-                )
-
-        # Rebuild params: only object Gaussians articulated
-        for name, param in self.gauss_params.items():
-            if name == "means":
-                articulated_params[name] = obj_means
-            elif name == "quats":
-                articulated_params[name] = obj_quats
-            else:
-                articulated_params[name] = param
-
-        return articulated_params
 
 
-    def _apply_articulation_to_canonical_params(self, joint_angle: float) -> Dict[str, torch.Tensor]:
-        """
-        Apply per-frame articulation to the canonical object parameters.
-        """
-        if joint_angle == 0.0:
-            return {name: param.data for name, param in self.gauss_params.items()}
+    # def _apply_articulation_to_canonical_params(self, joint_angle: float) -> Dict[str, torch.Tensor]:
+    #     """
+    #     Apply per-frame articulation to the canonical object parameters.
+    #     """
+    #     if joint_angle == 0.0:
+    #         return {name: param.data for name, param in self.gauss_params.items()}
         
-        means_articulated, quats_articulated = apply_joint_transform(
-            means=self.gauss_params["means"].data,  # Use .data
-            quats=self.gauss_params["quats"].data,  # Use .data
-            joint_pivot=self.joint_pivot.to(self.device),
-            joint_axis=self.joint_axis.to(self.device),
-            joint_angle=joint_angle
-        )
+    #     means_articulated, quats_articulated = apply_joint_transform(
+    #         means=self.gauss_params["means"].data,  # Use .data
+    #         quats=self.gauss_params["quats"].data,  # Use .data
+    #         joint_pivot=self.joint_pivot.to(self.device),
+    #         joint_axis=self.joint_axis.to(self.device),
+    #         joint_angle=joint_angle
+    #     )
         
-        articulated_params = {}
-        for name, param in self.gauss_params.items():
-            if name == "means":
-                articulated_params[name] = means_articulated
-            elif name == "quats":
-                articulated_params[name] = quats_articulated
-            else:
-                articulated_params[name] = param.data  # Use .data
+    #     articulated_params = {}
+    #     for name, param in self.gauss_params.items():
+    #         if name == "means":
+    #             articulated_params[name] = means_articulated
+    #         elif name == "quats":
+    #             articulated_params[name] = quats_articulated
+    #         else:
+    #             articulated_params[name] = param.data  # Use .data
         
-        return articulated_params
+    #     return articulated_params
 
 
     def get_outputs(self, camera: Cameras, render_id_map: bool = False) -> Dict[str, Union[torch.Tensor, List]]:
@@ -877,8 +805,10 @@ class ArtiSplatfactoModel(SplatfactoModel):
         if not isinstance(camera, Cameras):
             return {}
 
-        gaussians_to_render = self._get_gaussians_for_render(camera)
+        gaussians_to_render = self.get_gaussians_for_render(camera)
         self._current_camera = camera 
+
+        joint_angle = self.get_joint_angle_for_camera(camera)
         
         # DEBUG: Verify what we're actually rendering
         n_obj = self.gauss_params['means'].shape[0]
@@ -910,12 +840,10 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         # Determine render mode
         if render_id_map:
-            # For ID map rendering, we need to create pseudo-colors that encode the Gaussian type
             # Object: ID 0-255 (red channel)
             # Canonical: ID 256-511 (green channel) 
             # Background: ID 512+ (blue channel)
             
-            # Create type-based colors instead of learned colors
             id_colors = torch.zeros((actual_count, 3), device=gaussians_to_render["means"].device)
             
             # Object Gaussians (0 to n_obj-1): encode in red channel
@@ -947,9 +875,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
             render_mode = "RGB"
             sh_degree_to_use = None  # No SH for ID maps
             
-            # print(f" Rendering ID map with {actual_count} Gaussians:")
-            # print(f"   Object: 0-{n_obj-1} (red channel)")
-            # print(f"   Canonical: {n_obj}-{n_obj+n_canon-1} (green channel)")
             if actual_count > n_obj + n_canon:
                 print(f"   Background: {n_obj+n_canon}-{actual_count-1} (blue channel)")
         else:
@@ -981,6 +906,25 @@ class ArtiSplatfactoModel(SplatfactoModel):
             absgrad=self.strategy.absgrad if isinstance(self.strategy, DefaultStrategy) else False,
             rasterize_mode=self.config.rasterize_mode,
         )
+        
+
+        # inject joint information for the new mask aware strategy
+        if self.info is not None:
+            self.info["joint_angle"] = joint_angle
+            self.info["joint_pivot"] = self.joint_pivot
+            self.info["joint_axis"] = self.joint_axis
+            self.info["joint_type"] = self.joint_type
+            if self.step % 100 == 0:  # Log occasionally
+                print(f"Injected joint_angle={joint_angle:.3f} into render info")
+        
+        if self.training:
+            self.strategy.step_pre_backward(
+                params=self.gauss_params, 
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                step=self.step,
+                info=self.info  
+            )
 
         # Debug info
         n_rendered = gaussians_to_render["means"].shape[0]
@@ -998,7 +942,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             self.n_obj_rendered = n_obj
 
         if render_id_map:
-            # For ID maps, return raw render without background blending
+            # For ID maps, return raw render 
             background = self._get_background_color() 
             outputs = {
                 "rgb": torch.clamp(render[..., :3], 0.0, 1.0).squeeze(0),
@@ -1009,7 +953,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             }
             
             # Also decode the ID information for debugging
-            id_debug = self._decode_id_map(render[..., :3].squeeze(0), n_obj, n_canon)
+            id_debug = decode_id_map(render[..., :3].squeeze(0), n_obj, n_canon)
             outputs.update(id_debug)
             
             return outputs
@@ -1026,125 +970,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 "accumulation": alpha.squeeze(0),
                 "background": background,
             }
-
-    def _decode_id_map(self, id_map: torch.Tensor, n_obj: int, n_canon: int) -> Dict[str, torch.Tensor]:
-        """
-        Decode the ID map to extract masks for different Gaussian types.
-        
-        Args:
-            id_map: (H, W, 3) tensor with encoded IDs
-            n_obj: Number of object Gaussians
-            n_canon: Number of canonical Gaussians
-        
-        Returns:
-            Dictionary with decoded masks and statistics
-        """
-        H, W = id_map.shape[:2]
-        
-        # Extract channel values and convert back to IDs
-        red_vals = (id_map[..., 0] * 255).round().long()
-        green_vals = (id_map[..., 1] * 255).round().long()
-        blue_vals = (id_map[..., 2] * 255).round().long()
-        
-        # Create masks for each type
-        obj_mask = (red_vals > 0) & (green_vals == 0) & (blue_vals == 0)
-        canon_mask = (red_vals == 0) & (green_vals > 0) & (blue_vals == 0)
-        bg_mask = (red_vals == 0) & (green_vals == 0) & (blue_vals > 0)
-        
-        # Count pixels for each type
-        obj_pixels = obj_mask.sum().item()
-        canon_pixels = canon_mask.sum().item()
-        bg_pixels = bg_mask.sum().item()
-        total_pixels = H * W
-        
-        # print(f"🔍 ID Map Analysis:")
-        # print(f"   Object pixels: {obj_pixels} ({obj_pixels/total_pixels*100:.1f}%)")
-        # print(f"   Canonical pixels: {canon_pixels} ({canon_pixels/total_pixels*100:.1f}%)")
-        # print(f"   Background pixels: {bg_pixels} ({bg_pixels/total_pixels*100:.1f}%)")
-        # print(f"   Empty pixels: {total_pixels - obj_pixels - canon_pixels - bg_pixels}")
-        
-        # Check for floaters (simplified to avoid memory issues)
-        if obj_pixels > 0:
-            # Simple check: count object pixels in border regions
-            H, W = obj_mask.shape
-            border_width = 20
-            
-            # Create border mask (pixels near edges)
-            border_mask = torch.zeros_like(obj_mask)
-            border_mask[:border_width, :] = 1  # Top
-            border_mask[-border_width:, :] = 1  # Bottom
-            border_mask[:, :border_width] = 1  # Left
-            border_mask[:, -border_width:] = 1  # Right
-            
-            # Count object pixels in border regions (potential floaters)
-            border_obj_pixels = (obj_mask & border_mask).sum().item()
-            border_ratio = border_obj_pixels / obj_pixels if obj_pixels > 0 else 0
-            
-            if border_ratio > 0.1:  # More than 10% in border regions
-                # print(f"⚠️  Found {border_obj_pixels} object pixels in border regions ({border_ratio:.1%})")
-        
-        return {
-            "obj_mask": obj_mask.float(),
-            "canon_mask": canon_mask.float(), 
-            "bg_mask": bg_mask.float(),
-            "obj_pixel_count": obj_pixels,
-            "canon_pixel_count": canon_pixels,
-            "bg_pixel_count": bg_pixels,
-        }
-    
-
-    def _save_debug_id_maps(self, batch):
-        """Save ID maps for debugging floater Gaussians"""
-        import os
-        import torchvision.utils as vutils
-        
-        debug_dir = "/local/home/pmishra/cvg/arti-splatfacto/arti_debug"  
-        os.makedirs(debug_dir, exist_ok=True)
-        
-        try:
-            # Get camera from batch
-            camera = getattr(self, '_current_camera', None)
-            if camera is None:
-                print("No camera found in batch for debug saving")
-                return
-                
-            # Render ID map
-            debug_outputs = self.get_outputs(camera, render_id_map=True)
-            
-            id_map = debug_outputs["id_map"]
-            obj_mask = debug_outputs["obj_mask"] 
-            canon_mask = debug_outputs["canon_mask"]
-            
-            vutils.save_image(id_map.permute(2,0,1), f"{debug_dir}/step{self.step:06d}_id_map.png")
-            vutils.save_image(obj_mask.unsqueeze(0), f"{debug_dir}/step{self.step:06d}_obj_mask.png") 
-            vutils.save_image(canon_mask.unsqueeze(0), f"{debug_dir}/step{self.step:06d}_canon_mask.png")
-            
-            # Save normal RGB render (with pink background issue)
-            normal_outputs = self.get_outputs(camera, render_id_map=False)
-            rgb_rendered = normal_outputs["rgb"]
-            vutils.save_image(rgb_rendered.permute(2,0,1), f"{debug_dir}/step{self.step:06d}_rgb_rendered.png")
-            
-            # Save ground truth image from batch (actual camera image)
-            gt_img = self.get_gt_img(batch["image"])
-            if self._get_downscale_factor() > 1:
-                # Match the downscaling applied to rendered image
-                import torchvision.transforms.functional as TF
-                d = self._get_downscale_factor()
-                newsize = (gt_img.shape[0] // d, gt_img.shape[1] // d)
-                gt_img = TF.resize(gt_img.permute(2, 0, 1), newsize, antialias=None).permute(1, 2, 0)
-            
-            vutils.save_image(gt_img.permute(2,0,1), f"{debug_dir}/step{self.step:06d}_gt_image.png")
-            
-            
-        except Exception as e:
-            print(f"Failed to save debug ID maps: {e}")
-
-
-    def psnr_masked(self, image, rgb, mask):
-        assert mask.dtype == torch.bool
-        # mask: [1, 1, H, W], image/rgb: [1, 3, H, W]
-        mask = mask.expand(-1, 3, -1, -1)   # expand channel dim only
-        return self.psnr(image[mask], rgb[mask])
 
 
     def get_image_metrics_and_images(
@@ -1255,113 +1080,3 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         return metrics_dict, images_dict
 
-        
-
-def crop_imgs_w_masks(images, masks, resize=(256, 256)):
-    """
-    Crop the images to the smallest bbox containing the masks
-    """
-    # Masks to bboxes
-    bboxes = []
-    for mask in masks:
-        point_coords = torch.nonzero(mask.squeeze())[:, [1, 0]]
-        bbox = compute_2D_bbox(point_coords.unsqueeze(0)).float()
-        bboxes.append(bbox)
-    bboxes = torch.cat(bboxes, dim=0)
-    imgs_cropped = batch_crop_resize(images, bboxes, *resize)
-    return imgs_cropped   
-
-
-def compute_2D_bbox(points):
-    """
-    Compute bboxes for a batch of 2D points
-    """
-    assert len(points.shape) == 3
-    mins, _ = torch.min(points, dim=1)
-    maxs, _= torch.max(points, dim=1)
-    bboxes = torch.cat((mins, maxs), dim=1)
-    return bboxes       
-
-def batch_crop_resize(
-    img, rois, out_H, out_W, aligned=True, interpolation="bilinear"
-):
-    """
-    Crop and resize images
-    """
-    assert len(img.shape) >= 3 and img.shape[-3] == 3, \
-        "Error: Image size must be (*, 3, H, W)"
-    assert rois.shape[-1] == 4, "Error: Bboxes should be Bx4"
-    roi_idx = torch.arange(rois.size(0)).view(-1, 1).to(rois)
-    rois = torch.cat((roi_idx, rois), dim=-1)
-    # Crop and resize
-    output_size = (out_H, out_W)
-    from torchvision.ops import RoIAlign, RoIPool
-    if interpolation == "bilinear":
-        op = RoIAlign(output_size, 1.0, 0, aligned=aligned)
-    elif interpolation == "nearest":
-        op = RoIPool(output_size, 1.0)  #
-    else:
-        raise ValueError(f"Wrong interpolation type: {interpolation}")
-    return op(img, rois)    
-
-def apply_joint_transform(means, quats, joint_pivot, joint_axis, joint_angle):
-    """
-    Apply revolute joint transformation while preserving gradients.
-    """
-    
-    # if joint_angle == 0.0:
-    #     return means, quats
-    
-    # # DEBUG: Check input gradients
-    # print(f" apply_joint_transform input:")
-    # print(f"   means requires_grad: {means.requires_grad}")
-    # print(f"   quats requires_grad: {quats.requires_grad}")
-    
-    # CRITICAL: Ensure joint_pivot and joint_axis don't break gradients
-    if not joint_pivot.requires_grad:
-        joint_pivot = joint_pivot.detach()  # Explicitly detach constants
-    if not joint_axis.requires_grad:
-        joint_axis = joint_axis.detach()    # Explicitly detach constants
-    
-    means_local = means - joint_pivot.unsqueeze(0)
-    axis_angle = joint_axis * (-joint_angle)
-    R = axis_angle_to_matrix(axis_angle.unsqueeze(0)).squeeze(0)  # [3, 3]
-    
-    means_rotated = torch.matmul(means_local, R.T) + joint_pivot.unsqueeze(0)
-    
-    joint_quat = matrix_to_quaternion(R.unsqueeze(0)).squeeze(0)  # [4]
-    quats_rotated = quaternion_multiply(
-        joint_quat.unsqueeze(0).expand_as(quats), 
-        quats
-    )
-    
-    # # DEBUG: Check output gradients
-    # print(f"apply_joint_transform output:")
-    # print(f"   means_rotated requires_grad: {means_rotated.requires_grad}")
-    # print(f"   quats_rotated requires_grad: {quats_rotated.requires_grad}")
-
-    # import pdb; pdb.set_trace()  # Debugging breakpoint
-    
-    return means_rotated, quats_rotated
-
-
-
-def apply_joint_transform_prismatic(means, quats, joint_pivot, joint_axis, joint_disp):
-    """
-    Apply prismatic (sliding) joint transformation.
-    - means: Gaussian centers
-    - quats: Gaussian orientations (unchanged)
-    - joint_axis: direction of translation (normalized)
-    - joint_disp: displacement (scalar)
-    """
-    if not joint_axis.requires_grad:
-        joint_axis = joint_axis.detach()
-    
-    # Translate means along the axis
-    translation = joint_axis * joint_disp
-    means_translated = means + translation.unsqueeze(0)
-
-    # Keep orientations unchanged
-    quats_translated = quats  
-
-    return means_translated, quats_translated
