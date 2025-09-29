@@ -1,0 +1,15 @@
+{
+  "ransac_config": {
+    "max_iterations": 1000,
+    "error_threshold": 0.05,
+    "min_inliers": 10,
+    "min_trajectory_length": 5,
+    "early_termination_threshold": 0.8
+  },
+  "trajectory_filter_config": {
+    "min_length": 5,
+    "max_velocity_jump": 0.5,
+    "smoothing_window": 3
+  },
+  "debug_mode": false
+}
