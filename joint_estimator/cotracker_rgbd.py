@@ -136,20 +136,6 @@ class CoTrackerRGBD:
 
         print("=== RGB-D Processing Complete ===")
         return moving_trajectories, camera_intrinsics
-    
-    # def _load_and_preprocess_video(self, video_path: str) -> Tuple[torch.Tensor, int, int, int]:
-    #     """Load and preprocess RGB video with memory optimization."""
-    #     video = read_video_from_path(video_path)
-    #     video = torch.from_numpy(video).permute(0, 3, 1, 2)[None].float()
-    #     original_T, H, W = video.shape[1], video.shape[3], video.shape[4]
-        
-    #     # Memory optimization: downsample video if too large
-    #     if original_T > 30 or H > 480:
-    #         print(f"Downsampling video from {original_T} frames to reduce memory usage...")
-    #         video = video[:, ::2]  # Take every 2nd frame
-    #         print(f"New video shape: {video.shape}")
-        
-    #     return video.to(self.device), original_T, H, W
 
 
     def _load_and_preprocess_video(self, frames_dir: str) -> Tuple[torch.Tensor, int, int, int]:
