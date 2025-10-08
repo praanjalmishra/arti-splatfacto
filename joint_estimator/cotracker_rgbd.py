@@ -13,7 +13,7 @@ import os
 import json
 import torch
 import numpy as np
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from pathlib import Path
 import cv2
 from tqdm import tqdm
@@ -30,6 +30,124 @@ from sklearn.cluster import DBSCAN
 
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+from effsam_utils import effsam_embedding, effsam_refine_masks
+import glob
+from PIL import Image
+
+def compute_change_mask(first_frame: torch.Tensor, 
+                       last_frame: torch.Tensor,
+                       out_dir: str,
+                       threshold: float = 1e-2,
+                       kernel_ratio: float = 0.03,
+                       use_effsam: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Memory-optimized change mask computation.
+    Changed default use_effsam=False to avoid heavy SAM embeddings.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # Ensure batch dimension
+    if first_frame.dim() == 3:
+        first_frame = first_frame.unsqueeze(0)
+    if last_frame.dim() == 3:
+        last_frame = last_frame.unsqueeze(0)
+    
+    H, W = first_frame.shape[-2:]
+    device = first_frame.device
+    
+    # further downsample for CD
+    if max(H, W) > 480:
+        scale = 480 / max(H, W)
+        new_h = int(H * scale)
+        new_w = int(W * scale)
+        new_h = (new_h // 8) * 8
+        new_w = (new_w // 8) * 8
+        
+        print(f"Further downsampling for change detection: {H}x{W} → {new_h}x{new_w}")
+        
+        first_frame = torch.nn.functional.interpolate(
+            first_frame, size=(new_h, new_w), mode='bilinear', align_corners=False
+        )
+        last_frame = torch.nn.functional.interpolate(
+            last_frame, size=(new_h, new_w), mode='bilinear', align_corners=False
+        )
+        H, W = new_h, new_w
+    
+    # Move to CPU for OpenCV processing to save GPU memory
+    first_np = first_frame[0].permute(1, 2, 0).cpu().numpy()
+    last_np = last_frame[0].permute(1, 2, 0).cpu().numpy()
+    
+    torch.cuda.empty_cache()
+    
+    first_np = np.clip(first_np, 0, 1)
+    last_np = np.clip(last_np, 0, 1)
+    
+    # Save debug images
+    cv2.imwrite(f"{out_dir}/first_frame.png", 
+                (first_np[..., ::-1] * 255).astype(np.uint8))
+    cv2.imwrite(f"{out_dir}/last_frame.png", 
+                (last_np[..., ::-1] * 255).astype(np.uint8))
+    
+    # Optional Gaussian blur
+    if kernel_ratio > 0:
+        kernel_size = int(W * kernel_ratio)
+        kernel_size = kernel_size + 1 if kernel_size % 2 == 0 else kernel_size
+        first_np = cv2.GaussianBlur(first_np, (kernel_size, kernel_size), 0)
+        last_np = cv2.GaussianBlur(last_np, (kernel_size, kernel_size), 0)
+    
+    # Simple color difference (avoid heavy SAM embeddings)
+    diff = np.abs(first_np - last_np)
+    diff_gray = np.mean(diff, axis=2)
+    similarity_map = (255 - (diff_gray * 255)).astype(np.uint8)
+    
+    cv2.imwrite(f"{out_dir}/similarity_map.png", similarity_map)
+    
+    # Threshold
+    thresh = cv2.threshold(
+        similarity_map, 0, 255, 
+        cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    )[1]
+    
+    cv2.imwrite(f"{out_dir}/threshold_mask.png", thresh)
+    
+    # Find contours
+    contours, _ = cv2.findContours(
+        thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    
+    print(f"Found {len(contours)} change regions")
+    
+    masks = []
+    masks_all = []
+    
+    for i, contour in enumerate(contours):
+        mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
+        
+        mask_tensor = torch.from_numpy(mask).unsqueeze(0).float() / 255.0
+        masks_all.append(mask_tensor)
+        
+        area_ratio = cv2.contourArea(contour) / (H * W)
+        if area_ratio >= threshold:
+            masks.append(mask_tensor)
+            print(f"Region {i}: area={area_ratio:.4f} (kept)")
+            cv2.imwrite(f"{out_dir}/mask_region_{i}.png", mask)
+        else:
+            print(f"Region {i}: area={area_ratio:.4f} (discarded)")
+    
+    if len(masks) == 0:
+        print("Warning: No large change regions found, using all regions")
+        masks = masks_all
+    
+    # Stack and move to device
+    masks = torch.stack(masks, dim=0).to(device)
+    masks_all = torch.stack(masks_all, dim=0).to(device)
+    
+    print(f"Final masks: {masks.shape[0]} large regions, {masks_all.shape[0]} total")
+    
+    return masks, masks_all
+
 
 class CoTrackerRGBD:
     """
@@ -40,30 +158,36 @@ class CoTrackerRGBD:
     """
     
     def __init__(self, 
-                 trajectory_filter_config: TrajectoryFilterConfig,
-                 device: str = DEFAULT_DEVICE,
-                 grid_size: int = 30,
-                 grid_query_frame: int = 0,
-                 backward_tracking: bool = True):
+                trajectory_filter_config: TrajectoryFilterConfig,
+                device: str = DEFAULT_DEVICE,
+                grid_size: int = 30,
+                grid_query_frame: int = 0,
+                backward_tracking: bool = True,
+                use_change_mask: bool = True,
+                change_threshold: float = 1e-2,
+                max_resolution: int = 640,  # NEW
+                max_frames: int = 60):       # NEW
         """
-        Initialize the CoTracker RGB-D processor.
-        
         Args:
-            trajectory_filter_config: Configuration for trajectory filtering
-            device: Device to run computations on
-            grid_size: Grid size for CoTracker point sampling
-            grid_query_frame: Frame to use for grid initialization
-            backward_tracking: Whether to track backwards in time
+            max_resolution: Maximum spatial dimension (pixels)
+            max_frames: Maximum number of frames to process
         """
         self.trajectory_filter_config = trajectory_filter_config
         self.device = device
         self.grid_size = grid_size
         self.grid_query_frame = grid_query_frame
         self.backward_tracking = backward_tracking
+        self.use_change_mask = use_change_mask
+        self.change_threshold = change_threshold
+        self.max_resolution = max_resolution
+        self.max_frames = max_frames
         
         self.model = None
         self.camera_intrinsics = None
         self.camera_extrinsics = None
+        self.video_h = None  # Store video dimensions
+        self.video_w = None
+
         
     def load_cotracker_model(self):
         """Load the CoTracker3 model."""
@@ -76,27 +200,62 @@ class CoTrackerRGBD:
             available_memory = (torch.cuda.get_device_properties(0).total_memory - 
                               torch.cuda.memory_allocated())
             print(f"Available GPU memory: {available_memory / 1e9:.2f} GB")
+
+    def compute_change_segmentation(self, video_tensor: torch.Tensor, out_dir: str) -> torch.Tensor:
+        """
+        Compute change mask between first and last frames.
+        
+        Args:
+            video_tensor: Video tensor (1xTxCxHxW)
+            out_dir: Output directory for debug visualizations
+            
+        Returns:
+            segmentation_mask: Binary mask for changed regions (1xHxW)
+        """
+        print("Computing change detection mask...")
+        
+        first_frame = video_tensor[0, 0]  # First frame
+        last_frame = video_tensor[0, -1]  # Last frame
+        
+        change_dir = os.path.join(out_dir, "change_detection")
+        masks, masks_all = compute_change_mask(
+            first_frame, last_frame, 
+            out_dir=change_dir,
+            threshold=self.change_threshold
+        )
+        
+        # Combine all large masks into single segmentation
+        if len(masks) > 0:
+            areas = [mask.sum().item() for mask in masks]  # number of pixels in each mask
+            best_idx = int(torch.tensor(areas).argmax())   # index of largest region
+            segmentation = masks[best_idx].clone()         # (1, H, W)
+        else:
+            print("Warning: No change masks found, using full frame")
+            H, W = video_tensor.shape[-2:]
+            segmentation = torch.ones((1, H, W), device=self.device)
+
+        segmentation = segmentation.unsqueeze(0)
+        self.change_masks = masks
+        return segmentation
     
     def process_rgbd_sequence(self, 
                             video_path: str,
                             depth_dir: str, 
                             out_dir: str,
                             camera_metadata_path: str) -> Tuple[List[Trajectory3D], CameraIntrinsics]:
-        """
-        Process a complete RGB-D sequence to extract 3D trajectories.
+        """Process RGB-D sequence with memory optimizations."""
+        print("=== Starting RGB-D Processing (Memory Optimized) ===")
         
-        Args:
-            video_path: Path to RGB video file
-            depth_dir: Directory containing depth images
-            camera_metadata_path: Path to camera metadata JSON
-            
-        Returns:
-            Tuple of (list of 3D trajectories, camera intrinsics)
-        """
-        print("=== Starting RGB-D Processing ===")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f"Initial GPU memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
         
         print("Step 1: Loading RGB video...")
         video_tensor, original_T, H, W = self._load_and_preprocess_video(video_path)
+        self.video_h, self.video_w = H, W  # Store for depth matching
+        
+        # Clear cache after video load
+        torch.cuda.empty_cache()
         
         print("Step 2: Loading depth sequence...")
         depth_sequence = self._load_depth_sequence(depth_dir, video_tensor.shape[1])
@@ -104,15 +263,42 @@ class CoTrackerRGBD:
         print("Step 3: Loading camera parameters...")
         camera_intrinsics = self._load_camera_parameters(camera_metadata_path)
         
+        # Scale camera intrinsics to match downsampled resolution
+        scale_x = W / camera_intrinsics.w
+        scale_y = H / camera_intrinsics.h
+        camera_intrinsics.fx *= scale_x
+        camera_intrinsics.fy *= scale_y
+        camera_intrinsics.cx *= scale_x
+        camera_intrinsics.cy *= scale_y
+        camera_intrinsics.w = W
+        camera_intrinsics.h = H
+        print(f"Scaled camera intrinsics: fx={camera_intrinsics.fx:.1f}, fy={camera_intrinsics.fy:.1f}")
+        
+        segmentation_mask = None
+        if self.use_change_mask:
+            print("Step 3.5: Computing change-based segmentation...")
+            torch.cuda.empty_cache() 
+            segmentation_mask = self.compute_change_segmentation(video_tensor, out_dir)
+            torch.cuda.empty_cache() 
+
         print("Step 4: Extracting 2D trajectories...")
-        trajectories_2d = self._extract_2d_trajectories(video_tensor)
+        trajectories_2d = self._extract_2d_trajectories(
+            video_tensor, 
+            segmentation_mask=segmentation_mask
+        )
         print(f"Extracted {len(trajectories_2d)} 2D trajectories")
+        
+        # Clear video from GPU after tracking
+        del video_tensor
+        if segmentation_mask is not None:
+            del segmentation_mask
+        torch.cuda.empty_cache()
         
         print("Step 5: Converting to 3D trajectories...")
         trajectories_3d = self._convert_to_3d_trajectories(
             trajectories_2d, depth_sequence, camera_intrinsics
         )
-        print(f"Successfully converted {len(trajectories_3d)} trajectories to 3D")
+        print(f"Converted {len(trajectories_3d)} trajectories to 3D")
         
         print("Step 6: Filtering trajectories...")
         filtered_trajectories = self._filter_trajectories(trajectories_3d)
@@ -120,20 +306,13 @@ class CoTrackerRGBD:
         
         print("Step 7: Segmenting rigid parts...")
         segmented_trajectories = self._segment_rigid_parts(filtered_trajectories)
-
-        moving_trajectories = [traj for traj in segmented_trajectories if traj.rigid_part == 1]
-        print(f"Using only moving trajectories: {len(moving_trajectories)} out of {len(segmented_trajectories)}")
-
-        # # Step 8: Cluster trajectories (only moving ones)
-        # print("Step 8: Clustering trajectories...")
-        # clustered_trajectories = self._cluster_trajectories(moving_trajectories)
-
-        # visualize the trajectories
-
+        
+        moving_trajectories = [t for t in segmented_trajectories if t.rigid_part == 1]
+        print(f"Moving trajectories: {len(moving_trajectories)}/{len(segmented_trajectories)}")
+        
         self.visualize_result(out_dir=out_dir)
-
-        plot_trajectories_3d(moving_trajectories, out_path="./saved_videos/trajectories_3d.png")
-
+        plot_trajectories_3d(moving_trajectories, out_path=f"{out_dir}/trajectories_3d.png")
+        
         print("=== RGB-D Processing Complete ===")
         return moving_trajectories, camera_intrinsics
 
@@ -143,7 +322,6 @@ class CoTrackerRGBD:
         import glob
         from PIL import Image
         
-        # Get all frame files sorted by name
         frame_files = sorted(glob.glob(os.path.join(frames_dir, "frame_*.png")))
         
         if len(frame_files) == 0:
@@ -151,69 +329,93 @@ class CoTrackerRGBD:
         
         print(f"Loading {len(frame_files)} frames from {frames_dir}")
         
+        # Read first frame to get dimensions
+        first_img = Image.open(frame_files[0])
+        original_w, original_h = first_img.size
+        
+        # AGGRESSIVE DOWNSAMPLING: Target max dimension of 640px
+        max_dim = 640
+        if max(original_h, original_w) > max_dim:
+            scale = max_dim / max(original_h, original_w)
+            new_h = int(original_h * scale)
+            new_w = int(original_w * scale)
+            # Make divisible by 8 for neural networks
+            new_h = (new_h // 8) * 8
+            new_w = (new_w // 8) * 8
+            print(f"Downsampling spatial resolution: {original_h}x{original_w} → {new_h}x{new_w}")
+        else:
+            new_h, new_w = original_h, original_w
+        
+        # Temporal downsampling: keep max 60 frames
+        original_T = len(frame_files)
+        if original_T > 60:
+            stride = max(1, original_T // 60)
+            frame_files = frame_files[::stride]
+            print(f"Temporal downsampling: {original_T} → {len(frame_files)} frames (stride={stride})")
+        
+        # Load and resize frames
         frames = []
         for idx, frame_path in enumerate(frame_files):
-            if idx % 10 == 0:  # Progress update every 10 frames
+            if idx % 10 == 0:
                 print(f"Loading frame {idx}/{len(frame_files)}")
             
             img = Image.open(frame_path).convert('RGB')
-            img_array = np.array(img)
+            
+            # Resize if needed
+            if (img.size[1], img.size[0]) != (new_h, new_w):
+                img = img.resize((new_w, new_h), Image.BILINEAR)
+            
+            img_array = np.array(img, dtype=np.float32) / 255.0  # Normalize to [0,1]
             frames.append(img_array)
         
-        print(f"Loaded all {len(frames)} frames")
+        print(f"Loaded {len(frames)} frames at {new_h}x{new_w}")
         
-        # Stack into numpy array: (T, H, W, C)
+        # Stack and convert to torch: (1, T, C, H, W)
         video_np = np.stack(frames, axis=0)
-        
-        # Convert to torch and rearrange to (1, T, C, H, W)
         video = torch.from_numpy(video_np).permute(0, 3, 1, 2)[None].float()
         
-        original_T, H, W = video.shape[1], video.shape[3], video.shape[4]
-        
-        # Memory optimization: downsample if needed
-        if original_T > 60:
-            print(f"Downsampling video from {original_T} frames...")
-            stride = original_T // 60  # Keep ~60 frames max
-            video = video[:, ::stride]
-            print(f"New video shape: {video.shape}")
-        elif H > 480:
-            print(f"Downsampling spatial resolution from {H}x{W}...")
-            video = torch.nn.functional.interpolate(
-                video.squeeze(0), 
-                size=(480, 640), 
-                mode='bilinear', 
-                align_corners=False
-            ).unsqueeze(0)
-            print(f"New video shape: {video.shape}")
-        
-        return video.to(self.device), original_T, H, W
+        return video.to(self.device), original_T, new_h, new_w
     
     
     def _load_depth_sequence(self, depth_dir: str, num_frames: int) -> torch.Tensor:
-        """Load sequence of depth images."""
+        """Load depth sequence with matching downsampling."""
         depth_dir = Path(depth_dir)
-        depth_files = sorted(list(depth_dir.glob("*.png")) + list(depth_dir.glob("*.npy")))
-        
+        depth_files = sorted(list(depth_dir.glob("*.npy")) + list(depth_dir.glob("*.png")))
+
         if len(depth_files) == 0:
             raise FileNotFoundError(f"No depth files found in {depth_dir}")
-        
-        # Take every other frame if video was downsampled
-        if len(depth_files) > num_frames:
-            depth_files = depth_files[::2][:num_frames]
-        
+
+        # Match temporal downsampling from video
+        original_count = len(depth_files)
+        if original_count > num_frames:
+            stride = max(1, original_count // num_frames)
+            depth_files = depth_files[::stride][:num_frames]
+            print(f"Depth temporal downsampling: {original_count} → {len(depth_files)} (stride={stride})")
+
         depths = []
-        for depth_file in tqdm(depth_files[:num_frames], desc="Loading depth frames"):
+        for depth_file in tqdm(depth_files[:num_frames], desc="Loading depth"):
             if depth_file.suffix == '.npy':
                 depth = np.load(depth_file)
             else:
                 depth = cv2.imread(str(depth_file), cv2.IMREAD_ANYDEPTH)
                 if depth is None:
-                    raise ValueError(f"Could not load depth image: {depth_file}")
-
-                depth = depth.astype(np.float32)/1000.0
+                    raise ValueError(f"Could not load: {depth_file}")
+                depth = depth.astype(np.float32) / 1000.0
+            
             depths.append(depth)
-        
-        return torch.from_numpy(np.array(depths)).to(self.device)
+
+        depth_tensor = torch.from_numpy(np.array(depths))
+
+        # Spatial downsampling to match video resolution
+        if depth_tensor.shape[1:] != (self.video_h, self.video_w):
+            print(f"Resizing depth: {depth_tensor.shape[1:]} → ({self.video_h}, {self.video_w})")
+            depth_tensor = torch.nn.functional.interpolate(
+                depth_tensor.unsqueeze(1),
+                size=(self.video_h, self.video_w),
+                mode='nearest'
+            ).squeeze(1)
+
+        return depth_tensor.to(self.device)
     
     def _load_camera_parameters(self, camera_metadata_path: str) -> CameraIntrinsics:
         """Load camera intrinsics from metadata file."""
@@ -239,7 +441,8 @@ class CoTrackerRGBD:
         print(f"Camera intrinsics: fx={fx}, fy={fy}, cx={cx}, cy={cy}")
         return camera_intrinsics
     
-    def _extract_2d_trajectories(self, video_tensor: torch.Tensor) -> List[Trajectory2D]:
+    def _extract_2d_trajectories(self, video_tensor: torch.Tensor,
+                                 segmentation_mask: Optional[torch.Tensor] = None) -> List[Trajectory2D]:
         """Extract 2D trajectories using CoTracker."""
         if self.model is None:
             self.load_cotracker_model()
@@ -251,6 +454,7 @@ class CoTrackerRGBD:
                 grid_size=self.grid_size,
                 grid_query_frame=self.grid_query_frame,
                 backward_tracking=self.backward_tracking,
+                segm_mask=segmentation_mask
             )
 
         self._last_pred_tracks = pred_tracks
@@ -398,8 +602,6 @@ class CoTrackerRGBD:
             points=smoothed_points,
             rigid_part=trajectory.rigid_part
         )
-    
-
 
     def _segment_rigid_parts(self, trajectories_3d: List[Trajectory3D]) -> List[Trajectory3D]:
         """
