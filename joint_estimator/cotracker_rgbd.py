@@ -30,19 +30,21 @@ from sklearn.cluster import DBSCAN
 
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-from effsam_utils import effsam_embedding, effsam_refine_masks
+# from effsam_utils import effsam_embedding, effsam_refine_masks
+from dinov2_utils import load_dinov2_model, compute_dinov2_similarity
+
 import glob
 from PIL import Image
 
 def compute_change_mask(first_frame: torch.Tensor, 
                        last_frame: torch.Tensor,
                        out_dir: str,
-                       threshold: float = 1e-2,
-                       kernel_ratio: float = 0.03,
-                       use_effsam: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+                       threshold: float = 1e-1,
+                       use_dinov2: bool = True,
+                       dinov2_model=None,
+                       dinov2_processor=None) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Memory-optimized change mask computation.
-    Changed default use_effsam=False to avoid heavy SAM embeddings.
+    Compute change mask using DINOv2 or simple difference.
     """
     os.makedirs(out_dir, exist_ok=True)
     
@@ -55,7 +57,7 @@ def compute_change_mask(first_frame: torch.Tensor,
     H, W = first_frame.shape[-2:]
     device = first_frame.device
     
-    # further downsample for CD
+    # Downsample for efficiency
     if max(H, W) > 480:
         scale = 480 / max(H, W)
         new_h = int(H * scale)
@@ -63,8 +65,7 @@ def compute_change_mask(first_frame: torch.Tensor,
         new_h = (new_h // 8) * 8
         new_w = (new_w // 8) * 8
         
-        print(f"Further downsampling for change detection: {H}x{W} → {new_h}x{new_w}")
-        
+        print(f"Downsampling for change detection: {H}x{W} → {new_h}x{new_w}")
         first_frame = torch.nn.functional.interpolate(
             first_frame, size=(new_h, new_w), mode='bilinear', align_corners=False
         )
@@ -73,14 +74,13 @@ def compute_change_mask(first_frame: torch.Tensor,
         )
         H, W = new_h, new_w
     
-    # Move to CPU for OpenCV processing to save GPU memory
+    # Convert to numpy
     first_np = first_frame[0].permute(1, 2, 0).cpu().numpy()
     last_np = last_frame[0].permute(1, 2, 0).cpu().numpy()
-    
-    torch.cuda.empty_cache()
-    
     first_np = np.clip(first_np, 0, 1)
     last_np = np.clip(last_np, 0, 1)
+    
+    torch.cuda.empty_cache()
     
     # Save debug images
     cv2.imwrite(f"{out_dir}/first_frame.png", 
@@ -88,17 +88,20 @@ def compute_change_mask(first_frame: torch.Tensor,
     cv2.imwrite(f"{out_dir}/last_frame.png", 
                 (last_np[..., ::-1] * 255).astype(np.uint8))
     
-    # Optional Gaussian blur
-    if kernel_ratio > 0:
-        kernel_size = int(W * kernel_ratio)
-        kernel_size = kernel_size + 1 if kernel_size % 2 == 0 else kernel_size
-        first_np = cv2.GaussianBlur(first_np, (kernel_size, kernel_size), 0)
-        last_np = cv2.GaussianBlur(last_np, (kernel_size, kernel_size), 0)
-    
-    # Simple color difference (avoid heavy SAM embeddings)
-    diff = np.abs(first_np - last_np)
-    diff_gray = np.mean(diff, axis=2)
-    similarity_map = (255 - (diff_gray * 255)).astype(np.uint8)
+    # === KEY CHANGE: Use DINOv2 or simple diff ===
+    if use_dinov2 and dinov2_model is not None:
+        print("Using DINOv2 semantic similarity...")
+        sim_map = compute_dinov2_similarity(
+            first_np, last_np, dinov2_model, dinov2_processor, device
+        )
+        # Resize to original resolution
+        sim_map = cv2.resize(sim_map, (W, H), interpolation=cv2.INTER_CUBIC)
+        similarity_map = (sim_map * 255).astype(np.uint8)
+    else:
+        print("Using simple color difference...")
+        diff = np.abs(first_np - last_np)
+        diff_gray = np.mean(diff, axis=2)
+        similarity_map = (255 - (diff_gray * 255)).astype(np.uint8)
     
     cv2.imwrite(f"{out_dir}/similarity_map.png", similarity_map)
     
@@ -188,6 +191,10 @@ class CoTrackerRGBD:
         self.video_h = None  # Store video dimensions
         self.video_w = None
 
+        self.use_dinov2 = True  
+        self.dinov2_model = None
+        self.dinov2_processor = None
+
         
     def load_cotracker_model(self):
         """Load the CoTracker3 model."""
@@ -201,27 +208,24 @@ class CoTrackerRGBD:
                               torch.cuda.memory_allocated())
             print(f"Available GPU memory: {available_memory / 1e9:.2f} GB")
 
-    def compute_change_segmentation(self, video_tensor: torch.Tensor, out_dir: str) -> torch.Tensor:
-        """
-        Compute change mask between first and last frames.
-        
-        Args:
-            video_tensor: Video tensor (1xTxCxHxW)
-            out_dir: Output directory for debug visualizations
-            
-        Returns:
-            segmentation_mask: Binary mask for changed regions (1xHxW)
-        """
+    def compute_change_segmentation(self, video_tensor: torch.Tensor, out_dir: str):
         print("Computing change detection mask...")
         
-        first_frame = video_tensor[0, 0]  # First frame
-        last_frame = video_tensor[0, -1]  # Last frame
+        if self.use_dinov2 and self.dinov2_model is None:
+            print("Loading DINOv2 for change detection...")
+            self.dinov2_processor, self.dinov2_model = load_dinov2_model(self.device)
+        
+        first_frame = video_tensor[0, 0]
+        last_frame = video_tensor[0, -1]
         
         change_dir = os.path.join(out_dir, "change_detection")
         masks, masks_all = compute_change_mask(
             first_frame, last_frame, 
             out_dir=change_dir,
-            threshold=self.change_threshold
+            threshold=self.change_threshold,
+            use_dinov2=self.use_dinov2,
+            dinov2_model=self.dinov2_model,
+            dinov2_processor=self.dinov2_processor
         )
         
         # Combine all large masks into single segmentation
@@ -704,7 +708,6 @@ class CoTrackerRGBD:
             if not cluster_trajs:
                 continue
 
-            # Pick medoid trajectory (closest to cluster mean)
             cluster_features = [f for f, l in zip(features, labels) if l == lbl]
             cluster_mean = np.mean(cluster_features, axis=0)
 
@@ -717,21 +720,20 @@ class CoTrackerRGBD:
         return clustered
   
 
-    def visualize_result(self, out_dir="./saved_videos", pad_value=120, linewidth=3):
-        """Visualize last predicted tracks on the original video."""
+    def visualize_result(self, out_dir="./saved_videos", pad_value=50, linewidth=3):
         if not hasattr(self, "_last_pred_tracks"):
             print("No prediction available to visualize.")
             return
 
+        video_for_vis = (self._last_video_tensor * 255.0).byte()
+        
         vis = Visualizer(save_dir=out_dir, pad_value=pad_value, linewidth=linewidth)
         vis.visualize(
-            self._last_video_tensor,
+            video_for_vis,  
             self._last_pred_tracks,
             self._last_pred_visibility,
             query_frame=0 if self.backward_tracking else self.grid_query_frame,
         )
-        print(f"Visualization saved to {out_dir}")
-
     
 
 # Utility functions for external use
