@@ -42,6 +42,7 @@ from change_det.utils.img_utils import (
     extract_depths_at_pixels, image_align, filter_features_with_mask,
     in_image, split_masks, dilate_masks, overlay_mask_on_image
 )
+from change_det.utils.proj_utils import depths_to_points
 from change_det.utils.io import (
     load_from_json, write_to_json, read_dataset, read_imgs, read_transforms,
     save_masks, params_to_cameras, cameras_to_params, save_imgs
@@ -60,6 +61,8 @@ from nerfstudio.utils.poses import to4x4
 from change_det.utils.render_utils import render_cameras, render_3dgs_at_cam
 
 from change_det.utils.image_diff import image_diff_dinov2, image_diff_effsam
+
+from change_det.utils.obj_3d_seg import Object3DSeg, Obj3DFeats
 
 def camera_clone(cameras):
     """
@@ -259,7 +262,7 @@ class ChangeDet:
                 feat_i.append(feat)
             feats_all.append(feat_i)
         return feats_all
-
+    
     def match_move_out(
         self, rgbs, depths, masks, poses, Ks, pcd_filter=0.9, embed_sim_thresh=0.4
     ):
@@ -765,10 +768,10 @@ class ChangeDet:
         """
         if configs is None:
             configs = {
-                "sam_threshold": 0.8,
+                "sam_threshold": 0.85,
                 "mask_refine_sparse_view": 0.1,
                 "area_threshold": 0.01,
-                "cd_kernel_ratio": 0.1,
+                "cd_kernel_ratio": 0.05,
                 "pcd_filtering": 0.98,
                 "pre_train_pred_bbox_expand": 0.05,
                 "voxel_dim": 300,
@@ -811,7 +814,7 @@ class ChangeDet:
         pretrain_indices = [i for i, t in enumerate(times) if t == 0.0]
         postchange_indices = [i for i, t in enumerate(times) if t == 1.0]
 
-        sparse_view_indices = postchange_indices[3:9]  # e.g. N_sparse = 3
+        sparse_view_indices = postchange_indices[3:10]  # e.g. N_sparse = 3
 
         # Get tensors
         N, _, H, W = color_images.shape
@@ -841,15 +844,15 @@ class ChangeDet:
             self.pipeline_pretrain, cameras_sparse_view, device=device
         )
 
-        if self.debug_dir is not None:
-            debug_rgb_dir = self.debug_dir / "debug_rgb"
-            debug_depth_dir = self.debug_dir / "debug_depth"
+        # if self.debug_dir is not None:
+        #     debug_rgb_dir = self.debug_dir / "debug_rgb"
+        #     debug_depth_dir = self.debug_dir / "debug_depth"
 
-            debug_rgb_dir.mkdir(parents=True, exist_ok=True)
-            debug_depth_dir.mkdir(parents=True, exist_ok=True)
+        #     debug_rgb_dir.mkdir(parents=True, exist_ok=True)
+        #     debug_depth_dir.mkdir(parents=True, exist_ok=True)
 
-            debug_image_pairs(rgbs_render_sparse_view, rgbs_captured_sparse_view, debug_rgb_dir)
-            debug_depth_pairs(depths_render_sparse_view, depths_captured_sparse_view, debug_depth_dir)
+        #     debug_image_pairs(rgbs_render_sparse_view, rgbs_captured_sparse_view, debug_rgb_dir)
+        #     debug_depth_pairs(depths_render_sparse_view, depths_captured_sparse_view, debug_depth_dir)
 
 
 
@@ -898,7 +901,7 @@ class ChangeDet:
                     )
                     cv2.imwrite(
                         f"{self.debug_dir}/overlay_view{ii}_mask{mi}.png",
-                        cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)  # ensure OpenCV format
+                        cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR) 
                     )
 
         masks_move_out_sparse_view = []
@@ -955,7 +958,6 @@ class ChangeDet:
                         cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)  # ensure OpenCV format
                     )
 
-
         ##### move in #####
         masks_move_in_sparse_view = []
 
@@ -1011,13 +1013,10 @@ class ChangeDet:
                         cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)  # ensure OpenCV format
                     )
 
-
-        import pdb; pdb.set_trace()
-
-        ## Object Association across (Prec-change) views
+        ## Object Association across for move-out objects
         pcds, pcd_feats = self.match_move_out(
             rgbs_render_sparse_view[no_overlap_ind],
-            depths_sparse_view[no_overlap_ind],
+            depths_captured_sparse_view[no_overlap_ind],
             [masks_move_out_sparse_view[i] for i in no_overlap_ind],
             cam_poses_sparse_view[no_overlap_ind],
             Ks_sparse_view[no_overlap_ind],
@@ -1025,33 +1024,33 @@ class ChangeDet:
             embed_sim_thresh=0.9
         )
 
-        ## Multi view move-in mask association across post-change views
-        masks_move_in_sparse_view = []
-        for ii, masks_changed in enumerate(masks_changed_sparse):
-            masks_captured, scores_captured = effsam_refine_masks(
-                rgbs_captured_sparse_view[ii:ii+1], masks_changed,
-                expand=configs["mask_refine_sparse_view"]
-            )
-            # Move-in masks have SAM prediction score > 0.95 on captured image
-            masks_in = [
-                masks_captured[i:i+1] for i, s in enumerate(scores_captured)
-                if s > 0.8
-            ]
-            if self.debug_dir:
-                save_masks(
-                    masks_captured,
-                    [
-                        f"{self.debug_dir}/masks_captured_view{ii}_mask{j}.png"
-                        for j in range(masks_captured.shape[0])
-                    ]
-                )
-            if len(masks_in) > 0:
-                masks_in = torch.cat(masks_in, dim=0)
-                masks_in = split_masks(masks_in, configs["area_threshold"])
-            else:
-                masks_in = torch.empty(0, 1, H, W, device=device)
-            print(f"[View {ii}] Move-in candidates after SAM filtering: {len(masks_in)}")
-            masks_move_in_sparse_view.append(masks_in)
+        # ## Multi view move-in mask association across post-change views
+        # masks_move_in_sparse_view = []
+        # for ii, masks_changed in enumerate(masks_changed_sparse):
+        #     masks_captured, scores_captured = effsam_refine_masks(
+        #         rgbs_captured_sparse_view[ii:ii+1], masks_changed,
+        #         expand=configs["mask_refine_sparse_view"]
+        #     )
+        #     # Move-in masks have SAM prediction score > 0.95 on captured image
+        #     masks_in = [
+        #         masks_captured[i:i+1] for i, s in enumerate(scores_captured)
+        #         if s > 0.8
+        #     ]
+        #     if self.debug_dir:
+        #         save_masks(
+        #             masks_captured,
+        #             [
+        #                 f"{self.debug_dir}/masks_captured_view{ii}_mask{j}.png"
+        #                 for j in range(masks_captured.shape[0])
+        #             ]
+        #         )
+        #     if len(masks_in) > 0:
+        #         masks_in = torch.cat(masks_in, dim=0)
+        #         masks_in = split_masks(masks_in, configs["area_threshold"])
+        #     else:
+        #         masks_in = torch.empty(0, 1, H, W, device=device)
+        #     print(f"[View {ii}] Move-in candidates after SAM filtering: {len(masks_in)}")
+        #     masks_move_in_sparse_view.append(masks_in)
 
 
 

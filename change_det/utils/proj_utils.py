@@ -80,34 +80,46 @@ def distort_points(points, intrinsics, dist_coeffs):
     points2d = torch.stack((x_distorted, y_distorted), dim=-1)
     return points2d
 
-
 def depths_to_points(pixels, depths, poses, Ks):
     """
-    Convert depths at sparse pixels to point clouds wrt world frame
+    Convert depths at sparse pixels to 3D points in world coordinates.
 
     Args:
-        pixels (..., 2): pixel coordinates
+        pixels (..., 2): pixel coordinates (x, y)
         depths (..., 1): depth values
-        poses (4, 4): Camera-to-world poses
+        poses (4, 4): Camera-to-world pose
         Ks (3, 3): Camera intrinsics
 
     Returns:
-        points (..., 3): sparse point cloud
+        points (..., 3): sparse point cloud in world frame
     """
-    assert pixels.shape[-1] == 2
-    assert depths.shape[-1] == 1
+    assert pixels.shape[-1] == 2, f"Expected pixels (...,2), got {pixels.shape}"
+    assert depths.shape[-1] == 1, f"Expected depths (...,1), got {depths.shape}"
+
+    # Ensure device consistency
+    device = depths.device
+    pixels = pixels.to(device)
+    depths = depths.to(device)
+    poses = poses.to(device)
+    Ks = Ks.to(device)
+
+    # Homogeneous pixel coordinates
     pixels_homo = torch.cat([pixels, torch.ones_like(depths)], dim=-1)
-    cam_coords = torch.einsum(
-        'ij, ...j->...i', torch.inverse(Ks), pixels_homo
-    )
+
+    # Camera coordinates (undo intrinsics)
+    cam_coords = torch.einsum('ij, ...j->...i', torch.inverse(Ks), pixels_homo)
+
+    # Scale by depth
     cam_3D_coords = cam_coords * depths
-    cam_3D_coords_homo = torch.cat(
-        [cam_3D_coords, torch.ones_like(depths)], dim=-1
-    )
-    world_coords_homo = torch.einsum(
-        "ij, ...j->...i", poses, cam_3D_coords_homo
-    )
+
+    # Convert to homogeneous (for pose transform)
+    cam_3D_coords_homo = torch.cat([cam_3D_coords, torch.ones_like(depths)], dim=-1)
+
+    # Transform to world coordinates
+    world_coords_homo = torch.einsum("ij, ...j->...i", poses, cam_3D_coords_homo)
+
     return world_coords_homo[..., :3]
+
 
 
 def project_points(points, poses, intrinsics, dist_coeffs, H, W):

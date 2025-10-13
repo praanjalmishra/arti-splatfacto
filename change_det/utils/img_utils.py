@@ -88,23 +88,32 @@ def extract_depths_at_pixels(pixels, depth):
     """
     Extract depth values for pixel coordinates from the depth map.
 
-    Parameters
-        pixels: (N, 2) or (2,) Pixel coordinates
-        depth: (1, 1, H, W) Depth map
+    Args:
+        pixels (N, 2): Pixel coordinates (x, y)
+        depth (1, 1, H, W) or (1, 1, 1, H, W): Depth map
 
     Returns:
-        depths: (N, 1) or (1, 1)
+        depths (N, 1): Depth values at each pixel
     """
+    # Handle extra singleton dimension
+    if depth.ndim == 5 and depth.shape[2] == 1:
+        depth = depth.squeeze(2)
+    elif depth.ndim != 4:
+        raise ValueError(f"Expected depth shape (1,1,H,W), got {depth.shape}")
+
+    _, _, H, W = depth.shape
+    pixels = pixels.to(depth.device)
+
     if pixels.ndim == 1 and pixels.shape[0] == 2:
-        pixel_indices = pixels.unsqueeze(0).long()  # Convert (2,) to (1,2)
-    else:
-        pixel_indices = pixels.long()
+        pixels = pixels.unsqueeze(0)
 
-    if pixel_indices.shape[0] == 0:
-        return torch.empty((0, 1), device=depth.device)
+    x = pixels[:, 0].round().long().clamp(0, W - 1)
+    y = pixels[:, 1].round().long().clamp(0, H - 1)
 
-    depth_values = depth[0, 0, pixel_indices[:, 1], pixel_indices[:, 0]]
-    return depth_values.reshape(-1, 1)
+    depth_values = depth[0, 0, y, x].unsqueeze(-1)
+    return depth_values
+
+
 
 def dilate_masks(masks, kernel_size=3):
     """
@@ -171,35 +180,53 @@ def invert_mask(mask_file, output_file):
     inverted_mask.save(output_file)
 
 
+
 def split_masks(masks, threshold=1e-2):
     """
-    Split disconnected masks in a batch of masks
+    Safely split disconnected masks in a batch of masks.
 
     Args:
-        masks (Nx1xHxW): Binary masks
+        masks (Nx1xHxW): Binary masks tensor (0/1 or 0–255)
+        threshold (float): Fractional area threshold to filter small components
 
     Returns:
-        split_masks (Mx1xHxW): Split masks (M >= N)
+        (Mx1xHxW): Split masks (M >= N)
     """
-    assert len(masks.shape) == 4 and masks.shape[1] == 1
+    if masks is None or masks.numel() == 0:
+        print("[WARN] split_masks: empty input tensor")
+        return torch.zeros(0, 1, 1, 1, device=masks.device if masks is not None else "cuda")
+
+    assert len(masks.shape) == 4 and masks.shape[1] == 1, f"Invalid shape: {masks.shape}"
+
+    H, W = masks.shape[-2:]
+    device = masks.device
+
+    # Ensure safe range and dtype before converting to numpy
+    masks = masks.detach().float()
+    if masks.max() <= 1.0:
+        masks = (masks * 255).byte()
+    else:
+        masks = masks.byte()
+
     masks_np = masks.cpu().numpy()
-    H = masks.shape[-2]
-    W = masks.shape[-1]
+
     split_masks_np = []
+
     for mask_np in tqdm(masks_np, desc="Split masks"):
-        mask_np = mask_np[0]
-        # Find connected components
+        mask_np = mask_np[0]  # (H, W)
         num_labels, labels = cv2.connectedComponents(mask_np.astype(np.uint8))
         for i in range(1, num_labels):
-            # Split the masks
             component_mask = (labels == i).astype(np.uint8)
             if component_mask.sum() > threshold * H * W:
                 split_masks_np.append(component_mask)
-    if len(split_masks_np) == 0:
-        return torch.zeros(0, 1, H, W).to(masks)
-    split_masks = torch.from_numpy(np.array(split_masks_np)).to(masks)
-    return split_masks.unsqueeze(1)
 
+    # Handle no components safely
+    if len(split_masks_np) == 0:
+        return torch.zeros(0, 1, H, W, device=device, dtype=torch.float32)
+
+    # Stack and move back to GPU
+    split_masks_tensor = torch.from_numpy(np.stack(split_masks_np)).float().unsqueeze(1).to(device)
+    return split_masks_tensor
 
 def masks_to_focus(masks, kernel_ratio=0.15):
     """

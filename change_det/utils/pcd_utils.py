@@ -10,45 +10,55 @@ from scipy.spatial.distance import cdist
 
 def compute_point_cloud(depths, poses, Ks, masks):
     """
-    Compute the point cloud from depths maps, camera poses and intrinsics
-
+    Compute the point cloud from depth maps, camera poses and intrinsics
     Args:
         depths (N, 1, H, W): Depth maps
         poses (N, 4, 4): Camera poses
-        Ks (N, 3, 3): Camera intrinsics for each image
+        Ks (N, 3, 3): Camera intrinsics
         masks (N, 1, H, W): Binary masks
-
     Returns:
         point_cloud (torch.Tensor): Point cloud
     """
+    # Handle possible extra dimension (e.g., [N,1,1,H,W])
+    if depths.ndim == 5 and depths.shape[2] == 1:
+        depths = depths.squeeze(2)
+    elif depths.ndim != 4:
+        raise ValueError(f"Expected depths to have shape (N,1,H,W), got {depths.shape}")
+
+    # Ensure all tensors are on same device
+    device = depths.device
+    poses = poses.to(device)
+    Ks = Ks.to(device)
+    masks = masks.to(device)
+
     N, _, H, W = depths.shape
-    # Create a batched meshgrid
-    u = torch.linspace(
-        0, W - 1, W, device=depths.device
-    ).repeat(H, 1).expand(N, H, W)
-    v = torch.linspace(
-        0, H - 1, H, device=depths.device
-    ).repeat(W, 1).t().expand(N, H, W)
-    # Normalize (u, v) coordinates and scale by depth map
-    X = (u - Ks[:, 0, 2].view(N, 1, 1)) \
-        / Ks[:, 0, 0].view(N, 1, 1) * depths.squeeze(1)
-    Y = (v - Ks[:, 1, 2].view(N, 1, 1)) \
-        / Ks[:, 1, 1].view(N, 1, 1) * depths.squeeze(1)
+
+    # Create pixel coordinate grid
+    u = torch.linspace(0, W - 1, W, device=device).repeat(H, 1).expand(N, H, W)
+    v = torch.linspace(0, H - 1, H, device=device).repeat(W, 1).t().expand(N, H, W)
+
+    # Compute normalized camera coordinates
+    X = (u - Ks[:, 0, 2].view(N, 1, 1)) / Ks[:, 0, 0].view(N, 1, 1) * depths.squeeze(1)
+    Y = (v - Ks[:, 1, 2].view(N, 1, 1)) / Ks[:, 1, 1].view(N, 1, 1) * depths.squeeze(1)
     Z = depths.squeeze(1)
-    # Stack to create (N, H, W, 3) post cloud map
+
+    # Stack points in camera coordinates
     point_cloud = torch.stack((X, Y, Z), dim=-1)
-    # Apply 4x4 camera pose matrix to map to world coordinates
-    ones = torch.ones(N, H, W, 1, device=depths.device)
+
+    # Convert to homogeneous coordinates
+    ones = torch.ones(N, H, W, 1, device=device)
     point_cloud_hom = torch.cat((point_cloud, ones), dim=-1)
-    point_cloud_world = torch.einsum(
-        'bij,bklj->bkli', poses, point_cloud_hom
-    )
-    # Reshape to (NxHxW, 4) for easy min/max computation
+
+    # Transform points to world coordinates
+    point_cloud_world = torch.einsum('bij,bklj->bkli', poses, point_cloud_hom)
+
+    # Reshape and mask
     point_cloud_world_reshaped = point_cloud_world.reshape(-1, 4)
-    # Remove zero points using the mask
     non_zero_mask = masks.view(-1).bool()
     point_cloud_in_mask = point_cloud_world_reshaped[non_zero_mask, :3]
+
     return point_cloud_in_mask
+
 
 
 def point_cloud_filtering(point_cloud, percentile_threshold=0.90):
