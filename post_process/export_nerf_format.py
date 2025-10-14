@@ -5,12 +5,13 @@ from scipy.spatial.transform import Rotation
 import shutil
 import liblzfse
 import cv2
+import open3d as o3d
 
 def decompress_depth(compressed_data, dw, dh):
     """Decompress LZFSE depth data from Record3D"""
     try:
         decompressed = liblzfse.decompress(compressed_data)
-        depth = np.frombuffer(decompressed, dtype=np.float32).reshape(dh, dw)
+        depth = np.frombuffer(decompressed, dtype=np.float32).reshape(dh, dw).copy()
         return depth
     except Exception as e:
         print(f"Error decompressing depth: {e}")
@@ -24,22 +25,17 @@ def depth_to_pointcloud(depth, rgb, K, c2w, subsample=4, frame_idx=0, rgb_w=None
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
     
-    # CRITICAL FIX: Scale intrinsics from RGB resolution to depth resolution
     if rgb_w is not None and rgb_h is not None:
-        # Intrinsics are for RGB resolution, scale to depth
-        scale_x = W / rgb_w
-        scale_y = H / rgb_h
-        
-        fx_depth = fx * scale_x
-        fy_depth = fy * scale_y
-        cx_depth = cx * scale_x
-        cy_depth = cy * scale_y
-        
+        # Resize depth to match RGB before projection
+        depth = cv2.resize(depth, (rgb_w, rgb_h), interpolation=cv2.INTER_NEAREST)
+        H, W = depth.shape
+        fx_depth, fy_depth, cx_depth, cy_depth = fx, fy, cx, cy
+
+            
         if frame_idx == 0:
             print(f"\n  Scaling intrinsics:")
             print(f"    RGB resolution: {rgb_w}x{rgb_h}")
             print(f"    Depth resolution: {W}x{H}")
-            print(f"    Scale factors: {scale_x:.4f}, {scale_y:.4f}")
             print(f"    Original: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
             print(f"    Scaled:   fx={fx_depth:.1f}, fy={fy_depth:.1f}, cx={cx_depth:.1f}, cy={cy_depth:.1f}")
     else:
@@ -127,9 +123,19 @@ def save_ply(points, colors, output_path):
             f.write(f"{point[0]} {point[1]} {point[2]} ")
             f.write(f"{int(color[0])} {int(color[1])} {int(color[2])}\n")
 
-def record3d_to_nerf(data_dir, output_dir, max_frames=-1, stride=10,
-                     create_sparse_pc=True, pc_subsample=4, voxel_downsample=0.01,
-                     downsample_factor=2):
+def record3d_to_nerf(
+    data_dir,
+    output_dir,
+    max_frames=-1,
+    stride=10,
+    create_sparse_pc=True,
+    pc_subsample=4,
+    voxel_downsample=0.01,
+    downsample_factor=2,
+    start_frame=0,
+    end_frame=-1,
+):
+
     """
     Convert Record3D RGBD data to NeRF format for 3DGS training.
 
@@ -148,8 +154,12 @@ def record3d_to_nerf(data_dir, output_dir, max_frames=-1, stride=10,
     
     # Create output directories
     output_dir.mkdir(parents=True, exist_ok=True)
-    image_dir = output_dir / "images"
-    image_dir.mkdir(exist_ok=True)
+    rgb_dir_out = output_dir / "frames"
+    rgb_dir_out.mkdir(parents=True, exist_ok=True)
+
+
+    depth_dir_out = output_dir / "depth" 
+    depth_dir_out.mkdir(parents=True, exist_ok=True)
     
     # Load metadata
     print("Loading metadata...")
@@ -226,20 +236,21 @@ def record3d_to_nerf(data_dir, output_dir, max_frames=-1, stride=10,
     if stride > 1:
         indices_all = np.arange(num_frames)
         indices_strided = indices_all[::stride]
-        print(f"Applied stride={stride}: {len(indices_strided)} frames")
     else:
         indices_strided = np.arange(num_frames)
-    
-    # Then apply max_frames limit if needed
+
+    # Apply start/end slicing
+    if end_frame == -1 or end_frame > len(indices_strided):
+        end_frame = len(indices_strided)
+    indices_strided = indices_strided[start_frame:end_frame]
+
+    # Apply max_frames limit if needed
     if max_frames > 0 and len(indices_strided) > max_frames:
-        # Sample uniformly from the strided frames
-        indices = np.round(np.linspace(0, len(indices_strided) - 1, max_frames)).astype(int)
-        indices = indices_strided[indices]
-        print(f"Limited to max_frames={max_frames}")
-    else:
-        indices = indices_strided
-    
-    print(f"Final selected frames: {len(indices)}")
+        indices_strided = indices_strided[:max_frames]
+
+    indices = indices_strided
+    print(f"Selected frames {start_frame} - {end_frame} (stride={stride}), total: {len(indices)}")
+
     
     image_files = [image_files[i] for i in indices]
     selected_poses = [poses_list[i] for i in indices]
@@ -250,24 +261,28 @@ def record3d_to_nerf(data_dir, output_dir, max_frames=-1, stride=10,
         print(f"  Downsampling images by factor of {downsample_factor}")
     
     copied_paths = []
-    for img_file in image_files:
+    for frame_idx, img_file in enumerate(image_files):
         # Read image
         img = cv2.imread(str(rgb_dir / img_file.name))
         if img is None:
             print(f"Warning: Could not read {img_file.name}")
             continue
-        
+
         # Downsample if requested
         if downsample_factor > 1:
             new_h = img.shape[0] // downsample_factor
             new_w = img.shape[1] // downsample_factor
             img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        
-        # Save processed image
-        dst = image_dir / img_file.name
+
+        # Save sequentially named image inside rgb/frames/
+        frame_name = f"frame_{frame_idx:06d}.jpg"
+        dst = rgb_dir_out / frame_name
         cv2.imwrite(str(dst), img)
-        copied_paths.append(f"images/{img_file.name}")
-    
+
+        # Record relative path for transforms.json
+        copied_paths.append(f"frames/{frame_name}")
+
+        
     # Process camera poses
     print("Processing camera poses...")
     poses_array = np.array(selected_poses, dtype=np.float32)  # (N, 7)
@@ -284,7 +299,6 @@ def record3d_to_nerf(data_dir, output_dir, max_frames=-1, stride=10,
     # Convert quaternions to rotation matrices
     rotations = Rotation.from_quat(quats).as_matrix()  # (N, 3, 3)
     
-    # Build camera-to-world matrices (convert from ARKit/OpenCV to Nerfstudio/OpenGL)
     camera_to_worlds = []
     F_opencv_to_opengl = np.diag([1, -1, -1, 1])  # Flip Y and Z
 
@@ -292,6 +306,7 @@ def record3d_to_nerf(data_dir, output_dir, max_frames=-1, stride=10,
         c2w = np.eye(4)
         c2w[:3, :3] = rotations[i]
         c2w[:3, 3] = translations[i]
+        
         
         # Convert coordinate system
         c2w_nerf = F_opencv_to_opengl @ c2w
@@ -333,7 +348,6 @@ def record3d_to_nerf(data_dir, output_dir, max_frames=-1, stride=10,
                 # Get actual RGB dimensions
                 rgb_h_actual, rgb_w_actual = rgb.shape[:2]
                 
-                # Load and decompress depth
                 depth_file = depth_dir / f"{img_file.stem}.depth"
                 if depth_file.exists():
                     with open(depth_file, 'rb') as f:
@@ -342,8 +356,27 @@ def record3d_to_nerf(data_dir, output_dir, max_frames=-1, stride=10,
                     depth = decompress_depth(compressed_depth, W, H)
                     
                     if depth is not None:
+                        depth[np.isnan(depth)] = 0.0
+                        depth = np.clip(depth, 0.1, 3.0)
                         if idx == 0:
                             print(f"  RGB actual dimensions: {rgb_w_actual}x{rgb_h_actual}")
+
+
+                        if rgb_w_actual != W or rgb_h_actual != H:
+                            depth_resized = cv2.resize(depth, (rgb_w_actual, rgb_h_actual), interpolation=cv2.INTER_NEAREST)
+                        else:
+                            depth_resized = depth
+
+                        # Convert from meters → millimeters, clip, and cast
+                        depth_mm = np.clip(depth_resized * 1000.0, 0, 65535).astype(np.uint16)
+
+                        # Zero = invalid depth (as per Nerfstudio)
+                        depth_mm[np.isnan(depth_resized)] = 0
+                        depth_mm[depth_resized <= 0.0] = 0
+
+                        depth_filename = f"frame_{idx:06d}.png"
+                        cv2.imwrite(str(depth_dir_out / depth_filename), depth_mm)
+
                         
                         # Convert to point cloud with proper intrinsics scaling
                         points, colors = depth_to_pointcloud(
@@ -361,34 +394,42 @@ def record3d_to_nerf(data_dir, output_dir, max_frames=-1, stride=10,
                             print(f"  Processed {idx + 1}/{len(image_files)} frames ({success_count} successful)")
             
             print(f"  Total successful depth frames: {success_count}/{len(image_files)}")
-            
             if all_points:
-                # Combine all points
                 all_points = np.vstack(all_points)
                 all_colors = np.vstack(all_colors)
-                
-                print(f"Total points before downsampling: {len(all_points):,}")
-                
-                # Print point cloud statistics to verify
-                print(f"Point cloud bounds:")
-                print(f"  X: [{all_points[:, 0].min():.3f}, {all_points[:, 0].max():.3f}]")
-                print(f"  Y: [{all_points[:, 1].min():.3f}, {all_points[:, 1].max():.3f}]")
-                print(f"  Z: [{all_points[:, 2].min():.3f}, {all_points[:, 2].max():.3f}]")
-                
-                # Simple voxel downsampling
+
+                print(f"Total points before filtering: {len(all_points):,}")
+
+                dist = np.linalg.norm(all_points, axis=1)
+                mask = (dist > 0.05) & (dist < 5.0)  # keep only 5cm–5m points
+                all_points = all_points[mask]
+                all_colors = all_colors[mask]
+                print(f"After distance filter: {len(all_points):,}")
+
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(all_points)
+                pcd.colors = o3d.utility.Vector3dVector(all_colors / 255.0)
+
+                print("Running statistical outlier removal (nb_neighbors=20, std_ratio=1.0)...")
+                pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=1.0)
+                all_points = np.asarray(pcd.points)
+                all_colors = (np.asarray(pcd.colors) * 255).astype(np.uint8)
+                print(f"After statistical outlier removal: {len(all_points):,}")
+
+                # 3. Optional voxel downsampling (already in your code) ---
                 if voxel_downsample > 0:
                     voxel_indices = np.floor(all_points / voxel_downsample).astype(int)
                     _, unique_indices = np.unique(voxel_indices, axis=0, return_index=True)
                     all_points = all_points[unique_indices]
                     all_colors = all_colors[unique_indices]
-                    print(f"Points after downsampling: {len(all_points):,}")
-                
-                # Save point cloud
+                    print(f"After voxel downsampling: {len(all_points):,}")
+
                 ply_path = output_dir / "sparse_pc.ply"
                 save_ply(all_points, all_colors, ply_path)
-                print(f"✓ Sparse point cloud saved: {ply_path}")
+                print(f"✓ Clean sparse point cloud saved: {ply_path}")
             else:
                 print("Warning: No valid depth data found, skipping point cloud generation")
+
     
     # Build frames
     print("\nBuilding transforms.json...")
@@ -396,6 +437,7 @@ def record3d_to_nerf(data_dir, output_dir, max_frames=-1, stride=10,
     for i, img_path in enumerate(copied_paths):
         frames.append({
             "file_path": img_path,
+            "depth_file_path": f"depth/frame_{i:06d}.png",
             "transform_matrix": camera_to_worlds[i].tolist()
         })
     
@@ -416,22 +458,23 @@ def record3d_to_nerf(data_dir, output_dir, max_frames=-1, stride=10,
     cy = K[1, 2] * scale
     
     transforms = {
+        "camera_model": "OPENCV",
         "fl_x": float(focal_x),
         "fl_y": float(focal_y),
         "cx": float(cx),
         "cy": float(cy),
         "w": int(output_w),
         "h": int(output_h),
-        "camera_model": "OPENCV",
-        "frames": frames
+        "ply_file_path": "sparse_pc.ply" if create_sparse_pc and len(all_points) > 0 else None,
+        "frames": frames,
     }
     
     print(f"Output transforms.json resolution: {output_w}x{output_h} (downsampled from {output_w_orig}x{output_h_orig})")
     print(f"Intrinsics in transforms.json: fx={focal_x:.1f}, fy={focal_y:.1f}, cx={cx:.1f}, cy={cy:.1f}")
     
-    # Add sparse point cloud reference if created
-    if create_sparse_pc and len(all_points) > 0:
-        transforms["ply_file_path"] = "sparse_pc.ply"
+    # # Add sparse point cloud reference if created
+    # if create_sparse_pc and len(all_points) > 0:
+    #     transforms["ply_file_path"] = "sparse_pc.ply"
     
     # Save
     with open(output_dir / "transforms_pre.json", 'w') as f:
@@ -456,6 +499,9 @@ if __name__ == "__main__":
         data_dir=DATA_DIR,
         output_dir=OUTPUT_DIR,
         max_frames=-1,
+        stride=5,
+        start_frame=100,
+        end_frame=1400,
         create_sparse_pc=True,
         pc_subsample=8,
         voxel_downsample=0.01
