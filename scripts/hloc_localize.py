@@ -324,19 +324,7 @@ def localize_post_images(
         html_path = post_outputs / "localization_viz.html"
         fig.write_html(str(html_path), auto_open=True)
         print(f"✓ 3D visualization saved to: {html_path}")
-        
-        # 2D visualization of matches (optional)
-        try:
-            from hloc import visualization
-            print("\n=== Feature match visualization ===")
-            visualization.visualize_sfm_2d(
-                reconstruction,
-                images=list(poses.keys()),
-                color_by="visibility",
-                n=min(3, len(poses))
-            )
-        except Exception as e:
-            print(f"⚠ Skipped 2D visualization: {e}")
+    
 
     
     return poses
