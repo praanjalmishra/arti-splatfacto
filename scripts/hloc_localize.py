@@ -7,11 +7,15 @@ import json
 import numpy as np
 import pycolmap
 import h5py
+import cv2
+import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation
 from hloc import extract_features, match_features, pairs_from_retrieval
 from hloc.localize_sfm import QueryLocalizer
 from hloc.utils.io import get_keypoints
 from collections import defaultdict
+from hloc.utils import viz_3d
+import plotly.graph_objects as go
 
 def localize_post_images(
     pre_sfm_dir,           # Path to pre-change reconstruction (from script 1)
@@ -275,7 +279,213 @@ def localize_post_images(
         )
         print(f"\n✓ Saved transforms to: {post_transforms_file}")
     
+    # Visualize localized poses
+    if poses:
+        print("\n=== Step 7: Visualization ===")
+        print(reconstruction.summary())
+        
+        # 3D visualization (using hloc.utils.viz_3d)
+        fig = viz_3d.init_figure()
+        viz_3d.plot_reconstruction(
+            fig,
+            reconstruction,
+            color="rgba(255,0,0,0.5)",
+            name="pre-change reconstruction",
+            points=len(reconstruction.points3D) > 0,
+            cameras=True,
+            cs=0.1,
+            points_rgb=True
+        )
+        
+        # Add post-change localized cameras
+        camera_centers = np.array([pose[:3, 3] for pose in poses.values()])
+        fig.add_trace(
+            go.Scatter3d(
+                x=camera_centers[:, 0],
+                y=camera_centers[:, 1],
+                z=camera_centers[:, 2],
+                mode='markers',
+                marker=dict(size=4, color='blue'),
+                name='post-change cameras'
+            )
+        )
+        
+        fig.update_layout(
+            scene=dict(
+                aspectmode='data',
+                camera=dict(
+                    up=dict(x=0, y=-1, z=0),
+                    eye=dict(x=1.5, y=1.5, z=1.5)
+                ),
+            ),
+            title="Camera Localization: Pre-change (red) vs Post-change (blue)"
+        )
+        
+        html_path = post_outputs / "localization_viz.html"
+        fig.write_html(str(html_path), auto_open=True)
+        print(f"✓ 3D visualization saved to: {html_path}")
+        
+        # 2D visualization of matches (optional)
+        try:
+            from hloc import visualization
+            print("\n=== Feature match visualization ===")
+            visualization.visualize_sfm_2d(
+                reconstruction,
+                images=list(poses.keys()),
+                color_by="visibility",
+                n=min(3, len(poses))
+            )
+        except Exception as e:
+            print(f"⚠ Skipped 2D visualization: {e}")
+
+    
     return poses
+
+
+# def visualize_localization(reconstruction, poses, image_dir, output_dir):
+#     """Visualize localized camera poses"""
+    
+#     print("Creating 3D visualization...")
+    
+#     # Initialize figure
+#     fig = viz_3d.init_figure()
+    
+#     # Plot reference reconstruction (pre-change scene)
+#     viz_3d.plot_reconstruction(
+#         fig,
+#         reconstruction,
+#         color="rgba(255,0,0,0.5)",
+#         name="pre-change (reference)",
+#         points=len(reconstruction.points3D) > 0,
+#         cameras=True,
+#         cs=0.1,
+#         points_rgb=True
+#     )
+    
+#     # Plot localized post-change cameras
+#     camera_centers = []
+#     camera_directions = []
+    
+#     for img_name, c2w in poses.items():
+#         # Camera center in world coordinates
+#         center = c2w[:3, 3]
+#         camera_centers.append(center)
+        
+#         # Camera direction (negative z-axis in camera frame)
+#         direction = c2w[:3, :3] @ np.array([0, 0, -1])
+#         camera_directions.append(direction)
+    
+#     camera_centers = np.array(camera_centers)
+#     camera_directions = np.array(camera_directions)
+    
+#     # Add post-change camera centers as blue points
+#     fig.add_trace(go.Scatter3d(
+#         x=camera_centers[:, 0],
+#         y=camera_centers[:, 1],
+#         z=camera_centers[:, 2],
+#         mode='markers',
+#         marker=dict(size=4, color='blue'),
+#         name='post-change cameras'
+#     ))
+    
+#     # Add camera direction arrows (sample a few)
+#     sample_indices = np.linspace(0, len(poses)-1, min(20, len(poses)), dtype=int)
+    
+#     for idx in sample_indices:
+#         center = camera_centers[idx]
+#         direction = camera_directions[idx]
+        
+#         # Create arrow from center pointing in camera direction
+#         arrow_length = 0.2
+#         end_point = center + direction * arrow_length
+        
+#         fig.add_trace(go.Scatter3d(
+#             x=[center[0], end_point[0]],
+#             y=[center[1], end_point[1]],
+#             z=[center[2], end_point[2]],
+#             mode='lines',
+#             line=dict(color='cyan', width=2),
+#             showlegend=False,
+#             hoverinfo='skip'
+#         ))
+    
+#     fig.update_layout(
+#         scene=dict(
+#             aspectmode='data',
+#             camera=dict(
+#                 up=dict(x=0, y=-1, z=0),
+#                 eye=dict(x=1.5, y=1.5, z=1.5)
+#             ),
+#         ),
+#         title="Camera Localization: Pre-change (red) vs Post-change (blue)"
+#     )
+    
+#     html_path = output_dir / "localization_viz.html"
+#     fig.write_html(str(html_path), auto_open=True)
+#     print(f"✓ 3D visualization saved to: {html_path}")
+    
+#     # Also create a simple 2D visualization of a few matches
+#     print("\nCreating 2D match visualization...")
+#     visualize_matches_2d(reconstruction, poses, image_dir, output_dir)
+
+
+# def visualize_matches_2d(reconstruction, poses, post_image_dir, output_dir, num_viz=3):
+#     """Visualize feature matches for a few image pairs"""
+
+#     # Sample a few images to visualize
+#     post_images = list(poses.keys())
+#     sample_images = post_images[::len(post_images)//min(num_viz, len(post_images))][:num_viz]
+    
+#     for query_name in sample_images:
+#         # Load query image
+#         query_path = post_image_dir / query_name
+#         query_img = cv2.imread(str(query_path))
+#         if query_img is None:
+#             continue
+#         query_img = cv2.cvtColor(query_img, cv2.COLOR_BGR2RGB)
+        
+#         # Find a reference image with good overlap
+#         # (We'll just use the first one from reconstruction for simplicity)
+#         ref_img_data = list(reconstruction.images.values())[0]
+#         ref_name = ref_img_data.name
+        
+#         # Try to find reference image in pre-change directory
+#         # (assuming it's in the same relative structure)
+#         ref_path = post_image_dir.parent.parent / "pre_static" / "pre_static_1_post" / "frames" / ref_name
+        
+#         if ref_path.exists():
+#             ref_img = cv2.imread(str(ref_path))
+#             if ref_img is not None:
+#                 ref_img = cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB)
+                
+#                 # Create side-by-side visualization
+#                 h1, w1 = query_img.shape[:2]
+#                 h2, w2 = ref_img.shape[:2]
+#                 h = max(h1, h2)
+                
+#                 # Resize if needed
+#                 scale = 800 / max(w1, w2)
+#                 if scale < 1:
+#                     query_img = cv2.resize(query_img, None, fx=scale, fy=scale)
+#                     ref_img = cv2.resize(ref_img, None, fx=scale, fy=scale)
+                
+#                 fig, axes = plt.subplots(1, 2, figsize=(15, 7))
+#                 axes[0].imshow(query_img)
+#                 axes[0].set_title(f'Post-change: {query_name}')
+#                 axes[0].axis('off')
+                
+#                 axes[1].imshow(ref_img)
+#                 axes[1].set_title(f'Pre-change: {ref_name}')
+#                 axes[1].axis('off')
+                
+#                 plt.tight_layout()
+#                 viz_path = output_dir / f"match_viz_{query_name[:-4]}.png"
+#                 plt.savefig(str(viz_path), dpi=150, bbox_inches='tight')
+#                 plt.close()
+                
+#                 print(f"✓ Saved 2D visualization: {viz_path}")
+    
+#     print(f"\n✓ Visualization complete!")
 
 
 def save_transforms_json(poses, output_path, camera):
@@ -306,13 +516,12 @@ def save_transforms_json(poses, output_path, camera):
     with open(output_path, 'w') as f:
         json.dump(transforms, f, indent=2)
 
-
 if __name__ == "__main__":
     # Example usage
     pre_sfm_dir = Path("data_real/pre_static/pre_static_1_post/hloc_outputs")
-    post_image_dir = Path("data_real/sync/prismatic/static_sync/frames")
-    post_transforms_file = Path("data_real/sync/prismatic/static_sync/transforms.json")
-    
+    post_image_dir = Path("data_real/sync/prismatic/multi_sync/frames")
+    post_transforms_file = Path("data_real/sync/prismatic/multi_sync/transforms_aligned.json")
+
     poses = localize_post_images(
         pre_sfm_dir=pre_sfm_dir,
         post_image_dir=post_image_dir,
