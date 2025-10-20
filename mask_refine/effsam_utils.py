@@ -8,6 +8,7 @@ from efficient_sam.build_efficient_sam import (
     build_efficient_sam_vits, build_efficient_sam_vitt
 )
 from tqdm import tqdm
+from change_det.utils.img_utils import median_high_dim
 
 
 # Load EfficientSAM model
@@ -68,64 +69,6 @@ def expand_2D_bbox(bboxes, percent=0.05):
     expanded_bboxes[:, 3] += expand_height / 2
     expanded_bboxes [:, 3] += expand_height / 2
     return expanded_bboxes
-
-
-# def effsam_predict(rgbs, bboxes=None, points=None):
-#     """
-#     Query SAM model with bboxes prompts
-
-#     Args:
-#         rgbs: (N, 3, H, W) RGB images
-#         bboxes (N, 4): Bbox prompts (xyxy)
-#         points (N, K, 2): Positive point prompts
-
-#     Returns:
-#         masks (N, 1, H, W): Image masks
-#         scores (N-list): Confidence scores
-#     """
-#     if rgbs.shape[1] == 1:
-#         rgbs = rgbs.repeat(1, 3, 1, 1)
-#     elif rgbs.shape[1] == 3:
-#         pass
-#     else:
-#         raise ValueError("RGB images are of shape (N, 3, H, W)")
-#     assert bboxes is None or bboxes.shape[-1] == 4, \
-#         "bbox prompts are of shape (N, 4)"
-#     assert bboxes is None or bboxes.shape[0] == rgbs.shape[0], \
-#         "Image bbox batch mismatch"
-#     device = rgbs.device
-#     pts, pts_labels = [], []
-#     if bboxes is not None:
-#         # Uncomment to debug
-#         # debug_bbox_prompts(rgbs, bboxes, "/home/ziqi/Desktop/test/")
-#         bbox_pts = bboxes.reshape(bboxes.shape[0], 1, -1, 2)
-#         # Make labels for bbox points: 2 for top-left, 3 for bottom-right
-#         labels = torch.tensor([2, 3]).to(bbox_pts.device).reshape(1, 1, -1)
-#         pts.append(bbox_pts)
-#         pts_labels.append(labels)
-#     if points is not None:
-#         assert points.shape[0] == rgbs.shape[0]
-#         # Uncomment to debug
-#         # debug_point_prompts(rgbs, points, "/home/ziqi/Desktop/test/")
-#         pts.append(points[:, None, :, :])
-#         pts_labels.append(torch.ones(1, 1, points.shape[1]).to(device))
-#     pts = torch.cat(pts, dim=2)
-#     pts_label = torch.cat(pts_labels, dim=2)
-#     masks, scores = [], []
-#     for rgb, bbox_pt in tqdm(zip(rgbs, pts), desc="EffSAM"):
-#         rgb = rgb.to(device)
-#         bbox_pt = bbox_pt.to(device)
-#         logits, iou = effsam(rgb[None, ...], bbox_pt[None, ...], pts_label)
-#         sorted_ids = torch.argsort(iou, dim=-1, descending=True)
-#         iou = torch.take_along_dim(iou, sorted_ids, dim=2)
-#         logits = torch.take_along_dim(
-#             logits, sorted_ids[..., None, None], dim=2
-#         )
-#         mask = torch.ge(logits[0, 0, 0, :, :], 0)
-#         masks.append(mask)
-#         scores.append(iou[0, 0, 0].item())
-#     masks = torch.stack(masks, dim=0).unsqueeze(1)
-#     return masks, scores
 
 
 def effsam_predict(rgbs, bboxes=None, points=None, top_k=1, device=None):
@@ -257,7 +200,6 @@ def get_effsam_embedding_in_masks(rgbs, masks):
     @param masks (N-list of Mx1xHxW): 2D object masks
     @return features (N-list of MxK): Per-view per-object embedding vectors
     """
-    from nerfstudio.utils.img_utils import median_high_dim
     assert rgbs.shape[1] == 3
     device = rgbs.device
     embeddings = []

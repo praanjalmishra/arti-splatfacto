@@ -1,6 +1,6 @@
 #!/bin/bash
 
-DATA_DIR="/local/home/pmishra/cvg/arti-splatfacto/data_ransac/sync_data/multiview"
+DATA_DIR="/local/home/pmishra/cvg/arti-splatfacto/data_ransac/sync_data_rev/multiview"
 
 echo "Running refinement on full dataset..."
 echo ""
@@ -12,7 +12,6 @@ python mask_refine/mask_refinement.py \
     --batch-size 16 \
     --min-sam-score 0.80 \
     --overlays \
-
 
 echo ""
 # Run refinement on POST masks

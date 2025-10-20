@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Stage 1: Single-view mask refinement with embedding similarity and SAM validation.
+Single-view mask refinement with embedding similarity and SAM validation.
 
 Processes projected masks in mini-batches:
 1. Extract EfficientSAM embeddings (batched for efficiency)
@@ -167,7 +167,8 @@ def process_batch(
     dilation_size: int = 50,
     min_sam_score: float = 0.95,
     write_overlays: bool = False,
-    overlay_dir: Path = None
+    overlay_dir: Path = None,
+    second_pass: bool = True  
 ) -> dict:
     """
     Process a batch of frames.
@@ -198,44 +199,64 @@ def process_batch(
     # Refine each mask individually
     for i in range(batch_size):
         frame_name = rgb_paths[i].stem
-        
-        # Embedding-based refinement
+
+        # --- Pass 1: Embedding-based refinement ---
         refined_mask = refine_mask_with_embeddings(
             embeddings[i], masks[i], erosion_size, dilation_size
         )
-        
-        # Validate with SAM
-        sam_score = validate_mask_with_sam(
-            rgbs[i], refined_mask, expand=0.05  # rgbs[i] is already (1, 3, H, W)
-        )
-        sam_score = float(sam_score)
+
+        # --- Pass 2: SAM refinement ---
+        mask_tensor = refined_mask.float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+        refined_mask, scores = effsam_refine_masks(rgbs[i], mask_tensor, expand=0.01)
+        refined_mask = refined_mask.squeeze().bool()
+        sam_score1 = float(scores[0])
+
+        sam_score2 = sam_score1  # default if no second pass
+
+        # --- Pass 3 & 4: Optional second refinement round ---
+        if second_pass:
+            refined_mask = refine_mask_with_embeddings(
+                embeddings[i], refined_mask, erosion_size // 2, dilation_size // 2
+            )
+            mask_tensor = refined_mask.float().unsqueeze(0).unsqueeze(0)
+            refined_mask, scores = effsam_refine_masks(rgbs[i], mask_tensor, expand=0.03)
+            refined_mask = refined_mask.squeeze().bool()
+            sam_score2 = float(scores[0])
+
+    
+        sam_score = sam_score2
         stats['processed'] += 1
         stats['scores'].append(sam_score)
-        
+
+        # Count confidence levels, but don't block saving
         if sam_score >= min_sam_score:
             stats['high_conf'] += 1
-            
-            # Save refined mask
-            mask_np = refined_mask.cpu().numpy().astype(np.uint8) * 255
-            output_path = output_dir / f"{frame_name}.png"
-            cv2.imwrite(str(output_path), mask_np)
-            
-            # Optional: save overlay
-            if write_overlays and overlay_dir is not None:
-                rgb_np = (rgbs[i].squeeze(0).cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                rgb_np = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
-                overlay = rgb_np.copy()
-                overlay[mask_np > 0] = [0, 255, 0]  # Green
-                result = cv2.addWeighted(rgb_np, 0.7, overlay, 0.3, 0)
-                
-                # Add score text
-                cv2.putText(result, f"Score: {sam_score:.3f}", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                
-                cv2.imwrite(str(overlay_dir / f"{frame_name}.png"), result)
         else:
             stats['low_conf'] += 1
-    
+
+        # --- Save refined mask regardless of score ---
+        mask_np = refined_mask.cpu().numpy().astype(np.uint8) * 255
+        output_path = output_dir / f"{frame_name}.png"
+        cv2.imwrite(str(output_path), mask_np)
+
+        # Optional: save overlay
+        if write_overlays and overlay_dir is not None:
+            rgb_np = (rgbs[i].squeeze(0).cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            rgb_np = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
+            overlay = rgb_np.copy()
+            overlay[mask_np > 0] = [0, 255, 0]  # Green
+            result = cv2.addWeighted(rgb_np, 0.7, overlay, 0.3, 0)
+
+            # Add scores
+            cv2.putText(result, f"Score1: {sam_score1:.3f}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            if second_pass:
+                cv2.putText(result, f"Score2: {sam_score2:.3f}", (10, 65),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 200), 2)
+
+            cv2.imwrite(str(overlay_dir / f"{frame_name}.png"), result)
+
+
     return stats
 
 
@@ -259,6 +280,8 @@ def main():
                        help="Write debug overlays")
     parser.add_argument("--device", type=str, default='cuda',
                        help="Device (cuda or cpu)")
+    parser.add_argument("--second-pass", action="store_true",
+                       help="Enable second pass of refinement")
     
     args = parser.parse_args()
     
@@ -267,13 +290,24 @@ def main():
     
     # Setup paths
     rgb_dir = data_dir / "rgb"
-    mask_input_dir = data_dir / f"masks_{pose}"
-    mask_output_dir = data_dir / f"masks_{pose}_refined"
+
+    mask_dir = data_dir / f"masks_{pose}"
+    backup_dir = data_dir / f"masks_{pose}_coarse"
+
+    if mask_dir.exists() and not backup_dir.exists():
+        print(f"Backing up coarse masks: {mask_dir} → {backup_dir}")
+        mask_dir.rename(backup_dir)
+        mask_dir.mkdir(exist_ok=True)
+
+    # Always read coarse masks, always write refined masks into fresh dir
+    mask_input_dir = backup_dir
+    mask_output_dir = mask_dir
     mask_output_dir.mkdir(exist_ok=True)
+
     
     overlay_dir = None
     if args.overlays:
-        overlay_dir = data_dir / "debug_overlays" / f"{pose}_stage1"
+        overlay_dir = data_dir / "debug_overlays" / f"{pose}"
         overlay_dir.mkdir(parents=True, exist_ok=True)
     
     # Get all frames
@@ -306,7 +340,8 @@ def main():
             dilation_size=args.dilation_size,
             min_sam_score=args.min_sam_score,
             write_overlays=args.overlays,
-            overlay_dir=overlay_dir
+            overlay_dir=overlay_dir,
+            second_pass=args.second_pass
         )
 
         # Accumulate stats
