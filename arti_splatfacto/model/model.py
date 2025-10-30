@@ -75,16 +75,16 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
     cull_boundary_gaussians: bool = True
     """If True, cull Gaussians that drift outside object boundaries"""
 
-    use_depth: bool = False
+    use_depth: bool = True
     """If True, use depth information for culling and optimization"""
 
-    depth_lambda: float = 0.5
+    depth_lambda: float = 1.0
     """Weighting factor for depth information in loss function"""
 
     output_depth_during_training: bool = True
     """If True, output depth information during training"""
 
-    depth_debug: bool = False
+    depth_debug_vis: bool = True
 
 
 class ArtiSplatfactoModel(SplatfactoModel):    
@@ -95,10 +95,10 @@ class ArtiSplatfactoModel(SplatfactoModel):
         super().__init__(*args, **kwargs)
         
         # Joint configuration
-        self.joint_pivot = torch.tensor(self.config.joint_pivot, dtype=torch.float32, device=self.device)
-        self.joint_axis = torch.tensor(self.config.joint_axis, dtype=torch.float32, device=self.device)
-        self.joint_axis = F.normalize(self.joint_axis, dim=0)
-        self.joint_type = self.config.joint_type
+        self.joint_pivot = self.obj_3d_seg.joint_pivot.to(self.device)
+        self.joint_axis = F.normalize(self.obj_3d_seg.joint_axis.to(self.device), dim=0)
+        self.joint_type = self.obj_3d_seg.joint_type
+
 
         # Get joint angles from metadata if available
         self.metadata = kwargs.get("metadata", {})
@@ -150,44 +150,8 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "opacities":     torch.nn.Parameter(torch.empty((0, 1), device=device), requires_grad=False),
         })
 
-        self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=device)
-           
-        # if self.config.strategy == "default":
-        #     # Strategy for GS densification
-        #     self.strategy = SpatialArtiStrategy(
-        #         owner=self.obj_3d_seg,
-        #         prune_opa=self.config.cull_alpha_thresh,
-        #         grow_grad2d=self.config.densify_grad_thresh,
-        #         grow_scale3d=self.config.densify_size_thresh,
-        #         grow_scale2d=self.config.split_screen_size,
-        #         prune_scale3d=self.config.cull_scale_thresh,
-        #         prune_scale2d=self.config.cull_screen_size,
-        #         refine_scale2d_stop_iter=self.config.stop_screen_size_at,
-        #         refine_start_iter=self.config.warmup_length,
-        #         refine_stop_iter=self.config.stop_split_at,
-        #         reset_every=self.config.reset_alpha_every * self.config.refine_every,
-        #         refine_every=self.config.refine_every,
-        #         pause_refine_after_reset=self.num_train_data + self.config.refine_every,
-        #         absgrad=self.config.use_absgrad,
-        #         revised_opacity=False,
-        #         verbose=True
-        #     )
-        #     self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
-        # elif self.config.strategy == "mcmc":
-        #     self.strategy = MCMCStrategy(
-        #         cap_max=self.config.max_gs_num,
-        #         noise_lr=self.config.noise_lr,
-        #         refine_start_iter=self.config.warmup_length,
-        #         refine_stop_iter=self.config.stop_split_at,
-        #         refine_every=self.config.refine_every,
-        #         min_opacity=self.config.cull_alpha_thresh,
-        #         verbose=False,
-        #     )
-        #     self.strategy_state = self.strategy.initialize_state()
-        # else:
-        #     raise ValueError(f"""Splatfacto does not support strategy {self.config.strategy}
-        #                      Currently, the supported strategies include default and mcmc.""")
-
+        self.obj_3d_seg = Object3DSeg.load(self.config.obj_mask_file, device=device)
+        
 
         self.rgb_metrics = RGBMetrics()
         self.depth_metrics = DepthMetrics()
@@ -258,12 +222,12 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         # self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
         print("obj mask points:", self.obj_3d_seg)
-        self.obj_3d_seg.refine_mask(dilate_k=4, erode_k=1)
+        # self.obj_3d_seg.refine_mask(dilate_k=4, erode_k=1)
 
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
         all_means = state_dict["gauss_params.means"].to(self.device)
-        obj_mask = self.obj_3d_seg.query_refine(all_means, grow=1, thresh=0.01, bbox_margin=0.01).to(torch.bool).cpu()
+        obj_mask = self.obj_3d_seg.query_refine(all_means, grow=3, thresh=0.01, bbox_margin=0.01).to(torch.bool).cpu()
         bg_mask  = ~obj_mask
 
         for p in GAUSS:
@@ -302,7 +266,8 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         # self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
         if hasattr(self.obj_3d_seg, 'joint_axis') and self.obj_3d_seg.joint_axis is not None:
-            self.joint_axis = self.obj_3d_seg.joint_axis.to(self.device)
+            # self.joint_axis = self.obj_3d_seg.joint_axis.to(self.device)
+            self.joint_axis = torch.tensor([0.0, 1.0, 0.0], device=self.device)
             print(f"Updated joint axis from mask: {self.joint_axis}")
         if hasattr(self.obj_3d_seg, 'joint_pivot') and self.obj_3d_seg.joint_pivot is not None:
             self.joint_pivot = self.obj_3d_seg.joint_pivot.to(self.device)
@@ -577,19 +542,25 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 loss_dict["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)
 
         if self.config.use_depth and "depth_image" in batch:
-            depth_out = outputs['depth']
+            depth_out = outputs["depth"]
             depth_gt = self.get_gt_img(batch["depth_image"])
 
             if mask is not None:
                 assert mask.shape[:2] == depth_out.shape[:2] == depth_gt.shape[:2]
-                # depth_out, depth_gt = depth_out * mask, depth_gt * mask
+                depth_out = depth_out * mask
+                depth_gt = depth_gt * mask
 
-            # Debug visualization (toggle with flag)
-            if self.depth_debug and self.step % 1000 == 0:
+            if self.config.depth_debug_vis and self.step % 1000 == 0:
                 depth_debug(self.step, depth_out, depth_gt, mask)
 
-            # Depth loss (log-scale L1)
+            # Ensure valid values
+            depth_out = torch.clamp(depth_out, min=1e-4)
+            depth_gt = torch.clamp(depth_gt, min=1e-4)
             valid = torch.isfinite(depth_out) & torch.isfinite(depth_gt)
+            if mask is not None:
+                valid &= (mask > 0.5)
+
+            # Log-scale L1 loss
             if valid.any():
                 depth_loss = (torch.log(depth_out[valid]) - torch.log(depth_gt[valid])).abs().mean()
             else:
