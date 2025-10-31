@@ -92,35 +92,22 @@ class ArtiSplatfactoModel(SplatfactoModel):
     config: ArtiSplatfactoModelConfig
 
     def __init__(self, *args, **kwargs):
+        self.metadata = kwargs.pop("metadata", {}) or {}
         super().__init__(*args, **kwargs)
         
-        # Joint configuration
-        self.joint_pivot = self.obj_3d_seg.joint_pivot.to(self.device)
-        self.joint_axis = F.normalize(self.obj_3d_seg.joint_axis.to(self.device), dim=0)
-        self.joint_type = self.obj_3d_seg.joint_type
-
-
-        # Get joint angles from metadata if available
-        self.metadata = kwargs.get("metadata", {})
-        self.joint_angles = self.metadata.get("joint_angles", None)
-
-    
+        # Don't assign joint parameters here - they'll be created in populate_modules()
+        # Just store the joint_type as a simple attribute
+        self.joint_type = self.obj_3d_seg.joint_type 
 
     def populate_modules(self):
         """Populates the modules of the model."""
         super().populate_modules()
         print("Populating ArtiSplatfactoModel modules...")
 
-        def make_param(shape, requires_grad=True):
-            return torch.nn.Parameter(
-                torch.empty(shape, device="cuda" if torch.cuda.is_available() else "cpu", dtype=torch.float32),
-                requires_grad=requires_grad,
-            )
-
-        dim_sh = num_sh_bases(self.config.sh_degree)
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        dim_sh = num_sh_bases(self.config.sh_degree)
 
-        # Use ParameterDict like base model
+        # Base Splatfacto parameter dicts
         self.gauss_params = torch.nn.ParameterDict({
             "means":         torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
             "scales":        torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
@@ -130,7 +117,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "opacities":     torch.nn.Parameter(torch.empty((0, 1), device=device, requires_grad=True)),
         })
 
-        # Canonical gaussians (trainable)
+        # Canonical and fixed parameter sets
         self.gauss_params_canonical = torch.nn.ParameterDict({
             "means":         torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
             "scales":        torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
@@ -140,7 +127,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "opacities":     torch.nn.Parameter(torch.empty((0, 1), device=device, requires_grad=True)),
         })
 
-        # Fixed gaussians (non-trainable but still Parameters for saving)
         self.gauss_params_fixed = torch.nn.ParameterDict({
             "means":         torch.nn.Parameter(torch.empty((0, 3), device=device), requires_grad=False),
             "scales":        torch.nn.Parameter(torch.empty((0, 3), device=device), requires_grad=False),
@@ -150,12 +136,49 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "opacities":     torch.nn.Parameter(torch.empty((0, 1), device=device), requires_grad=False),
         })
 
+        # Load object articulation info
         self.obj_3d_seg = Object3DSeg.load(self.config.obj_mask_file, device=device)
-        
+        initial_pivot = self.obj_3d_seg.joint_pivot.to(device)
+        initial_axis = F.normalize(self.obj_3d_seg.joint_axis.to(device), dim=0)
 
+        # Store initial pivot as buffer for regularization
+        self.register_buffer('initial_joint_pivot', initial_pivot.clone())
+        
+        # Shared articulation parameters (NOW as Parameters)
+        self.joint_pivot = torch.nn.Parameter(initial_pivot.clone(), requires_grad=True)
+        self.joint_axis_raw = torch.nn.Parameter(initial_axis.clone(), requires_grad=True)
+
+        # Per-frame joint angles
+        joint_angles_meta = self.metadata.get("joint_angles", [])
+        num_frames = len(joint_angles_meta)
+        print(f"Found {num_frames} frames with joint angles")
+
+        if num_frames > 0:
+            # Fix the warning: use torch.as_tensor instead of torch.tensor
+            initial_angles = torch.as_tensor(joint_angles_meta, dtype=torch.float32, device=device)
+        else:
+            initial_angles = torch.zeros(1, device=device)
+
+        self.joint_angles = torch.nn.Parameter(initial_angles.clone(), requires_grad=True)
+        
+        # Store max angle if available for regularization
+        if hasattr(self.obj_3d_seg, 'joint_angle'):
+            self.register_buffer('max_joint_angle', self.obj_3d_seg.joint_angle.to(device))
+
+        # Metrics
         self.rgb_metrics = RGBMetrics()
         self.depth_metrics = DepthMetrics()
         self.mse_loss = torch.nn.MSELoss()
+
+        print(f"Initialized joint parameters:")
+        print(f"  Pivot: {self.joint_pivot.data}")
+        print(f"  Axis (normalized): {self.joint_axis.data}")
+        print(f"  Angles: {num_frames} frames, range [{initial_angles.min():.2f}, {initial_angles.max():.2f}]")
+
+    @property
+    def joint_axis(self):
+        """Always return normalized axis"""
+        return F.normalize(self.joint_axis_raw, dim=0)
 
 
     def state_dict(self, *args, **kwargs):
@@ -209,9 +232,20 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 groups[optimizer_name] = [self.gauss_params_canonical[internal_name]]
                 print(f"Added param group '{optimizer_name}': {self.gauss_params_canonical[internal_name].shape}")
         
-        print(f"[debug] Created {len(groups)} parameter groups")
-        return groups
+        if hasattr(self, 'joint_pivot') and self.joint_pivot is not None:
+            groups["joint_pivot"] = [self.joint_pivot]
+            print(f"Added param group 'joint_pivot': {self.joint_pivot.shape}")
         
+        if hasattr(self, 'joint_axis_raw') and self.joint_axis_raw is not None:
+            groups["joint_axis"] = [self.joint_axis_raw]  # Note: optimizer gets raw, not normalized
+            print(f"Added param group 'joint_axis': {self.joint_axis_raw.shape}")
+        
+        if hasattr(self, 'joint_angles') and self.joint_angles is not None:
+            groups["joint_angles"] = [self.joint_angles]
+            print(f"Added param group 'joint_angles': {self.joint_angles.shape} (num_frames={self.joint_angles.numel()})")
+        
+        print(f"[debug] Created {len(groups)} parameter groups total")
+        return groups        
     
     def _initialize_and_partition(self, state_dict: Dict[str, torch.Tensor]):
         """
@@ -264,17 +298,17 @@ class ArtiSplatfactoModel(SplatfactoModel):
         print(f"Loading state_dict (Training mode: {self.training})")
         assert self.config.obj_mask_file is not None and self.config.obj_mask_file.exists()
 
-        # self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
-        if hasattr(self.obj_3d_seg, 'joint_axis') and self.obj_3d_seg.joint_axis is not None:
-            # self.joint_axis = self.obj_3d_seg.joint_axis.to(self.device)
-            self.joint_axis = torch.tensor([0.0, 1.0, 0.0], device=self.device)
-            print(f"Updated joint axis from mask: {self.joint_axis}")
-        if hasattr(self.obj_3d_seg, 'joint_pivot') and self.obj_3d_seg.joint_pivot is not None:
-            self.joint_pivot = self.obj_3d_seg.joint_pivot.to(self.device)
-            print(f"Updated joint pivot from mask: {self.joint_pivot}")
-        if hasattr(self.obj_3d_seg, 'joint_angle') and self.obj_3d_seg.joint_angle is not None:
-            self.max_joint_angle = self.obj_3d_seg.joint_angle.to(self.device)
-            print(f"Updated joint angles from mask: {self.max_joint_angle}")
+        # # self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
+        # if hasattr(self.obj_3d_seg, 'joint_axis') and self.obj_3d_seg.joint_axis is not None:
+        #     # self.joint_axis = self.obj_3d_seg.joint_axis.to(self.device)
+        #     # self.joint_axis = torch.tensor([0.0, 1.0, 0.0], device=self.device)
+        #     print(f"Updated joint axis from mask: {self.joint_axis}")
+        # if hasattr(self.obj_3d_seg, 'joint_pivot') and self.obj_3d_seg.joint_pivot is not None:
+        #     self.joint_pivot = self.obj_3d_seg.joint_pivot.to(self.device)
+        #     print(f"Updated joint pivot from mask: {self.joint_pivot}")
+        # if hasattr(self.obj_3d_seg, 'joint_angle') and self.obj_3d_seg.joint_angle is not None:
+        #     self.max_joint_angle = self.obj_3d_seg.joint_angle.to(self.device)
+        #     print(f"Updated joint angles from mask: {self.max_joint_angle}")
 
 
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
@@ -319,6 +353,23 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 k.startswith("gauss_params_fixed.")
             )
         }
+
+        if "joint_pivot" in state_dict:
+            self.joint_pivot.data.copy_(state_dict["joint_pivot"].to(self.device))
+            print(f"Loaded joint_pivot from checkpoint: {self.joint_pivot.data}")
+            
+        if "joint_axis_raw" in state_dict:
+            self.joint_axis_raw.data.copy_(state_dict["joint_axis_raw"].to(self.device))
+            print(f"Loaded joint_axis_raw from checkpoint: {self.joint_axis_raw.data}")
+            
+        if "joint_angles" in state_dict:
+            self.joint_angles.data.copy_(state_dict["joint_angles"].to(self.device))
+            print(f"Loaded joint_angles from checkpoint: shape={self.joint_angles.shape}, range=[{self.joint_angles.min():.3f}, {self.joint_angles.max():.3f}]")
+
+        # Also load the buffer if it was saved
+        if "initial_joint_pivot" in state_dict:
+            self.initial_joint_pivot.copy_(state_dict["initial_joint_pivot"].to(self.device))
+            print(f"Loaded initial_joint_pivot buffer from checkpoint")
 
         super().load_state_dict(non_gauss_state, strict=False)
         self.step = 0
@@ -475,28 +526,25 @@ class ArtiSplatfactoModel(SplatfactoModel):
         pred_img = outputs["rgb"]
 
         time_val = float(batch["time"])  
-        mask_pre = batch.get("mask_pre", None)
-        mask_post = batch.get("mask_post", None)
+        mask = batch.get("mask", None)
+        # mask_post = batch.get("mask_post", None)
+            
+            # mask_post = self._downscale_if_required(mask_post.to(self.device))
 
-        if mask_pre is not None:
-            mask_pre = self._downscale_if_required(mask_pre.to(self.device))
-        if mask_post is not None:
-            mask_post = self._downscale_if_required(mask_post.to(self.device))
-
-        # If door is still mostly closed, supervise only with mask_post
-        if time_val <= 0.25 and mask_post is not None:
-            mask = mask_post
-        # If door is opening/opened, use mask_post (revealed area + door)
-        elif time_val >= 0.25 and mask_pre is not None and mask_post is not None:
-            mask = torch.clamp(mask_pre + mask_post, 0.0, 1.0)
-        else:
-            mask = None
+        # # If door is still mostly closed, supervise only with mask_post
+        # if time_val <= 0.25 and mask_post is not None:
+        #     mask = mask_post
+        # # If door is opening/opened, use mask_post (revealed area + door)
+        # elif time_val >= 0.25 and mask_pre is not None and mask_post is not None:
+        #     mask = torch.clamp(mask_pre + mask_post, 0.0, 1.0)
+        # else:
+        #     mask = None
 
         if mask is not None:
+            mask = self._downscale_if_required(mask.to(self.device))
             assert mask.shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
             gt_img = gt_img * mask
             pred_img = pred_img * mask
-        
 
         # === Losses ===
         Ll1 = torch.abs(gt_img - pred_img).mean()
@@ -567,6 +615,34 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 depth_loss = torch.tensor(0.0, device=depth_out.device)
 
             loss_dict["depth_loss"] = self.config.depth_lambda * depth_loss
+
+        if self.training and hasattr(self, 'joint_axis_raw'):
+            # 1. Keep axis normalized (should be automatic with property, but enforce it)
+            axis_length = self.joint_axis_raw.norm()
+            axis_unit_penalty = (axis_length - 1.0).abs()
+            loss_dict["joint_axis_unit"] = 0.01 * axis_unit_penalty
+            
+            # 2. Temporal smoothness on joint angles (optional but recommended)
+            if hasattr(self, 'joint_angles') and len(self.joint_angles) > 1:
+                angle_diff = self.joint_angles[1:] - self.joint_angles[:-1]
+                angle_smoothness = angle_diff.abs().mean()
+                loss_dict["joint_angle_smooth"] = 0.001 * angle_smoothness
+            
+            # 3. Optional: Keep angles within reasonable bounds
+            if hasattr(self, 'joint_angles') and hasattr(self, 'max_joint_angle'):
+                # Soft constraint to keep angles near the expected range
+                angle_bound_penalty = torch.clamp(
+                    self.joint_angles.abs() - self.max_joint_angle * 1.1, 
+                    min=0.0
+                ).mean()
+                loss_dict["joint_angle_bound"] = 0.01 * angle_bound_penalty
+            
+            # 4. Optional: Prevent pivot from drifting too far from initial estimate
+            if hasattr(self, 'initial_joint_pivot'):
+                pivot_drift = (self.joint_pivot - self.initial_joint_pivot).norm()
+                # Only penalize if drift exceeds a threshold (e.g., 0.1 meters)
+                pivot_drift_penalty = torch.clamp(pivot_drift - 0.1, min=0.0)
+                loss_dict["joint_pivot_drift"] = 0.001 * pivot_drift_penalty
 
         if self.step % 1000 == 0 and not getattr(self, '_debug_saved_this_step', False):
             self._debug_saved_this_step = True
@@ -657,14 +733,14 @@ class ArtiSplatfactoModel(SplatfactoModel):
     def get_joint_angle_for_camera(self, camera: Cameras) -> float:
         """Extract joint angle from camera.times (interpolated) or metadata (fixed)"""
 
-        if hasattr(camera, 'times') and camera.times is not None and self.joint_angles is not None:
+        if hasattr(camera, 'times') and camera.times is not None:
             time_val = float(camera.times.flatten()[0])
             num_frames = len(self.joint_angles)
+            
+            # Map time [0, 1] to frame index
             frame_idx = int(time_val * (num_frames - 1))
             frame_idx = max(0, min(frame_idx, num_frames - 1))
-            joint_angle = self.joint_angles[frame_idx].item()
-            # print(f"Time {time_val:.3f} → Joint angle {joint_angle:.3f} rad")
-            return joint_angle
+            return self.joint_angles[frame_idx]
 
         if hasattr(camera, 'metadata') and camera.metadata is not None:
             joint_angle = camera.metadata.get("joint_angle", 0.0)
@@ -880,13 +956,13 @@ class ArtiSplatfactoModel(SplatfactoModel):
         
 
         # inject joint information for the new mask aware strategy
-        if self.info is not None:
-            self.info["joint_angle"] = joint_angle
-            self.info["joint_pivot"] = self.joint_pivot
-            self.info["joint_axis"] = self.joint_axis
-            self.info["joint_type"] = self.joint_type
-            if self.step % 100 == 0:  # Log occasionally
-                print(f"Injected joint_angle={joint_angle:.3f} into render info")
+        # if self.info is not None:
+        #     self.info["joint_angle"] = joint_angle
+        #     self.info["joint_pivot"] = self.joint_pivot
+        #     self.info["joint_axis"] = self.joint_axis
+        #     self.info["joint_type"] = self.joint_type
+        #     if self.step % 100 == 0:  # Log occasionally
+        #         print(f"Injected joint_angle={joint_angle:.3f} into render info")
         
         if self.training:
             self.strategy.step_pre_backward(
