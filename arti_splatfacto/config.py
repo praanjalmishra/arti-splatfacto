@@ -71,30 +71,30 @@ arti_splatfacto_config = MethodSpecification(
 
             # === Canonical groups ===
             "canon_means": {
-                "optimizer": AdamOptimizerConfig(lr=8e-5, eps=1e-15),  # maybe slower
+                "optimizer": AdamOptimizerConfig(lr=2e-4, eps=1e-15), 
                 "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=8e-7,
+                    lr_final=1.6e-5,
                     max_steps=30000,
                 ),
             },
             "canon_features_dc": {
-                "optimizer": AdamOptimizerConfig(lr=0.00125, eps=1e-15),
-                "scheduler": None,
-            },
-            "canon_features_rest": {
-                "optimizer": AdamOptimizerConfig(lr=0.00125 / 20, eps=1e-15),
-                "scheduler": None,
-            },
-            "canon_opacities": {
-                "optimizer": AdamOptimizerConfig(lr=0.025, eps=1e-15),
-                "scheduler": None,
-            },
-            "canon_scales": {
                 "optimizer": AdamOptimizerConfig(lr=0.0025, eps=1e-15),
                 "scheduler": None,
             },
+            "canon_features_rest": {
+                "optimizer": AdamOptimizerConfig(lr=0.0025 / 20, eps=1e-15),
+                "scheduler": None,
+            },
+            "canon_opacities": {
+                "optimizer": AdamOptimizerConfig(lr=0.05, eps=1e-15),
+                "scheduler": None,
+            },
+            "canon_scales": {
+                "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
+                "scheduler": None,
+            },
             "canon_quats": {
-                "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
                 "scheduler": None,
             },
             "camera_opt": {
