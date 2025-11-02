@@ -78,7 +78,7 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
     use_depth: bool = True
     """If True, use depth information for culling and optimization"""
 
-    depth_lambda: float = 1.0
+    depth_lambda: float = 0.2
     """Weighting factor for depth information in loss function"""
 
     output_depth_during_training: bool = True
@@ -246,17 +246,13 @@ class ArtiSplatfactoModel(SplatfactoModel):
         
         print(f"[debug] Created {len(groups)} parameter groups total")
         return groups        
-    
+        
     def _initialize_and_partition(self, state_dict: Dict[str, torch.Tensor]):
         """
-        From a full-scene checkpoint: split into trainable object + fixed background.
-        (Canonical stays empty here; you can fill it later if you have an exposed mask.)
+        From a full-scene checkpoint: split into object (surface) + canonical (interior) + background.
+        Uses depth-based heuristic to separate exterior from interior Gaussians.
         """
         print("Initializing from full scene: partitioning Gaussians...")
-
-        # self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
-        print("obj mask points:", self.obj_3d_seg)
-        # self.obj_3d_seg.refine_mask(dilate_k=4, erode_k=1)
 
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
@@ -291,25 +287,21 @@ class ArtiSplatfactoModel(SplatfactoModel):
         n_canon = self.gauss_params_canonical["means"].shape[0]
         n_bg = self.gauss_params_fixed["means"].shape[0]
 
+        print(f"\nPartitioning complete:")
+        print(f"  Object (moving): {n_obj}")
+        print(f"  Canonical (revealed): {n_canon}")
+        print(f"  Background (fixed): {n_bg}")
+        print(f"  Total: {n_obj + n_canon + n_bg} / {all_means.shape[0]}")
 
-        print(f"Partitioning complete. Trainable: {self.gauss_params['means'].shape[0]}, Canonical: {self.gauss_params_canonical['means'].shape[0]}, Fixed: {self.gauss_params_fixed['means'].shape[0]}")
+        # if hasattr(self, "gauss_params_fixed") and "opacities" in self.gauss_params_fixed:
+        #     print("Dimming background Gaussians for canonical visibility...")
+        #     self.gauss_params_fixed["opacities"].data[:] = -10.0  
+        
+
 
     def load_state_dict(self, state_dict: Dict[str, torch.Tensor], **kwargs):
         print(f"Loading state_dict (Training mode: {self.training})")
         assert self.config.obj_mask_file is not None and self.config.obj_mask_file.exists()
-
-        # # self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
-        # if hasattr(self.obj_3d_seg, 'joint_axis') and self.obj_3d_seg.joint_axis is not None:
-        #     # self.joint_axis = self.obj_3d_seg.joint_axis.to(self.device)
-        #     # self.joint_axis = torch.tensor([0.0, 1.0, 0.0], device=self.device)
-        #     print(f"Updated joint axis from mask: {self.joint_axis}")
-        # if hasattr(self.obj_3d_seg, 'joint_pivot') and self.obj_3d_seg.joint_pivot is not None:
-        #     self.joint_pivot = self.obj_3d_seg.joint_pivot.to(self.device)
-        #     print(f"Updated joint pivot from mask: {self.joint_pivot}")
-        # if hasattr(self.obj_3d_seg, 'joint_angle') and self.obj_3d_seg.joint_angle is not None:
-        #     self.max_joint_angle = self.obj_3d_seg.joint_angle.to(self.device)
-        #     print(f"Updated joint angles from mask: {self.max_joint_angle}")
-
 
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
@@ -527,18 +519,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         time_val = float(batch["time"])  
         mask = batch.get("mask", None)
-        # mask_post = batch.get("mask_post", None)
-            
-            # mask_post = self._downscale_if_required(mask_post.to(self.device))
-
-        # # If door is still mostly closed, supervise only with mask_post
-        # if time_val <= 0.25 and mask_post is not None:
-        #     mask = mask_post
-        # # If door is opening/opened, use mask_post (revealed area + door)
-        # elif time_val >= 0.25 and mask_pre is not None and mask_post is not None:
-        #     mask = torch.clamp(mask_pre + mask_post, 0.0, 1.0)
-        # else:
-        #     mask = None
 
         if mask is not None:
             mask = self._downscale_if_required(mask.to(self.device))
@@ -1064,27 +1044,9 @@ class ArtiSplatfactoModel(SplatfactoModel):
             metrics_dict["cc_ssim"] = float(cc_ssim)
             metrics_dict["cc_lpips"] = float(cc_lpips)
 
-        time_val = float(batch["time"])
-        mask_pre = batch.get("mask_pre", None)
-        mask_post = batch.get("mask_post", None)
-
-        if mask_pre is not None:
-            mask_pre = self._downscale_if_required(mask_pre.to(self.device))
-        if mask_post is not None:
-            mask_post = self._downscale_if_required(mask_post.to(self.device))
-
-        # --- Mask selection logic (same as training) ---
-        if time_val <= 0.25 and mask_post is not None:
-            mask = mask_post
-        elif time_val >= 0.25 and mask_pre is not None and mask_post is not None:
-            mask = torch.clamp(mask_pre + mask_post, 0.0, 1.0)
-        else:
-            mask = None 
-
-        # print(f"mask shape: {mask.shape if mask is not None else None}")
-        # print(f"gt_rgb shape: {gt_rgb.shape}")
-        # print(f"predicted_rgb shape: {predicted_rgb.shape}")
-        # print(mask.shape, mask.dtype)
+        mask = batch.get("mask", None)
+        if mask is not None:
+            mask = self._downscale_if_required(mask.to(self.device))
 
         import os
         import torchvision.utils as vutils
@@ -1100,7 +1062,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             debug_gt_masked = gt_rgb * mask_expanded
             debug_pred_masked = predicted_rgb * mask_expanded
 
-            debug = False  # Set to True to enable debug saving
+            debug = True  # Set to True to enable debug saving
             
             # === Save only every 1000 steps ===
             if self.step % 1000 == 0 and debug:
@@ -1126,4 +1088,3 @@ class ArtiSplatfactoModel(SplatfactoModel):
         images_dict = {"img": combined_rgb}
 
         return metrics_dict, images_dict
-
