@@ -31,6 +31,7 @@ from ransac_core import estimate_joint_from_trajectories
 from post_processing import process_joint_result, visualize_joint_result
 from utils import export_joint_and_inliers, export_joint_and_inliers_tapip3d, save_result_to_json
 
+from joint_estimator.obj_mask_gen import TemporalVoxelMaskGenerator, integrate_with_joint_estimation, visualize_voxel_mask
 
 class JointEstimator:
     """
@@ -319,12 +320,34 @@ def main():
     parser.add_argument("--camera_metadata", type=str,
                     help="JSON file with camera parameters (required for video_path)")
 
+
+    parser.add_argument("--data_dir", type=str,
+                    help="Root directory with frames/, depth/, masks/ for temporal voxelization")
+
+
     parser.add_argument("--out_dir", type=str, default="./output",
                     help="Directory to save intermediate outputs")
 
     # TAPIP3D-specific parameters
     parser.add_argument("--visibility_threshold", type=float, default=0.8,
                     help="Minimum visibility score for TAPIP3D points (0-1)")
+    
+    parser.add_argument("--use_temporal_voxels", action="store_true",
+                       help="Use temporal RGB-D voxelization instead of sparse trajectories")
+    parser.add_argument("--voxel_resolution", type=int, default=16,
+                       help="Voxel grid resolution (e.g., 32³)")
+    parser.add_argument("--depth_scale", type=float, default=1000.0,
+                       help="Depth scale factor (1000 for mm → m)")
+    parser.add_argument("--depth_max", type=float, default=5.0,
+                       help="Maximum valid depth (meters)")
+    parser.add_argument("--depth_min", type=float, default=0.1,
+                       help="Minimum valid depth (meters)")
+    parser.add_argument("--use_tsdf", action="store_true",
+                       help="Use TSDF instead of binary occupancy")
+    parser.add_argument("--frame_subsample", type=int, default=20,
+                       help="Process every Nth frame for voxelization")
+    parser.add_argument("--voxel_dilate", type=int, default=1,
+                       help="Number of dilation iterations on voxel grid")
     
     # Camera parameters (can override metadata file)
     parser.add_argument("--fx", type=float, default=None,
@@ -449,20 +472,101 @@ def main():
         print(f"Results saved to: {Path(args.out_dir) / 'joint_schemas.json'}")
 
 
-    if args.out_dir and not args.video_path :
-        export_joint_and_inliers_tapip3d(
-            result=result,
-            inlier_trajectories=result.inlier_trajectories,
-            output_dir=args.out_dir,
-            filename_prefix="prismatic" if result.joint_type.value == "slider" else "revolute",
-            voxel_resolution=16
+    # if args.out_dir and not args.video_path :
+    #     export_joint_and_inliers_tapip3d(
+    #         result=result,
+    #         inlier_trajectories=result.inlier_trajectories,
+    #         output_dir=args.out_dir,
+    #         filename_prefix="prismatic" if result.joint_type.value == "slider" else "revolute",
+    #         voxel_resolution=16
+    #     )
+
+
+    if args.use_temporal_voxels and args.data_dir:
+        print("\n" + "="*60)
+        print("GENERATING TEMPORAL VOXEL MASK")
+        print("="*60)
+        
+        # Initialize voxel generator
+        voxel_generator = TemporalVoxelMaskGenerator(
+            voxel_resolution=args.voxel_resolution,
+            depth_scale=args.depth_scale,
+            depth_max=args.depth_max,
+            depth_min=args.depth_min,
+            use_tsdf=args.use_tsdf,
+            padding=0.0
         )
-        save_result_to_json(result, per_frame_values, Path(args.out_dir) / "joint_schemas.json", coordinate_system="world")
-        print(f"Results saved to: {Path(args.out_dir) / 'joint_schemas.json'}")
+        
+        # Generate voxel mask from temporal RGB-D
+        voxel_data = voxel_generator.generate_voxel_mask(
+            data_dir=args.data_dir,
+            metadata_path=args.camera_metadata,
+            subsample_rate=args.frame_subsample,
+            dilate_iterations=args.voxel_dilate
+        )
+        
+        # Integrate with joint estimation
+        integrate_with_joint_estimation(
+            voxel_mask_data=voxel_data,
+            joint_result=result,
+            output_dir=args.out_dir,
+            filename_prefix="prismatic" if result.joint_type.value == "slider" else "revolute"
+        )
+        
+        # Optional: Visualize voxel mask
+        if not args.no_viz:
+            visualize_voxel_mask(voxel_data, "Temporal Articulation Mask")
+        
+        # Save JSON schema
+        save_result_to_json(
+            result, per_frame_values,
+            Path(args.out_dir) / "joint_schemas.json",
+            coordinate_system="world"
+        )
+        print(f"✅ Results saved to: {Path(args.out_dir) / 'joint_schemas.json'}")
+        
+    else:
+        # ===== FALLBACK: Original sparse trajectory export =====
+        if args.out_dir and args.video_path:
+            export_joint_and_inliers(
+                result=result,
+                inlier_trajectories=result.inlier_trajectories,
+                extrinsics=args.extrinsics,
+                output_dir=args.out_dir,
+                filename_prefix="prismatic" if result.joint_type.value == "slider" else "revolute"
+            )
+            save_result_to_json(result, per_frame_values, Path(args.out_dir) / "joint_schemas.json", coordinate_system="world")
+            print(f"Results saved to: {Path(args.out_dir) / 'joint_schemas.json'}")
+
+        if args.out_dir and not args.video_path:
+            # Prepare camera parameters for SAM filtering
+            intrinsics_dict = {
+                'fx': args.fx,
+                'fy': args.fy,
+                'cx': args.cx,
+                'cy': args.cy
+            }
+            image_size = (args.w, args.h) if args.w and args.h else None
+            
+            # Note: This still uses the old sparse method - consider deprecating
+            print("\n⚠️  Using legacy sparse trajectory export.")
+            print("   Consider using --use_temporal_voxels for better results.\n")
+            
+            export_joint_and_inliers_tapip3d(
+                result=result,
+                inlier_trajectories=result.inlier_trajectories,
+                output_dir=args.out_dir,
+                filename_prefix="prismatic" if result.joint_type.value == "slider" else "revolute",
+                voxel_resolution=16,
+                sam_mask_path=None,  # You can add this as an argument
+                intrinsics=intrinsics_dict,
+                extrinsics=args.extrinsics,
+                image_size=image_size
+            )
+            save_result_to_json(result, per_frame_values, Path(args.out_dir) / "joint_schemas.json", coordinate_system="world")
+            print(f"Results saved to: {Path(args.out_dir) / 'joint_schemas.json'}")
 
     return 0 if result.success else 1
-
-
 
 
 if __name__ == "__main__":
