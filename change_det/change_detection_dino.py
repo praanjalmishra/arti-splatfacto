@@ -4,6 +4,7 @@ from ast import Not
 import gc
 import json
 import os
+import random
 import re
 from pathlib import Path
 import datetime
@@ -23,7 +24,9 @@ from matplotlib import pyplot as plt
 from PIL import Image
 from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
+import random
 
+from change_det.utils.sam_refine import refine_change_detection_masks
 from nerfstudio.cameras.camera_paths import get_path_from_json
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.models.splatfacto import SplatfactoModel
@@ -60,8 +63,7 @@ from change_det.utils.pcd_utils import (
 from nerfstudio.utils.poses import to4x4
 from change_det.utils.render_utils import render_cameras, render_3dgs_at_cam
 
-from change_det.utils.image_diff import image_diff_dinov2, image_diff_effsam
-
+from change_det.utils.image_diff import image_diff_dinov2, image_diff_effsam, image_diff_sam2_with_depth
 from change_det.utils.obj_3d_seg import Object3DSeg, Obj3DFeats
 
 def camera_clone(cameras):
@@ -303,20 +305,25 @@ class ChangeDet:
         embeds = get_effsam_embedding_in_masks(rgbs, masks)
         # Initialize object pcds
         pcds, pcd_sizes, pcd_counts, pcd_feats, pcd_embeds = [], [], [], [], []
-        for j in range(len(masks[0])):
-            pcd = compute_point_cloud(
-                depths[0:1], poses[0:1], Ks[0:1], masks[0][j:j+1]
-            )
-            pcd = mahalanobis_filter(pcd, pcd_filter)
-            pcds.append(pcd)
-            pcd_sizes.append(pcd_size(pcd))
-            pcd_counts.append(1)
-            # Extract 3D positions of keypoints
-            pts3D = compute_feats_3D(
-                feats[0][j], depths[0:1], poses[0], Ks[0]
-            )
-            pcd_feats.append(Obj3DFeats([feats[0][j]], [pts3D]))
-            pcd_embeds.append(embeds[0][j:j+1, :])
+
+        if len(masks[0]) == 0:
+            print("[INFO] No move-out masks in the first view, skipping move-out matching.")
+
+        else:
+            for j in range(len(masks[0])):
+                pcd = compute_point_cloud(
+                    depths[0:1], poses[0:1], Ks[0:1], masks[0][j:j+1]
+                )
+                pcd = mahalanobis_filter(pcd, pcd_filter)
+                pcds.append(pcd)
+                pcd_sizes.append(pcd_size(pcd))
+                pcd_counts.append(1)
+                # Extract 3D positions of keypoints
+                pts3D = compute_feats_3D(
+                    feats[0][j], depths[0:1], poses[0], Ks[0]
+                )
+                pcd_feats.append(Obj3DFeats([feats[0][j]], [pts3D]))
+                pcd_embeds.append(embeds[0][j:j+1, :])
         # Associate move-out masks with the object point clouds w/ NN matching
         for i in range(1, N):
             dist_mat = torch.tensor(pcd_sizes).reshape(-1, 1).to(device)
@@ -335,31 +342,29 @@ class ChangeDet:
             # print(f"row_ind: {row_ind}, col_ind: {col_ind}")
             # Update existing object point clouds
             for r, c in zip(row_ind, col_ind):
-                # check feature sim btw matched object segments
+                if c >= len(masks[i]) or r >= len(pcd_embeds):
+                    continue
+                if pcd_embeds[r].numel() == 0 or embeds[i][c].numel() == 0:
+                    continue
+
                 embed_sim = torch.cosine_similarity(
                     pcd_embeds[r], embeds[i][c], dim=-1
                 )
-                if c < len(masks[i]):
-                    if embed_sim.max() > embed_sim_thresh:
-                        pcds[r] = torch.cat((pcds[r], new_pcds[c]), dim=0)
-                        pcd_sizes[r] = pcd_size(pcds[r])
-                        pcd_counts[r] += 1
-                        pts3D = compute_feats_3D(
-                            feats[i][c], depths[i:i+1], poses[i], Ks[i]
-                        )
-                        pcd_feats[r].add_feats(feats[i][c], pts3D)
-                        pcd_embeds[r] = torch.cat(
-                            (pcd_embeds[r], embeds[i][c:c+1]), dim=0
-                        )
-                    else:
-                        pcds.append(new_pcds[c])
-                        pcd_sizes.append(pcd_size(new_pcds[c]))
-                        pcd_counts.append(1)
-                        pts3D = compute_feats_3D(
-                            feats[i][c], depths[i:i+1], poses[i], Ks[i]
-                        )
-                        pcd_feats.append(Obj3DFeats([feats[i][c]], [pts3D]))
-                        pcd_embeds.append(embeds[i][c:c+1, :])
+
+                if embed_sim.max() > embed_sim_thresh:
+                    pcds[r] = torch.cat((pcds[r], new_pcds[c]), dim=0)
+                    pcd_sizes[r] = pcd_size(pcds[r])
+                    pcd_counts[r] += 1
+                    pts3D = compute_feats_3D(feats[i][c], depths[i:i+1], poses[i], Ks[i])
+                    pcd_feats[r].add_feats(feats[i][c], pts3D)
+                    pcd_embeds[r] = torch.cat((pcd_embeds[r], embeds[i][c:c+1]), dim=0)
+                else:
+                    pcds.append(new_pcds[c])
+                    pcd_sizes.append(pcd_size(new_pcds[c]))
+                    pcd_counts.append(1)
+                    pts3D = compute_feats_3D(feats[i][c], depths[i:i+1], poses[i], Ks[i])
+                    pcd_feats.append(Obj3DFeats([feats[i][c]], [pts3D]))
+                    pcd_embeds.append(embeds[i][c:c+1, :])
             # Add new object point clouds
             for k in range(len(masks[i])):
                 if k not in col_ind:
@@ -385,6 +390,7 @@ class ChangeDet:
                 )
 
         return pcds, pcd_feats
+
 
     def match_move_in(self, rgbs, masks, depths, poses, Ks, pcd_filter=0.95):
         """
@@ -668,87 +674,6 @@ class ChangeDet:
 
 
 
-    def masks_to_bbox3d(
-        self, masks, poses, Ks, dist_params, gauss_filter_percent=0.5,
-        obj_pts_filter_percent=0.8, num_sample=1000000, proj_check_cutoff=0.99
-    ):
-        """
-        Obj masks on multi views to rough object bbox3D
-        for finer obj segmentation of *inserted* objects
-
-        Args:
-            masks (Nx1xHxW): Object move-out masks on the sparse views
-            poses (Nx4x4): Camera poses wrt world
-            Ks (Nx3x3): Camera intrinsics
-            dist_params (Nx4): Camera distortion parameters
-
-        Returns:
-            bbox3d (2-tuple of 3-tuple of floats): MinMax xyz of the obj bbox3D
-        """
-        # Get the 3D bbox of all Gaussians in the 3DGS model
-        gauss_means = self.pipeline_pretrain.model.gauss_params.means
-        gauss_means = mahalanobis_filter(gauss_means, gauss_filter_percent)
-        device = gauss_means.device
-        min_xyz = gauss_means.min(dim=0)[0]
-        max_xyz = gauss_means.max(dim=0)[0]
-        # Sample points in the 3D bbox
-        pts_sampled = torch.rand(num_sample, 3, device=device) * \
-            (max_xyz - min_xyz) + min_xyz
-        occupied = proj_check_3D_points(
-            pts_sampled, poses, Ks, dist_params, masks,
-            cutoff=proj_check_cutoff
-        )
-        pts_occupy = pts_sampled[occupied]
-        pts_occupy = mahalanobis_filter(
-            pts_occupy, obj_pts_filter_percent
-        )
-        bbox3d = (
-            pts_occupy.min(dim=0)[0].detach().cpu().numpy(),
-            pts_occupy.max(dim=0)[0].detach().cpu().numpy()
-        )
-        return bbox3d
-
-    def check_visibility(
-        self, pcds, masks, poses, Ks, dist_params, H, W, threshold=0.95
-    ):
-        """
-        Check visibility of object point clouds
-
-        Args:
-            pcds (M-list of Lx3): Object point clouds
-            masks (MxNx1xHxW): Object move-out masks on the sparse views
-            poses (Nx4x4): Camera poses wrt world
-            Ks (Nx3x3): Camera intrinsics
-            dist_params (Nx4): Camera distortion parameters
-            H (int): Image height
-            W (int): Image width
-            
-        Returns:
-            vis (M-list of N-list of int): Views where obj pcd is fully visible
-        """
-        assert len(pcds) == len(masks)
-        assert masks.shape[1] == len(poses)
-        vis = []
-        for ii in range(len(pcds)):
-            pcd_proj, _ = project_points(
-                pcds[ii], poses, Ks, dist_params, H, W
-            )
-            # We count how many object points can project in masks
-            vis_ii = []
-            for jj, proj in enumerate(pcd_proj):
-                proj = proj.round().long().unique(dim=0)
-                proj_in = in_image(proj, H, W)
-                proj_in_ratio = proj_in.sum().item() / proj.size(0)
-                proj = proj[proj_in]
-                in_mask_count = masks[ii, jj, 0][proj[:, 1], proj[:, 0]].sum()
-                in_mask_ratio = in_mask_count / proj.size(0)
-                if in_mask_ratio > threshold and proj_in_ratio > threshold:
-                    vis_ii.append(jj)
-            vis.append(vis_ii)
-        return vis
-
-
-
 
 
     def main(
@@ -768,10 +693,10 @@ class ChangeDet:
         """
         if configs is None:
             configs = {
-                "sam_threshold": 0.85,
-                "mask_refine_sparse_view": 0.1,
+                "sam_threshold": 0.75,
+                "mask_refine_sparse_view": 0.15,
                 "area_threshold": 0.01,
-                "cd_kernel_ratio": 0.05,
+                "cd_kernel_ratio": 0.1,
                 "pcd_filtering": 0.98,
                 "pre_train_pred_bbox_expand": 0.05,
                 "voxel_dim": 300,
@@ -814,7 +739,30 @@ class ChangeDet:
         pretrain_indices = [i for i, t in enumerate(times) if t == 0.0]
         postchange_indices = [i for i, t in enumerate(times) if t == 1.0]
 
-        sparse_view_indices = postchange_indices[3:10]  # e.g. N_sparse = 3
+        # sparse_view_indices = postchange_indices[3:10]  # e.g. N_sparse = 3
+
+        # sparse_view_indices = [postchange_indices[0]]
+
+        # Define how many frames to sample from the end
+        N_SPARSE = 1  # change as needed
+        FRACTION_END = 0.0  # take frames from the last 20% of the timeline, for example
+
+        # Indices sorted by time
+        sorted_indices = np.argsort(times)
+        sorted_times = np.array(times)[sorted_indices]
+
+        # Identify which frames are in the "post-change" region (near t=1)
+        threshold_time = 1.0 - FRACTION_END  # e.g. if FRACTION_END=0.2, then t > 0.8
+        postchange_indices = [i for i, t in zip(sorted_indices, sorted_times) if t >= threshold_time]
+    
+        # Sample N_SPARSE frames from the post-change portion
+        num_samples = min(N_SPARSE, len(postchange_indices))
+        # sparse_view_indices = random.sample(postchange_indices, num_samples)
+        sparse_view_indices = [len(img_fnames) - 1]
+
+
+        # print(f"Sampled {num_samples} frames from post-change region (t > {threshold_time:.2f})")
+        print("Indices:", sparse_view_indices)
 
         # Get tensors
         N, _, H, W = color_images.shape
@@ -862,48 +810,76 @@ class ChangeDet:
 
         masks_changed_sparse, masks_changed_sparse_all = [], []
 
-        # for ii in tqdm(range(len(sparse_view_indices)), desc="Running CD"): 
-        #     masks_changed, masks_changed_all = image_diff_dinov2(
-        #         rgbs_render_sparse_view[ii:ii+1],  
-        #         rgbs_captured_sparse_view[ii:ii+1],   
-        #         debug_dir=self.debug_dir,       
-        #         threshold=configs["area_threshold"],
-        #         kernel_ratio=configs["cd_kernel_ratio"]
-        #     )
 
         for ii in tqdm(range(len(sparse_view_indices)), desc="Running CD"): 
-            masks_changed, masks_changed_all = image_diff_effsam(
+            
+            masks_changed, masks_changed_all = image_diff_sam2_with_depth(
                 rgbs_render_sparse_view[ii:ii+1],  
-                rgbs_captured_sparse_view[ii:ii+1],          
+                rgbs_captured_sparse_view[ii:ii+1],   
+                depths_render_sparse_view[ii:ii+1],
+                depths_captured_sparse_view[ii:ii+1],       
                 debug_dir=self.debug_dir,
                 threshold=configs["area_threshold"],
-                kernel_ratio=configs["cd_kernel_ratio"]
+                kernel_ratio=configs["cd_kernel_ratio"],
+                depth_weight=0.20,
             )
-
-            masks_changed_sparse.append(masks_changed)
+            
+            print(f"[INFO] View {ii}: Detected {masks_changed.size(0)} changed masks.")
+            print(f"[INFO] Shape of masks_changed: {masks_changed.shape}")
+            
+            # Check if any masks were detected
+            if masks_changed.numel() == 0 or masks_changed.size(0) == 0:
+                print(f"[WARNING] No masks detected for view {ii}, skipping refinement")
+                masks_changed_sparse.append(masks_changed)
+                masks_changed_sparse_all.append(masks_changed_all)
+                continue
+            
+            # Refine masks with SAM2
+            refined_masks, iou = refine_change_detection_masks(
+                image_captured=rgbs_captured_sparse_view[ii],  # [3, H, W]
+                masks_changed=masks_changed,  # [N, 1, H, W] in range [0, 255]
+                device="cuda",
+                num_positive_points=10,
+                num_negative_points=20,
+                debug=True 
+            )
+            
+            print(f"[INFO] Refined masks shape: {refined_masks.shape}, "
+                f"range: [{refined_masks.min():.3f}, {refined_masks.max():.3f}]")
+            
+            # Convert back to [0, 255] for consistency with your pipeline
+            refined_masks_uint8 = (refined_masks * 255.0).to(torch.uint8)
+            
+            masks_changed_sparse.append(refined_masks_uint8)
             masks_changed_sparse_all.append(masks_changed_all)
-        
+
+        # Save masks (now they should be visible)
         if debug:
             masks_changed_tensor = torch.cat(masks_changed_sparse, dim=0)
-            # save_masks(
-            #     masks_changed_tensor / 255.0, [
-            #         f"{self.debug_dir}/masks_changed{i}.png"
-            #         for i in range(len(masks_changed_tensor))
-            #     ]
-            # )
-
+            # Normalize to [0, 1] for saving
+            save_masks(
+                masks_changed_tensor / 255.0, 
+                [f"{self.debug_dir}/masks_refined_{i}.png" 
+                for i in range(len(masks_changed_tensor))]
+            )
+            
+            # Save overlays
             for ii, masks_changed in enumerate(masks_changed_sparse):
                 if masks_changed.numel() == 0:
                     continue
                 for mi, mask in enumerate(masks_changed):
+                    # Normalize mask for overlay
+                    mask_normalized = mask.float() / 255.0
                     overlay = overlay_mask_on_image(
-                        rgbs_captured_sparse_view[ii:ii+1], mask
+                        rgbs_captured_sparse_view[ii:ii+1], 
+                        mask_normalized
                     )
                     cv2.imwrite(
-                        f"{self.debug_dir}/overlay_view{ii}_mask{mi}.png",
+                        f"{self.debug_dir}/overlay_refined_view{ii}_mask{mi}.png",
                         cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR) 
                     )
-
+                    
+        import pdb; pdb.set_trace()
         masks_move_out_sparse_view = []
 
         for ii, masks_changed in enumerate(masks_changed_sparse):
@@ -941,11 +917,11 @@ class ChangeDet:
                 no_overlap_ind.append(i)
                 print(f"[INFO] View {i} has enough masks")
         if debug:
-            # masks_to_save = torch.cat(masks_move_out_sparse_view, dim=0)
-            # save_masks(masks_to_save, [
-            #     f"{self.debug_dir}/masks_move_out{i}.png"
-            #     for i in range(len(masks_to_save))
-            # ])
+            masks_to_save = torch.cat(masks_move_out_sparse_view, dim=0)
+            save_masks(masks_to_save, [
+                f"{self.debug_dir}/masks_move_out{i}.png"
+                for i in range(len(masks_to_save))
+            ])
 
             # save overlays
             for ii, masks_out in enumerate(masks_move_out_sparse_view):
@@ -996,11 +972,11 @@ class ChangeDet:
                 no_overlap_ind.append(i)
                 print(f"[INFO] View {i} has enough masks")
         if debug:
-            # masks_to_save = torch.cat(masks_move_out_sparse_view, dim=0)
-            # save_masks(masks_to_save, [
-            #     f"{self.debug_dir}/masks_move_out{i}.png"
-            #     for i in range(len(masks_to_save))
-            # ])
+            masks_to_save = torch.cat(masks_move_out_sparse_view, dim=0)
+            save_masks(masks_to_save, [
+                f"{self.debug_dir}/masks_move_out{i}.png"
+                for i in range(len(masks_to_save))
+            ])
 
             # save overlays
             for ii, mask_in in enumerate(masks_move_in_sparse_view):
@@ -1016,7 +992,7 @@ class ChangeDet:
         ## Object Association across for move-out objects
         pcds, pcd_feats = self.match_move_out(
             rgbs_render_sparse_view[no_overlap_ind],
-            depths_captured_sparse_view[no_overlap_ind],
+            depths_render_sparse_view[no_overlap_ind],
             [masks_move_out_sparse_view[i] for i in no_overlap_ind],
             cam_poses_sparse_view[no_overlap_ind],
             Ks_sparse_view[no_overlap_ind],
@@ -1024,371 +1000,17 @@ class ChangeDet:
             embed_sim_thresh=0.9
         )
 
-        # ## Multi view move-in mask association across post-change views
-        # masks_move_in_sparse_view = []
-        # for ii, masks_changed in enumerate(masks_changed_sparse):
-        #     masks_captured, scores_captured = effsam_refine_masks(
-        #         rgbs_captured_sparse_view[ii:ii+1], masks_changed,
-        #         expand=configs["mask_refine_sparse_view"]
-        #     )
-        #     # Move-in masks have SAM prediction score > 0.95 on captured image
-        #     masks_in = [
-        #         masks_captured[i:i+1] for i, s in enumerate(scores_captured)
-        #         if s > 0.8
-        #     ]
-        #     if self.debug_dir:
-        #         save_masks(
-        #             masks_captured,
-        #             [
-        #                 f"{self.debug_dir}/masks_captured_view{ii}_mask{j}.png"
-        #                 for j in range(masks_captured.shape[0])
-        #             ]
-        #         )
-        #     if len(masks_in) > 0:
-        #         masks_in = torch.cat(masks_in, dim=0)
-        #         masks_in = split_masks(masks_in, configs["area_threshold"])
-        #     else:
-        #         masks_in = torch.empty(0, 1, H, W, device=device)
-        #     print(f"[View {ii}] Move-in candidates after SAM filtering: {len(masks_in)}")
-        #     masks_move_in_sparse_view.append(masks_in)
-
-
-
-        # Move-in masks w/ few inlier matches to obj templates are for inserted
-        feats_move_in = self.get_features_in_masks(
-            rgbs_captured_sparse_view, masks_move_in_sparse_view
+        pcds, pcd_feats = self.match_move_in_2(
+            rgbs_render_sparse_view[no_overlap_ind],
+            depths_captured_sparse_view[no_overlap_ind],
+            [masks_move_in_sparse_view[i] for i in no_overlap_ind],
+            cam_poses_sparse_view[no_overlap_ind],
+            Ks_sparse_view[no_overlap_ind],
+            pcd_filter=configs["pcd_filtering"],
+            embed_sim_thresh=0.9
         )
 
-        masks_move_in_inserted = []
-        for feats_i, masks_i in zip(feats_move_in, masks_move_in_sparse_view):
-            masks_move_in_inserted_i = []
-            for feat_i, mask_i in zip(feats_i, masks_i):
-                num_inlier_max = 0
-                for pcd_feat in pcd_feats:
-                    _, num_inlier, _ = pcd_feat.PnP(
-                        feat_i, Ks_sparse_view[0], H, W
-                    )
-                    num_inlier_max = max(num_inlier_max, num_inlier)
-                if num_inlier_max < 5:
-                    masks_move_in_inserted_i.append(mask_i[None])
-            if len(masks_move_in_inserted_i) > 0:
-                masks_move_in_inserted_i = torch.cat(
-                    masks_move_in_inserted_i, dim=0
-                )
-            else:
-                masks_move_in_inserted_i = torch.empty(
-                    0, 1, H, W, device=device
-                )
-            masks_move_in_inserted.append(masks_move_in_inserted_i)
-            print("###articulated masks")
-            print(f"Found {len(masks_move_in_inserted_i)} matched masks")
-
-       
-        # preprocess captured depth
-        H_target, W_target = rgbs_captured_sparse_view.shape[-2:]  # e.g., 480x640
-        depths_captured_sparse_view = self.preprocess_depths(depths_captured_sparse_view, H_target, W_target)
-
-
-        # obj_masks_move_in, obj_move_in_view_indices = self.match_move_in_depth(
-        #     rgbs_captured_sparse_view, 
-        #     masks_move_in_inserted,
-        #     depths_captured_sparse_view,
-        #     cam_poses_sparse_view,
-        #     Ks_sparse_view
-        # )
-        # Pose change estimation for move-in objects
-        obj_masks_move_in, obj_move_in_view_indices, pcds_post = self.match_move_in(
-            rgbs_captured_sparse_view, 
-            masks_move_in_inserted,
-            depths_captured_sparse_view,
-            cam_poses_sparse_view,
-            Ks_sparse_view
-        )
-
-
-        pcd_posts = []
-        print(f"[INFO] Found {len(obj_masks_move_in)} move-in objects across views")
-        print(f"[INFO] Move-in masks view indices: {obj_move_in_view_indices}")
-
-        # Obect pose change estimation
-        feat_masks = [
-            dilate_masks(m.any(dim=0, keepdim=True), 10)
-            for m in masks_changed_sparse_all
-        ]
-        feats = self.get_features_in_masks(
-            rgbs_captured_sparse_view, feat_masks
-        )
-
-        # Debug view 1  
-        # debug_point_prompts(
-        #     rgbs_captured_sparse_view[1:2], feats[1][0]["keypoints"],
-        #     self.debug_dir
-        # )
-
-        # Sec.IV.F: Object pose change estimation
-        pose_changes = []
-        num_sparse_views = len(rgbs_captured_sparse_view)
-
-        for obj_id, pcd_feat in enumerate(pcd_feats):
-            best_pose = None
-            best_inliers = 0
-            best_matches = 0
-
-            for view_idx in tqdm(range(num_sparse_views), desc=f"Pose estimation for Obj {obj_id}"):
-                # Run PnP with 2D-3D correspondences
-                pose_est, inliers, matches = pcd_feat.PnP(
-                    feats[view_idx][0], Ks_sparse_view[view_idx], H, W, self.matcher
-                )
-
-                if pose_est is None:
-                    continue
-
-                # Transform to global coordinate frame (paper eq.)
-                pose_est = cam_poses_sparse_view[view_idx] @ pose_est.inverse()
-
-                # Use early break if specified in configs
-                if configs.get("pose_change_break") and \
-                configs["pose_change_break"][obj_id] is not None and \
-                view_idx == configs["pose_change_break"][obj_id]:
-                    best_pose = pose_est
-                    best_inliers = inliers
-                    best_matches = matches
-                    break
-
-                if inliers > best_inliers:
-                    best_pose = pose_est
-                    best_inliers = inliers
-                    best_matches = matches
-
-                # Optional debug visualization
-                if debug:
-                    m2d, m3d = pcd_feat.match(feats[view_idx][0], self.matcher)
-                    m3d_proj, _ = project_points(
-                        m3d, cam_poses_sparse_view[0:1], Ks_sparse_view[0:1],
-                        dist_params_sparse_view[0:1], H, W
-                    )
-                    debug_matches(
-                        rgbs_render_sparse_view[0:1], 
-                        rgbs_captured_sparse_view[view_idx:view_idx+1],
-                        m3d_proj, [m2d],
-                        torch.arange(m2d.shape[0])[None, :, None].repeat(1, 1, 2),
-                        self.debug_dir
-                    )
-
-            # Logging
-            if best_pose is None:
-                print(f"[Obj {obj_id}] ❌ Pose estimation failed (likely removed).")
-            else:
-                print(f"[Obj {obj_id}] ✅ pose_change:\n{best_pose.cpu().numpy()}")
-            print(f"[Obj {obj_id}] inlier_ratio: {best_inliers} / {best_matches}")
-
-            pose_changes.append(best_pose)
-
-
-        # visualization
-        if self.debug_dir is not None:
-            for obj_id, (pcd, pose) in enumerate(zip(pcds, pose_changes)):
-                np.save(self.debug_dir / f"obj{obj_id}_pre_change_pcd.npy", pcd.cpu().numpy())
-
-                pose_np = pose.cpu().numpy() if pose is not None else None
-                with open(self.debug_dir / f"obj{obj_id}_pose_change.json", "w") as f:
-                    json.dump(pose_np.tolist() if pose_np is not None else None, f)
-
-        # Summary
-        num_moved = sum(pc is not None for pc in pose_changes)
-        print(f"# Moved objects: {num_moved}")
-        print(f"# Removed objects: {len(pose_changes) - num_moved}")
-        print(f"# Inserted objects: {len(obj_masks_move_in)}")
-
-
-        # # Sec.IV.E: 3D object segmentation
-        # # Get more 2D masks for moved and removed objects
-        # if len(pcds) > 0:
-        #     # Project the object pcd to pre-change views to get 2D bboxes
-        #     bboxes2d = []
-        #     for pcd in pcds:
-        #         pcd_proj, is_point_in_img = project_points(
-        #             pcd, cam_poses_pretrain_view, Ks_pretrain_view,
-        #             dist_params_pretrain_view, H, W
-        #         )
-        #         if not is_point_in_img.all():
-        #             print("WARN: Some points are out of the pre-change images")
-        #         # if debug:
-        #         #     debug_point_prompts(
-        #         #         color_images_pretrain_view, pcd_proj, self.debug_dir
-        #         #     )
-        #         bbox2d = compute_2D_bbox(pcd_proj)
-        #         # Slightly expand 2D bboxes to improve SAM predictions
-        #         bbox2d = expand_2D_bbox(
-        #             bbox2d, configs["pre_train_pred_bbox_expand"]
-        #         )
-        #         bboxes2d.append(bbox2d)
-        #     bboxes2d = torch.stack(bboxes2d, dim=1) # NxMx4
-
-        #     # SAM predict all move-out masks (batched for multi-object)
-        #     masks_move_out_pretrain_view, scores = [], []
-        #     for img, bbox2d in tqdm(
-        #         zip(color_images_pretrain_view, bboxes2d), desc="SAM predict"
-        #     ):
-        #         mask, score = effsam_batch_predict(
-        #             img[None].to(device), bbox2d
-        #         )
-        #         masks_move_out_pretrain_view.append(mask)
-        #         scores.append(score)
-        #     masks_move_out_pretrain_view = torch.stack(
-        #         masks_move_out_pretrain_view, dim=1
-        #     ) # MxNx1xHxW
-        #     scores = [list(t) for t in zip(*scores)] # M-list of N-list
-        #     # if debug:
-        #     #     debug_masks(
-        #     #         masks_move_out_pretrain_view[0, ...], self.debug_dir
-        #     #     )
-
-        #     # Get high score mask indices
-        #     high_score_inds = []
-        #     for ss in scores:
-        #         high_score = [i for i, x in enumerate(ss) if x > 0.95]
-        #         if len(high_score) > 0:
-        #             print(f"High score masks: {len(high_score)} / {len(ss)}")
-        #         else:
-        #             print("All masks look great!!")
-        #         high_score_inds.append(high_score)
-        #     # Check visibility of object point clouds
-        #     visible = self.check_visibility(
-        #         pcds, masks_move_out_pretrain_view, cam_poses_pretrain_view,
-        #         Ks_pretrain_view, dist_params_pretrain_view, H, W,
-        #         threshold=configs["vis_check_threshold"]
-        #     )
-        #     for vv in visible:
-        #         print(
-        #             f"Visible views: {len(vv)} / {len(cam_poses_pretrain_view)}"
-        #         )
-        #     # Views having high-score masks and objects fully visible
-        #     high_score_inds = [
-        #         list(set(hs) & set(vis))
-        #         for hs, vis in zip(high_score_inds, visible)
-        #     ]
-        #     for inds in high_score_inds:
-        #         print(
-        #             f"#Views for 3D seg: {len(inds)} / {len(Ks_pretrain_view)}"
-        #         )
-
-        # # # Multi-view mask fusion
-        # obj_segs = []
-        # # For moved and removed objects
-        # for ii in range(len(pcds)):
-        #     bbox3d = compute_3D_bbox(pcds[ii])
-        #     bbox3d = expand_3D_bbox(bbox3d, configs["bbox3d_expand"])
-
-        #     voxel = points_to_occupancy(pcds[ii], bbox3d[0], bbox3d[1], (30, 30, 30))
-
-        #     obj3Dseg = Object3DSeg(
-        #         *bbox3d, voxel, pose_changes[ii], bbox3d,
-        #         configs["mask3d_dilate_uniform"], configs["mask3d_dilate_top"]
-        #     )
-        #     # obj3Dseg.save(self.debug_dir / f"obj3Dseg_pre{ii}.pt")
-
-        #     obj_segs.append(obj3Dseg)
-
-        # # For inserted objects
-        # obj_segs_inserted = []
-
-        # for ii, pcd_post in enumerate(pcds_post):
-        #     bbox3d = compute_3D_bbox(pcd_post)
-        #     bbox3d = expand_3D_bbox(bbox3d, configs["bbox3d_expand"])
-        #     print(f"[Obj {ii}] bbox3d from fused PCD: {bbox3d}")
-
-        #     # Create dummy voxel grid (binary mask = all occupied)
-        #     voxel_dim = (30, 30, 30)
-        #     voxel = points_to_occupancy(pcd_post, bbox3d[0], bbox3d[1], voxel_dim)
-        #     occ_grid = torch.ones((1, 1, *voxel.shape[-3:]), dtype=torch.bool, device=device)
-
-        #     obj3Dseg = Object3DSeg(
-        #         bbox_min=bbox3d[0],
-        #         bbox_max=bbox3d[1],
-        #         voxel=voxel,
-        #         pose_change=torch.eye(4, device=device), 
-        #         tight_bbox=bbox3d,  
-        #         mask_dilate_uniform=configs.get("mask3d_dilate_uniform", 1),
-        #         mask_dilate_top=configs.get("mask3d_dilate_top", 0)
-        #     )
-
-        #     # obj3Dseg.save(self.debug_dir / f"obj3Dseg_post{ii}.pt")
-        #     obj_segs_inserted.append(obj3Dseg)
-
-
-        # # Sec.IV.G: Global pose refinement
-        # if refine_pose and len(pcds) > 0:
-        #     new_cameras = params_to_cameras(
-        #         cam_poses_sparse_view, Ks_sparse_view, 
-        #         dist_params_sparse_view, H, W
-        #     )
-        #     # for ii in range(len(obj_segs)):
-        #     pose_changes, new_cameras = self.refine_obj_pose_change(
-        #         rgbs_captured_sparse_view, obj_segs, new_cameras,
-        #         lr=configs["pose_refine_lr"],
-        #         epochs=5,
-        #         patience=configs["pose_refine_patience"]
-        #     )
-        #     print("refined:")
-        #     for ii, pose_change in enumerate(pose_changes):
-        #         obj_segs[ii].set_pose_change(pose_change)
-        #         print(pose_change)
-        
-        # # Sec.IV.H: Occlusion-Aware Mask Projection
-        # # Optimize eval camera poses
-
-        # rgbs_eval, _, eval_fnames, _, _, _, cams_eval = \
-        #     read_transforms(transforms_json, mode="val")
-        # if refine_pose:
-        #     _, cams_eval = self.refine_obj_pose_change(
-        #         rgbs_eval.to(device), obj_segs+obj_segs_inserted, cams_eval,
-        #         lr=configs["pose_refine_lr"],
-        #         epochs=5,
-        #         patience=configs["pose_refine_patience"], optim="cam"
-        #     )
-        #     eval_file_ids = []
-        #     for ii, path in enumerate(eval_fnames):
-        #         id_int = extract_last_number(path.name)
-        #         eval_file_ids.append(id_int)
-
-        # # Project 3D obj segs to eval images
-        # _, _, val_files, _, _, _, _ = read_transforms(
-        #     transforms_json, read_images=False, mode="val"
-        # )
-        # # not checking occlusion for inserted object for now
-        # occlusion_check = [True]*len(obj_segs) + [False]*len(obj_segs_inserted)
-        # cams_eval = cams_eval.to(device)
-        # cams_eval.camera_to_worlds = cams_eval.camera_to_worlds.to(device)
-        # val_masks_move_out_no_occl = self.mask_proj(
-        #     cams_eval, obj_segs+obj_segs_inserted, new=False,
-        #     dilate=configs["val_move_out_dilate_3d"],
-        #     occlusion_check=occlusion_check
-        # )
-        # val_masks_move_in_no_occl = self.mask_proj(
-        #     cams_eval, obj_segs+obj_segs_inserted, new=True,
-        #     dilate=configs["val_move_in_dilate_3d"],
-        #     occlusion_check=occlusion_check
-        # )
-        # val_file_ids = []
-        # for ii, path in enumerate(val_files):
-        #     id_int = extract_last_number(path.name)
-        #     val_file_ids.append(id_int)
-        # # Save eval masks
-        # mask_output_dir = self.output_dir / "masks_new"
-        # os.makedirs(mask_output_dir, exist_ok=True)
-        # mask_files = [
-        #     mask_output_dir / f"mask_{ii:05d}.png" for ii in val_file_ids
-        # ]
-        # save_masks(val_masks_move_out_no_occl, mask_files)
-        # mask_files = [
-        #     mask_output_dir / f"mask_new_{ii:05d}.png" for ii in val_file_ids
-        # ]
-        # save_masks(val_masks_move_in_no_occl, mask_files)
-        # # Uncomment to save object 3D segmentations
-        # for ii, obj_seg in enumerate(obj_segs+obj_segs_inserted):
-        #     obj_seg.save(self.output_dir / f"obj3Dseg{ii}.pt")
-
+        import pdb; pdb.set_trace()
 
 
 
