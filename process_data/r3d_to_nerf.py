@@ -24,7 +24,8 @@ import argparse
 import json
 import shutil
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from turtle import down
+from typing import Optional, Dict, Any, List, Union
 import numpy as np
 from regex import F
 import torch
@@ -263,6 +264,7 @@ def convert_r3d_to_nerf(
     stride: int = 1,
     start_frame: int = 0,
     end_frame: Optional[int] = None,
+    downsample_factor: Union[int, float] = 1,
     pc_subsample: float = 0.1,
     voxel_downsample: float = 0.01,
     generate_pc: bool = True
@@ -281,7 +283,7 @@ def convert_r3d_to_nerf(
         generate_pc: Whether to generate point cloud
     """
     print(f"Loading R3D dataset from {data_path}...")
-    dataset = get_posed_rgbd_dataset(key='r3d', path=str(data_path), use_depth_shape=False)
+    dataset = get_posed_rgbd_dataset(key='r3d', path=str(data_path), use_depth_shape=False, downsample_factor=downsample_factor)
     
     total_frames = len(dataset)
     print(f"Total frames in dataset: {total_frames}")
@@ -381,6 +383,12 @@ def main():
         help="Ending frame index (default: None = all frames)"
     )
     parser.add_argument(
+        "--downsample_factor",
+        type=Union[int, float],
+        default=2,
+        help="Downsample factor for dataset (default: 1)"
+    )
+    parser.add_argument(
         "--pc_subsample",
         type=float,
         default=0.1,
@@ -413,6 +421,7 @@ def main():
         stride=args.stride,
         start_frame=args.start,
         end_frame=args.end,
+        downsample_factor=args.downsample_factor,
         pc_subsample=args.pc_subsample,
         voxel_downsample=args.voxel_downsample,
         generate_pc=not args.no_pc

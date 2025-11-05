@@ -29,10 +29,13 @@
  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  SOFTWARE.
 """
+
+
 from __future__ import annotations
 import pickle as pkl
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -49,7 +52,6 @@ from quaternion import as_rotation_matrix, quaternion
 from torch.utils.data.dataset import Dataset
 from tqdm import tqdm
 from torch import Tensor
-
 from typing import NamedTuple
 
 class PosedRGBDItem(NamedTuple):
@@ -104,7 +106,6 @@ def as_pose_matrix(pose: list[float]) -> np.ndarray:
     Returns:
         A (4, 4) pose matrix
     """
-
     mat = np.eye(4, dtype=np.float64)
     qx, qy, qz, qw, px, py, pz = pose
     mat[:3, :3] = as_rotation_matrix(quaternion(qw, qx, qy, qz))
@@ -112,95 +113,8 @@ def as_pose_matrix(pose: list[float]) -> np.ndarray:
     return mat
 
 
-def get_arrs(
-    r3d_file: ZipFile,
-    meta: Metadata,
-    use_depth_shape: bool = True,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Loads the arrays from the .r3d file.
-
-    Args:
-        r3d_file: The open .r3d file
-        meta: The metadata loaded from the file
-        use_depth_shape: If True, the image array will be resized to the depth
-            shape; otherwise, the depth array will be resized to the image
-            shape.
-
-    Returns:
-        The images array, with shape (T, H, W, 3); the depth array, with
-        shape (T, H, W), and the mask array, with shape (T, H, W) and
-        boolean values where True means that the point is masked. Note that
-        the depth and confidence arrays are resized to match the image array
-        shape.
-    """
-
-    img_re_expr = re.compile(r"^rgbd/(\d+).jpg$")
-    depth_re_expr = re.compile(r"^rgbd/(\d+).depth$")
-    conf_re_expr = re.compile(r"^rgbd/(\d+).conf$")
-
-    tsz = meta.timestamps.shape[0]
-    rgb_h, rgb_w = meta.rgb_shape
-    depth_h, depth_w = meta.depth_shape
-
-    def get_filenames(expr: re.Pattern) -> list[str]:
-        re_matches = sorted(
-            [re_match for re_match in (expr.match(f.filename) for f in r3d_file.filelist) if re_match is not None],
-            key=lambda m: int(m.group(1)),
-        )
-        return [m.group() for m in re_matches]
-
-    def to_img_shape(arr: np.ndarray) -> np.ndarray:
-        return cv2.resize(arr, (rgb_w, rgb_h), interpolation=cv2.INTER_NEAREST)
-
-    def to_depth_shape(arr: np.ndarray) -> np.ndarray:
-        return cv2.resize(arr, (depth_w, depth_h), interpolation=cv2.INTER_NEAREST)
-
-    img_fnames = get_filenames(img_re_expr)
-    depth_fnames = get_filenames(depth_re_expr)
-    conf_fnames = get_filenames(conf_re_expr)
-
-    assert img_fnames[0] == "rgbd/0.jpg" and img_fnames[-1] == f"rgbd/{len(img_fnames) - 1}.jpg"
-    if len(conf_fnames) != len(img_fnames):
-        conf_fnames = ['' for _ in range(len(img_fnames))]
-
-    arr_h, arr_w = (depth_h, depth_w) if use_depth_shape else (rgb_h, rgb_w)
-    img_arrs = np.zeros((tsz, arr_h, arr_w, 3), dtype=np.uint8)
-    depth_arrs = np.zeros((tsz, arr_h, arr_w), dtype=np.float32)
-    conf_arrs = np.zeros((tsz, arr_h, arr_w), dtype=np.uint8)
-
-    zipped = zip(img_fnames, depth_fnames, conf_fnames)
-    iterable = enumerate(tqdm(zipped, total=tsz, desc="Loading R3D file"))
-    for i, (img_fname, depth_fname, conf_fname) in iterable:
-        with r3d_file.open(img_fname, "r") as img_f:
-            img_arr = np.asarray(Image.open(img_f))
-        assert img_arr.shape == (rgb_h, rgb_w, 3)
-        img_arrs[i] = to_depth_shape(img_arr) if use_depth_shape else img_arr
-
-        with r3d_file.open(depth_fname, "r") as depth_f:
-            raw_bytes = depth_f.read()
-            decompressed_bytes = liblzfse.decompress(raw_bytes)
-            depth_arr = np.frombuffer(decompressed_bytes, dtype=np.float32).reshape(depth_h, depth_w).copy()
-        depth_is_nan_arr = np.isnan(depth_arr)
-        depth_arr[depth_is_nan_arr] = -1.0
-        depth_arrs[i] = depth_arr if use_depth_shape else to_img_shape(depth_arr)
-
-        if conf_fname == '':
-            conf_arr = np.zeros(depth_arr.shape)
-            conf_arr[depth_arr < 3] = 2
-        else:
-            with r3d_file.open(conf_fname, "r") as conf_f:
-                raw_bytes = conf_f.read()
-                decompressed_bytes = liblzfse.decompress(raw_bytes)
-                conf_arr = np.frombuffer(decompressed_bytes, dtype=np.uint8).reshape(depth_h, depth_w).copy()
-            conf_arr[depth_is_nan_arr] = 0
-        conf_arrs[i] = conf_arr if use_depth_shape else to_img_shape(conf_arr)
-
-    masks_arrs = conf_arrs != 2
-
-    return img_arrs, depth_arrs, masks_arrs
-
-
 def read_metadata(r3d_file: ZipFile, use_depth_shape: bool) -> Metadata:
+    """Read metadata from R3D file."""
     with r3d_file.open("metadata", "r") as f:
         metadata_dict = json.load(f)
 
@@ -226,16 +140,10 @@ def read_metadata(r3d_file: ZipFile, use_depth_shape: bool) -> Metadata:
         start_pose=as_pose_matrix(metadata_dict["initPose"]),
     )
 
-    # Converts the intrinsics from the image shape to the depth shape.
     if use_depth_shape:
         metadata.intrinsics[0, :] *= metadata.depth_shape[1] / metadata.rgb_shape[1]
         metadata.intrinsics[1, :] *= metadata.depth_shape[0] / metadata.rgb_shape[0]
 
-    # Swaps fx and cx, fy and cy in the intrinsics.
-    # metadata.intrinsics[0, 0], metadata.intrinsics[1, 1] = metadata.intrinsics[1, 1], metadata.intrinsics[0, 0]
-    # metadata.intrinsics[0, 2], metadata.intrinsics[1, 2] = metadata.intrinsics[1, 2], metadata.intrinsics[0, 2]
-
-    # Checks metadata is well-formed.
     assert metadata.timestamps.shape[0] == metadata.poses.shape[0]
     assert metadata.poses.shape[1:] == (4, 4)
     assert metadata.start_pose.shape == (4, 4)
@@ -244,67 +152,220 @@ def read_metadata(r3d_file: ZipFile, use_depth_shape: bool) -> Metadata:
 
 
 class R3DDataset(Dataset[PosedRGBDItem]):
+    """
+    Streaming version of R3D Dataset that loads frames on-demand.
+    
+    This version is memory-efficient and suitable for:
+    - Large captures with many frames
+    - Full-resolution RGB (use_depth_shape=False)
+    
+    """
+    
     def __init__(
         self,
         path,
         *,
         use_depth_shape: bool = True,
+        keep_zipfile_open: bool = False,
+        downsample_factor: int = 1,
     ) -> None:
-        """Defines a dataset for iterating samples from an R3D file.
-
-        The .r3d file format is the special format used by the Record3D app.
-        It is basically just a zipped file with some images, depths and
-        metadata.
+        """
+        Initialize  R3D dataset.
 
         Args:
             path: The path to the .r3d file
-            use_depth_shape: If True, the image array will be resized to the depth
-                shape; otherwise, the depth array will be resized to the image
-                shape.
+            use_depth_shape: If True, images are resized to depth shape (192x256);
+                           if False, depth is resized to RGB shape (more memory per frame)
+            keep_zipfile_open: If True, keeps ZipFile handle open for faster access.
+            downsample_factor: Factor by which to downsample images. 
+
         """
-
         path = Path(path)
-
         assert path.suffix == ".r3d", f"Invalid file suffix: {path.suffix} Expected `.r3d`"
+        assert downsample_factor >= 1, f"downsample_factor must be >= 1, got {downsample_factor}"
 
+        self.path = path
         self.use_depth_shape = use_depth_shape
-
+        self.keep_zipfile_open = keep_zipfile_open
+        self.downsample_factor = downsample_factor
+        
         with ZipFile(path) as r3d_file:
             self.metadata = read_metadata(r3d_file, self.use_depth_shape)
-            self.imgs_arr, self.depths_arr, self.masks_arr = get_arrs(r3d_file, self.metadata, self.use_depth_shape)
-
-        self.intrinsics = self.metadata.intrinsics
-        affine_matrix = np.array(
-            [
-                [1, 0, 0, 0],
-                [0, -1, 0, 0],
-                [0, 0, -1, 0],
-                [0, 0, 0, 1],
-            ]
+        
+        self.rgb_h, self.rgb_w = self.metadata.rgb_shape
+        self.depth_h, self.depth_w = self.metadata.depth_shape
+        base_h, base_w = (
+            (self.depth_h, self.depth_w) if use_depth_shape else (self.rgb_h, self.rgb_w)
         )
-        self.poses = self.metadata.poses @ affine_matrix
+        
+        self.output_h = base_h // downsample_factor
+        self.output_w = base_w // downsample_factor
+        
+        self.num_frames = self.metadata.timestamps.shape[0]
+        
+        self.intrinsics = self.metadata.intrinsics.copy()
+        if downsample_factor > 1:
+            # Scale focal lengths and principal point
+            scale = 1.0 / downsample_factor
+            self.intrinsics[0, :] *= scale  # fx and cx
+            self.intrinsics[1, :] *= scale  # fy and cy
+        
+        affine_matrix_1 = np.array([
+            [1, 0, 0, 0],
+            [0, -1, 0, 0],
+            [0, 0, -1, 0],
+            [0, 0, 0, 1],
+        ])
+        self.poses = self.metadata.poses @ affine_matrix_1
 
-        # Converts poses from (X, Z, Y) to (X, -Y, Z).
-        affine_matrix = np.array(
-            [
-                [1, 0, 0, 0],
-                [0, 0, -1, 0],
-                [0, 1, 0, 0],
-                [0, 0, 0, 1],
-            ]
-        )
-        self.poses = affine_matrix @ self.poses
+        affine_matrix_2 = np.array([
+            [1, 0, 0, 0],
+            [0, 0, -1, 0],
+            [0, 1, 0, 0],
+            [0, 0, 0, 1],
+        ])
+        self.poses = affine_matrix_2 @ self.poses
+        
+        self._zipfile_handle: Optional[ZipFile] = None
+        if keep_zipfile_open:
+            self._zipfile_handle = ZipFile(path)
+            
+        print(f"R3D Dataset initialized (streaming mode):")
+        print(f"  Frames: {self.num_frames}")
+        print(f"  RGB shape: {self.rgb_h}x{self.rgb_w}")
+        print(f"  Depth shape: {self.depth_h}x{self.depth_w}")
+        print(f"  Use depth shape: {use_depth_shape}")
+        print(f"  Downsample factor: {downsample_factor}")
+        print(f"  Final output shape: {self.output_h}x{self.output_w}")
+        print(f"  Keep ZipFile open: {keep_zipfile_open}")
 
     def __len__(self) -> int:
-        return len(self.imgs_arr)
+        return self.num_frames
+
+    def __del__(self):
+        """Close ZipFile handle when object is destroyed."""
+        if self._zipfile_handle is not None:
+            self._zipfile_handle.close()
+
+    def _get_zipfile(self) -> ZipFile:
+        """Get ZipFile handle (either persistent or temporary)."""
+        if self._zipfile_handle is not None:
+            return self._zipfile_handle
+        else:
+            return ZipFile(self.path)
+
+    def _load_frame_data(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Load RGB, depth, and mask for a single frame.
+        
+        Args:
+            index: Frame index
+            
+        Returns:
+            Tuple of (rgb_array, depth_array, mask_array) with final output shape
+        """
+        need_to_close = self._zipfile_handle is None
+        r3d_file = self._get_zipfile()
+        
+        try:
+            img_fname = f"rgbd/{index}.jpg"
+            with r3d_file.open(img_fname, "r") as img_f:
+                img_arr = np.asarray(Image.open(img_f))
+            
+            assert img_arr.shape == (self.rgb_h, self.rgb_w, 3), \
+                f"Expected shape ({self.rgb_h}, {self.rgb_w}, 3), got {img_arr.shape}"
+            
+            if self.use_depth_shape:
+                img_arr = cv2.resize(img_arr, (self.depth_w, self.depth_h), interpolation=cv2.INTER_LINEAR)
+            
+            depth_fname = f"rgbd/{index}.depth"
+            with r3d_file.open(depth_fname, "r") as depth_f:
+                raw_bytes = depth_f.read()
+                decompressed_bytes = liblzfse.decompress(raw_bytes)
+                depth_arr = np.frombuffer(decompressed_bytes, dtype=np.float32).reshape(
+                    self.depth_h, self.depth_w
+                ).copy()
+            
+            depth_is_nan = np.isnan(depth_arr)
+            depth_arr[depth_is_nan] = -1.0
+            
+            if not self.use_depth_shape:
+                depth_arr = cv2.resize(depth_arr, (self.rgb_w, self.rgb_h), interpolation=cv2.INTER_NEAREST)
+            
+            conf_fname = f"rgbd/{index}.conf"
+            try:
+                with r3d_file.open(conf_fname, "r") as conf_f:
+                    raw_bytes = conf_f.read()
+                    decompressed_bytes = liblzfse.decompress(raw_bytes)
+                    conf_arr = np.frombuffer(decompressed_bytes, dtype=np.uint8).reshape(
+                        self.depth_h, self.depth_w
+                    ).copy()
+                
+                conf_arr[depth_is_nan] = 0
+                    
+            except KeyError:
+                conf_arr = np.zeros((self.depth_h, self.depth_w), dtype=np.uint8)
+                conf_arr[depth_arr < 3] = 2
+            
+            if not self.use_depth_shape:
+                conf_arr = cv2.resize(conf_arr, (self.rgb_w, self.rgb_h), interpolation=cv2.INTER_NEAREST)
+            
+            if self.downsample_factor > 1:
+                img_arr = cv2.resize(
+                    img_arr, 
+                    (self.output_w, self.output_h), 
+                    interpolation=cv2.INTER_AREA  
+                )
+                depth_arr = cv2.resize(
+                    depth_arr, 
+                    (self.output_w, self.output_h), 
+                    interpolation=cv2.INTER_NEAREST  
+                )
+                conf_arr = cv2.resize(
+                    conf_arr, 
+                    (self.output_w, self.output_h), 
+                    interpolation=cv2.INTER_NEAREST  
+                )
+            
+            mask_arr = conf_arr != 2
+            
+            return img_arr, depth_arr, mask_arr
+            
+        finally:
+            if need_to_close:
+                r3d_file.close()
 
     def __getitem__(self, index: int) -> PosedRGBDItem:
-        img = torch.from_numpy(self.imgs_arr[index]).permute(2, 0, 1)
+        """
+        Load a single frame on-demand.
+        
+        Args:
+            index: Frame index
+            
+        Returns:
+            PosedRGBDItem containing image, depth, mask, intrinsics, and pose
+        """
+        if index < 0 or index >= self.num_frames:
+            raise IndexError(f"Index {index} out of range [0, {self.num_frames})")
+        
+        # Load frame data
+        img_arr, depth_arr, mask_arr = self._load_frame_data(index)
+        
+        img = torch.from_numpy(img_arr).permute(2, 0, 1)  # (H, W, 3) -> (3, H, W)
         img = V.convert_image_dtype(img, torch.float32)
-        depth = torch.from_numpy(self.depths_arr[index]).unsqueeze(0)
-        mask = torch.from_numpy(self.masks_arr[index]).unsqueeze(0)
+        
+        depth = torch.from_numpy(depth_arr).unsqueeze(0)  # (H, W) -> (1, H, W)
+        mask = torch.from_numpy(mask_arr).unsqueeze(0)    # (H, W) -> (1, H, W)
+        
         intr = torch.from_numpy(self.intrinsics)
         pose = torch.from_numpy(self.poses[index])
-
-        item = PosedRGBDItem(image=img, depth=depth, mask=mask, intrinsics=intr, pose=pose)
+        
+        item = PosedRGBDItem(
+            image=img,
+            depth=depth,
+            mask=mask,
+            intrinsics=intr,
+            pose=pose
+        )
+        
         return item

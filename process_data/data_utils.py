@@ -32,6 +32,7 @@
 
 import os
 from dataclasses import dataclass
+from turtle import down
 from typing import Iterator, Tuple
 from pathlib import Path
 from typing import Iterator, Sized, cast, Union
@@ -54,11 +55,12 @@ def get_posed_rgbd_dataset(
     key: str,
     path: str,
     use_depth_shape: bool = True,
+    downsample_factor: Union[int, float] = 1,
 ) -> Dataset[PosedRGBDItem]:
     assert key == 'home_robot' or key == 'r3d'
     # Currently we only support data from Record3D
     if key == "r3d":
-        return R3DDataset(path, use_depth_shape=use_depth_shape)
+        return R3DDataset(path, use_depth_shape=use_depth_shape, downsample_factor=downsample_factor)
 
 
 @dataclass(frozen=True)
