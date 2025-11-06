@@ -23,8 +23,8 @@ def localize_and_update_json(
     post_image_dir,        # directory of post-change images
     old_transforms_path,   # old transforms.json (with depth paths, etc.)
     new_transforms_path,   # where to save updated transforms.json
-    num_retrieval=10,
-    ransac_thresh=12.0
+    num_retrieval=20,
+    ransac_thresh=10.0
 ):
     """
     Localize post-change images and update existing transforms.json
@@ -208,7 +208,6 @@ def localize_and_update_json(
         w2c[:3, 3] = tvec
         c2w = np.linalg.inv(w2c)
         
-        # Apply coordinate fix (OpenCV to OpenGL)
         fix_rot = np.diag([1, -1, -1, 1])
         poses[query_name] = c2w @ fix_rot
         
@@ -272,158 +271,96 @@ def localize_and_update_json(
             print("⚠️ Not enough matched frames to estimate ARKit alignment. Skipping.")
 
 
-
-    if args.align_arkit_static:
-        print("\n=== Static camera mode: Using single frame alignment ===")
-
-        # Load old JSON
-        with open(old_transforms_path, "r") as f:
-            old_json = json.load(f)
-
-        # Pick one localized frame (first successful)
-        first_name = next(iter(poses.keys()))
-        T_hloc = poses[first_name]
-
-        # Find corresponding ARKit pose
-        T_arkit = None
-        for frame in old_json["frames"]:
-            if Path(frame["file_path"]).name == first_name:
-                T_arkit = np.array(frame["transform_matrix"])
-                break
-
-        if T_arkit is None:
-            print("!!!!Could not find ARKit pose for the localized frame.")
-        else:
-            # Compute global alignment (ARKit → SfM)
-            transform = T_hloc @ np.linalg.inv(T_arkit)
-
-            print(f"✓ Using frame '{first_name}' for alignment")
-            print("✓ Estimated rigid transform (ARKit → SfM):")
-            print(transform)
-
-            # Validate rigidness
-            R = transform[:3, :3]
-            det = np.linalg.det(R)
-            print(f"  Rotation determinant: {det:.6f} (should be ≈1.0)")
-            if abs(det - 1.0) > 0.1:
-                print("!!!!: Transform may not be purely rigid!")
-
-            # Compute single aligned pose for the static camera
-            T_fixed = transform @ T_arkit
-
-            # Apply same pose to all frames (freeze)
-            for frame in old_json["frames"]:
-                frame["transform_matrix"] = T_fixed.tolist()
-                name = Path(frame["file_path"]).name
-                poses[name] = T_fixed  # for visualization consistency
-
-            # Save
-            with open(new_transforms_path, "w") as f:
-                json.dump(old_json, f, indent=2)
-
-            print(f"✓ Saved globally aligned static camera poses to {new_transforms_path}")
-
-
     print(f"Successfully localized: {len(poses)}/{len(post_images)} images")
     if failed:
         print(f"Failed: {len(failed)} images")
 
-    # === Step 6: Update transforms.json ===
-    print("\n=== Step 6: Update transforms.json ===")
     
-    # Load old JSON
     with open(old_transforms_path, "r") as f:
         old_json = json.load(f)
 
-    # Create mapping from file_path to pose
     file_to_pose = {f"frames/{name}": mat.tolist() for name, mat in poses.items()}
     
-    # Update transform matrices
     updated = 0
     for frame in old_json["frames"]:
         fp = frame["file_path"]
         if fp in file_to_pose:
             frame["transform_matrix"] = file_to_pose[fp]
             updated += 1
-
-    print(f"✓ Updated poses for {updated}/{len(old_json['frames'])} frames")
     
-    # Save updated JSON
     with open(new_transforms_path, "w") as f:
         json.dump(old_json, f, indent=2)
     
-    print(f"✓ Saved updated transforms to: {new_transforms_path}")
+    print(f"Saved updated transforms to: {new_transforms_path}")
 
-    # === Step 7: Visualization ===
-    print("\n=== Step 7: Create visualization ===")
-    
-    fig = viz_3d.init_figure()
-    
-    # Plot pre-change reconstruction
-    viz_3d.plot_reconstruction(
-        fig,
-        reconstruction,
-        color="rgba(255,0,0,0.5)",
-        name="pre-change reconstruction",
-        points=len(reconstruction.points3D) > 0,
-        cameras=True,
-        cs=0.1,
-        points_rgb=True
-    )
-
-    # Add localized post-change cameras
-    if poses:
-        camera_centers = np.array([pose[:3, 3] for pose in poses.values()])
+    if args.visualize:
         
-        fig.add_trace(
-            go.Scatter3d(
-                x=camera_centers[:, 0],
-                y=camera_centers[:, 1],
-                z=camera_centers[:, 2],
-                mode='markers',
-                marker=dict(size=4, color='blue'),
-                name='post-change cameras'
-            )
+        fig = viz_3d.init_figure()
+        
+        # Plot pre-change reconstruction
+        viz_3d.plot_reconstruction(
+            fig,
+            reconstruction,
+            color="rgba(255,0,0,0.5)",
+            name="pre-change reconstruction",
+            points=len(reconstruction.points3D) > 0,
+            cameras=True,
+            cs=0.1,
+            points_rgb=True
         )
-        
-        # Add camera direction arrows (sample)
-        sample_indices = np.linspace(0, len(poses)-1, min(20, len(poses)), dtype=int)
-        pose_list = list(poses.values())
-        
-        for idx in sample_indices:
-            pose = pose_list[idx]
-            center = pose[:3, 3]
-            direction = pose[:3, :3] @ np.array([0, 0, -1])
-            
-            arrow_length = 0.2
-            end_point = center + direction * arrow_length
+
+        if poses:
+            camera_centers = np.array([pose[:3, 3] for pose in poses.values()])
             
             fig.add_trace(
                 go.Scatter3d(
-                    x=[center[0], end_point[0]],
-                    y=[center[1], end_point[1]],
-                    z=[center[2], end_point[2]],
-                    mode='lines',
-                    line=dict(color='cyan', width=2),
-                    showlegend=False,
-                    hoverinfo='skip'
+                    x=camera_centers[:, 0],
+                    y=camera_centers[:, 1],
+                    z=camera_centers[:, 2],
+                    mode='markers',
+                    marker=dict(size=4, color='blue'),
+                    name='post-change cameras'
                 )
             )
+            
+            # Add camera direction arrows (sample)
+            sample_indices = np.linspace(0, len(poses)-1, min(20, len(poses)), dtype=int)
+            pose_list = list(poses.values())
+            
+            for idx in sample_indices:
+                pose = pose_list[idx]
+                center = pose[:3, 3]
+                direction = pose[:3, :3] @ np.array([0, 0, -1])
+                
+                arrow_length = 0.2
+                end_point = center + direction * arrow_length
+                
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=[center[0], end_point[0]],
+                        y=[center[1], end_point[1]],
+                        z=[center[2], end_point[2]],
+                        mode='lines',
+                        line=dict(color='cyan', width=2),
+                        showlegend=False,
+                        hoverinfo='skip'
+                    )
+                )
 
-    fig.update_layout(
-        scene=dict(
-            aspectmode='data',
-            camera=dict(
-                up=dict(x=0, y=-1, z=0),
-                eye=dict(x=1.5, y=1.5, z=1.5)
+        fig.update_layout(
+            scene=dict(
+                aspectmode='data',
+                camera=dict(
+                    up=dict(x=0, y=-1, z=0),
+                    eye=dict(x=1.5, y=1.5, z=1.5)
+                ),
             ),
-        ),
-        title="Camera Localization: Pre-change (red) vs Post-change (blue)"
-    )
+            title="Camera Localization: Pre-change (red) vs Post-change (blue)"
+        )
 
-    html_path = post_outputs / "localization_viz.html"
-    fig.write_html(str(html_path), auto_open=True)
-    print(f"✓ 3D visualization saved to: {html_path}")
+        html_path = post_outputs / "localization_viz.html"
+        fig.write_html(str(html_path), auto_open=True)
+        print(f"✓ 3D visualization saved to: {html_path}")
     
     return poses, old_json
 
@@ -448,9 +385,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--align_arkit", action="store_true",
                         help="Align old ARKit transforms to pre-change HLoc coordinate frame instead of replacing poses")
-    parser.add_argument("--align_arkit_static", action="store_true",
-                        help="Static camera mode: Align old ARKit transforms using first localized frame")
-
+    parser.add_argument("--visualize", action="store_true",
+                        help="Generate 3D visualization of localization results")
     args = parser.parse_args()
 
     poses, updated_json = localize_and_update_json(

@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument(
         "--transforms",
         type=str,
-        default="transforms_pre.json",
+        default="transforms_arkit.json",
         help="Transform JSON file name (default: transforms_pre.json)"
     )
     parser.add_argument(
