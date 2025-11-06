@@ -21,7 +21,7 @@ import open3d as o3d
 def localize_and_update_json(
     pre_sfm_dir,           # path to pre-change reconstruction (hloc outputs)
     post_image_dir,        # directory of post-change images
-    old_transforms_path,   # old transforms.json (with depth paths, etc.)
+    arkit_transforms_path,   # old transforms.json (with depth paths, etc.)
     new_transforms_path,   # where to save updated transforms.json
     num_retrieval=20,
     ransac_thresh=10.0
@@ -31,7 +31,7 @@ def localize_and_update_json(
     """
     pre_sfm_dir = Path(pre_sfm_dir)
     post_image_dir = Path(post_image_dir)
-    old_transforms_path = Path(old_transforms_path)
+    arkit_transforms_path = Path(arkit_transforms_path)
     new_transforms_path = Path(new_transforms_path)
 
     # Load reconstruction and camera
@@ -219,7 +219,7 @@ def localize_and_update_json(
         print("\n=== Step 5b: Aligning ARKit trajectory to pre-change SfM frame ===")
 
         # Load ARKit poses from old JSON
-        with open(old_transforms_path, "r") as f:
+        with open(arkit_transforms_path, "r") as f:
             old_json = json.load(f)
 
         arkit_centers, hloc_centers = [], []
@@ -266,9 +266,9 @@ def localize_and_update_json(
             with open(new_transforms_path, "w") as f:
                 json.dump(old_json, f, indent=2)
 
-            print(f"✓ Saved globally aligned ARKit poses to {new_transforms_path}")
+            print(f"Saved globally aligned ARKit poses to {new_transforms_path}")
         else:
-            print("⚠️ Not enough matched frames to estimate ARKit alignment. Skipping.")
+            print("Not enough matched frames to estimate ARKit alignment. Skipping.")
 
 
     print(f"Successfully localized: {len(poses)}/{len(post_images)} images")
@@ -276,7 +276,7 @@ def localize_and_update_json(
         print(f"Failed: {len(failed)} images")
 
     
-    with open(old_transforms_path, "r") as f:
+    with open(arkit_transforms_path, "r") as f:
         old_json = json.load(f)
 
     file_to_pose = {f"frames/{name}": mat.tolist() for name, mat in poses.items()}
@@ -374,7 +374,7 @@ if __name__ == "__main__":
                         help="Path to pre-change reconstruction (hloc outputs, contains sfm/)")
     parser.add_argument("--post_image_dir", type=str, required=True,
                         help="Path to post-change image directory (frames/)")
-    parser.add_argument("--old_transforms_path", type=str, required=True,
+    parser.add_argument("--arkit_transforms_path", type=str, required=True,
                         help="Path to original transforms.json file")
     parser.add_argument("--new_transforms_path", type=str, required=True,
                         help="Output path for updated transforms.json file")
@@ -392,7 +392,7 @@ if __name__ == "__main__":
     poses, updated_json = localize_and_update_json(
         pre_sfm_dir=args.pre_sfm_dir,
         post_image_dir=args.post_image_dir,
-        old_transforms_path=args.old_transforms_path,
+        arkit_transforms_path=args.arkit_transforms_path,
         new_transforms_path=args.new_transforms_path,
         num_retrieval=args.num_retrieval,
         ransac_thresh=args.ransac_thresh
