@@ -22,12 +22,13 @@ from data_structures import (
 from joint_model import JointModelBase, create_joint_models
 
 
+
 class RANSACCore:
     """
     Core RANSAC implementation for joint estimation.
     
     This class implements the main RANSAC loop that robustly fits
-    joint models to 3D trajectory data.
+    joint models to 3D trajectory data, with optional TMS pre-clustering.
     """
     
     def __init__(self, config: RANSACConfig):
@@ -40,7 +41,7 @@ class RANSACCore:
         self.config = config
         self.joint_models = create_joint_models()
         
-        # Set random seed for reproducible results (optional)
+        # Set random seed for reproducible results
         random.seed(42)
         np.random.seed(42)
     
@@ -56,19 +57,12 @@ class RANSACCore:
         """
         print(f"=== Starting RANSAC Joint Estimation ===")
         print(f"Input: {len(trajectories_3d)} trajectories")
+        print(f"TMS pre-clustering: {'ENABLED' if self.config.use_tms_preclustering else 'DISABLED'}")
         
         start_time = time.time()
         
-        # # Filter trajectories by minimum length
+        # Step 1: Filter trajectories by minimum length
         valid_trajectories = self._filter_trajectories(trajectories_3d)
-
-        # # Step 0: Pre-cluster trajectories with TMS
-        # clusters = self._build_tms_clusters(trajectories_3d)
-        # representatives = [self._choose_representative(c) for c in clusters]
-
-        # # Step 1: Filter representatives
-        # valid_trajectories = self._filter_trajectories(representatives)
-
         print(f"After filtering: {len(valid_trajectories)} valid trajectories")
         
         if len(valid_trajectories) < self.config.min_inliers:
@@ -83,20 +77,40 @@ class RANSACCore:
                 error_message="Insufficient valid trajectories"
             )
         
-        # Try each joint type
+        # Step 2: Optional TMS clustering
+        if self.config.use_tms_preclustering:
+            clusters = self._build_tms_clusters(valid_trajectories)
+            representatives = [self._choose_representative(c) for c in clusters]
+            print(f"Using {len(representatives)} cluster representatives for RANSAC")
+            ransac_input = representatives
+        else:
+            clusters = None
+            ransac_input = valid_trajectories
+        
+        # Step 3: Try each joint type
         best_result = None
         best_consensus_count = 0
         
         for joint_type, joint_model in self.joint_models.items():
             print(f"\n--- Testing {joint_type.value.upper()} model ---")
             
-            result = self._fit_joint_model(joint_model, valid_trajectories)
+            result = self._fit_joint_model(joint_model, ransac_input)
             
-            if result and result.inlier_count > best_consensus_count:
-                best_result = result
-                best_consensus_count = result.inlier_count
-                print(f"New best model: {joint_type.value} with {result.inlier_count} inliers")
-        
+            if result:
+                # If using TMS, expand inliers to full clusters
+                if self.config.use_tms_preclustering and clusters:
+                    result = self._expand_to_full_clusters(result, clusters, joint_model)
+                
+                # Prefer more inliers, but break ties with lower error
+                if (best_result is None or
+                    result.inlier_count > best_result.inlier_count or
+                    (result.inlier_count == best_result.inlier_count and 
+                    result.fit_error < best_result.fit_error)):
+                    
+                    best_result = result
+                    print(f"New best model: {joint_type.value} with {result.inlier_count} inliers, "
+                        f"avg error={result.fit_error:.4f}")
+
         processing_time = time.time() - start_time
         
         if best_result is None or best_result.inlier_count < self.config.min_inliers:
@@ -127,92 +141,195 @@ class RANSACCore:
             processing_time=processing_time
         )
 
-    # def _build_tms_clusters(self,
-    #                         trajectories: List[Trajectory3D],
-    #                         n_rtm: int = 100,
-    #                         eps_r: float = 0.01,
-    #                         jaccard_thresh: float = 0.7):
-    #     """
-    #     Build trajectory clusters using Trajectory-Model Signatures (TMS).
-    #     Each trajectory gets a binary signature vector describing which
-    #     rigid trajectory models (RTMs) it supports. Then cluster trajectories
-    #     based on Jaccard similarity of signatures.
+    def _build_tms_clusters(self,
+                            trajectories: List[Trajectory3D],
+                            n_rtm: int = 40,
+                            eps_r: float = 0.03,
+                            jaccard_thresh: float = 0.4) -> List[List[Trajectory3D]]:
+        """
+        Build trajectory clusters using Trajectory-Model Signatures (TMS).
+        
+        Algorithm:
+        1. Generate N random Rigid Trajectory Models (RTMs) from trajectory pairs
+        2. Build binary signature for each trajectory (which RTMs it supports)
+        3. Cluster trajectories by Jaccard similarity of signatures
+        
+        Args:
+            trajectories: List of 3D trajectories
+            n_rtm: Number of RTM candidates to generate
+            eps_r: Residual error threshold for RTM agreement (meters)
+            jaccard_thresh: Jaccard distance threshold for clustering
+        
+        Returns:
+            List of clusters, each containing trajectories with similar rigid motion
+        """
+        if len(trajectories) < 2:
+            return [[t] for t in trajectories]
+        
+        print(f"[TMS] Building clusters from {len(trajectories)} trajectories...")
+        
+        # --- Step 1: Generate RTM candidates (rigid transformations) ---
+        rtms = []
+        attempts = 0
+        max_attempts = n_rtm * 3
+        
+        while len(rtms) < n_rtm and attempts < max_attempts:
+            attempts += 1
+            
+            # Sample two trajectories with sufficient length
+            candidates = [t for t in trajectories if len(t.points) >= 3]
+            if len(candidates) < 2:
+                break
+                
+            t1, t2 = random.sample(candidates, 2)
+            
+            # Get start and end positions for each trajectory
+            try:
+                p1_start = np.array([t1.points[0].x, t1.points[0].y, t1.points[0].z])
+                p1_end = np.array([t1.points[-1].x, t1.points[-1].y, t1.points[-1].z])
+                
+                p2_start = np.array([t2.points[0].x, t2.points[0].y, t2.points[0].z])
+                p2_end = np.array([t2.points[-1].x, t2.points[-1].y, t2.points[-1].z])
+                
+                # Estimate rigid transformation from start to end frames
+                points_start = np.array([p1_start, p2_start])
+                points_end = np.array([p1_end, p2_end])
+                
+                # Use Kabsch algorithm (from HingeJointModel)
+                R, t = self.joint_models[JointType.HINGE]._estimate_rigid_transform_kabsch(
+                    points_start, points_end
+                )
+                
+                # Validate: check if transformation is reasonable
+                # Reject if rotation is too extreme or translation too large
+                rot_angle = np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))
+                trans_dist = np.linalg.norm(t)
+                
+                if rot_angle < np.pi and trans_dist < 1.0:  # Reasonable motion
+                    rtms.append((R, t))
+                    
+            except Exception:
+                continue
+        
+        if len(rtms) == 0:
+            print("[TMS] Failed to generate RTMs, returning single cluster")
+            return [trajectories]
+        
+        print(f"[TMS] Generated {len(rtms)} valid RTMs")
+        
+        # --- Step 2: Compute TMS signature vectors ---
+        signatures = {}
+        
+        for traj in trajectories:
+            pts = traj.get_all_positions()
+            if len(pts) < 2:
+                signatures[traj.track_id] = np.zeros(len(rtms), dtype=np.uint8)
+                continue
+            
+            sig = []
+            for (R, t) in rtms:
+                # Test if this RTM explains the trajectory motion
+                # Predict positions using RTM and compare to actual
+                predicted = (R @ pts[:-1].T).T + t
+                residuals = np.linalg.norm(predicted - pts[1:], axis=1)
+                avg_residual = np.mean(residuals)
+                
+                # Mark as 1 if RTM explains this trajectory well
+                sig.append(1 if avg_residual < eps_r else 0)
+            
+            signatures[traj.track_id] = np.array(sig, dtype=np.uint8)
+        
+        # --- Step 3: Cluster using Jaccard similarity ---
+        unvisited = set(signatures.keys())
+        clusters = []
+        
+        while unvisited:
+            seed_id = unvisited.pop()
+            cluster = [seed_id]
+            sig_seed = signatures[seed_id]
+            
+            to_check = list(unvisited)
+            for other_id in to_check:
+                sig_other = signatures[other_id]
+                
+                # Compute Jaccard distance: 1 - (intersection / union)
+                inter = np.sum(np.logical_and(sig_seed, sig_other))
+                union = np.sum(np.logical_or(sig_seed, sig_other))
+                
+                jaccard_dist = 1.0 if union == 0 else 1.0 - (inter / union)
+                
+                if jaccard_dist < jaccard_thresh:
+                    cluster.append(other_id)
+                    unvisited.remove(other_id)
+            
+            # Convert track IDs back to trajectory objects
+            cluster_trajs = [t for t in trajectories if t.track_id in cluster]
+            if cluster_trajs:
+                clusters.append(cluster_trajs)
+        
+        print(f"[TMS] Found {len(clusters)} rigid motion clusters")
+        for i, cluster in enumerate(clusters):
+            print(f"  Cluster {i}: {len(cluster)} trajectories")
+        
+        return clusters
 
-    #     Args:
-    #         trajectories: List of trajectories
-    #         n_rtm: Number of RTM candidates to generate
-    #         eps_r: Residual error threshold for agreement
-    #         jaccard_thresh: Jaccard distance threshold for clustering
+    def _choose_representative(self, cluster: List[Trajectory3D]) -> Trajectory3D:
+        """
+        Pick representative trajectory from a cluster.
+        Strategy: choose the longest trajectory (most temporal coverage).
+        """
+        return max(cluster, key=lambda t: len(t.points))
 
-    #     Returns:
-    #         List of clusters, each a list of trajectories
-    #     """
-    #     if len(trajectories) < 2:
-    #         return [[t] for t in trajectories]
-
-    #     # --- Step 1: Generate RTM candidates ---
-    #     rtms = []
-    #     for _ in range(min(n_rtm, len(trajectories) // 2)):
-    #         t1, t2 = random.sample(trajectories, 2)
-    #         p1a = np.array([t1.points[0].x, t1.points[0].y, t1.points[0].z])
-    #         p1b = np.array([t1.points[-1].x, t1.points[-1].y, t1.points[-1].z])
-
-    #         p2a = np.array([t2.points[0].x, t2.points[0].y, t2.points[0].z])
-    #         p2b = np.array([t2.points[-1].x, t2.points[-1].y, t2.points[-1].z])
-    #         try:
-    #             R, t = self.joint_models[JointType.HINGE]._estimate_rigid_transform_kabsch(
-    #                 np.array([p1a, p2a]), np.array([p1b, p2b])
-    #             )
-    #             rtms.append((R, t))
-    #         except Exception:
-    #             continue
-
-    #     if not rtms:
-    #         return [[t] for t in trajectories]
-
-    #     # --- Step 2: Compute TMS vectors ---
-    #     signatures = {}
-    #     for traj in trajectories:
-    #         pts = traj.get_all_positions()
-    #         sig = []
-    #         for (R, t) in rtms:
-    #             if len(pts) < 2:
-    #                 sig.append(0)
-    #                 continue
-    #             pred = (R @ pts[:-1].T).T + t
-    #             res = np.mean(np.linalg.norm(pred - pts[1:], axis=1))
-    #             sig.append(1 if res < eps_r else 0)
-    #         signatures[traj.track_id] = np.array(sig, dtype=np.uint8)
-
-    #     # --- Step 3: Cluster using Jaccard similarity ---
-    #     unvisited = set(signatures.keys())
-    #     clusters = []
-
-    #     while unvisited:
-    #         seed = unvisited.pop()
-    #         cluster = [seed]
-    #         sig_seed = signatures[seed]
-
-    #         to_check = list(unvisited)
-    #         for other in to_check:
-    #             sig_other = signatures[other]
-    #             inter = np.sum(np.logical_and(sig_seed, sig_other))
-    #             union = np.sum(np.logical_or(sig_seed, sig_other))
-    #             d_j = 1.0 if union == 0 else 1 - inter / union
-    #             if d_j < jaccard_thresh:
-    #                 cluster.append(other)
-    #                 unvisited.remove(other)
-
-    #         clusters.append([traj for traj in trajectories if traj.track_id in cluster])
-
-    #     return clusters
-
-    # def _choose_representative(self, cluster: List[Trajectory3D]) -> Trajectory3D:
-    #     """
-    #     Pick representative trajectory from a cluster.
-    #     Strategy: choose the longest trajectory (most frames).
-    #     """
-    #     return max(cluster, key=lambda t: len(t.points))
+    def _expand_to_full_clusters(self, 
+                                 result: ModelFitResult,
+                                 clusters: List[List[Trajectory3D]],
+                                 joint_model: JointModelBase) -> ModelFitResult:
+        """
+        Expand inliers from cluster representatives to all cluster members.
+        
+        After RANSAC finds good representatives, include all trajectories
+        from the same clusters if they also fit the model well.
+        """
+        # Find which clusters are represented in inliers
+        inlier_track_ids = {t.track_id for t in result.inlier_trajectories}
+        active_clusters = []
+        
+        for cluster in clusters:
+            # Check if any representative from this cluster is an inlier
+            cluster_track_ids = {t.track_id for t in cluster}
+            if cluster_track_ids & inlier_track_ids:  # Intersection
+                active_clusters.append(cluster)
+        
+        # Test all trajectories from active clusters
+        expanded_inliers = []
+        errors = []
+        
+        for cluster in active_clusters:
+            for traj in cluster:
+                try:
+                    error = joint_model.calculate_trajectory_error(traj, result.parameters)
+                    if error <= self.config.error_threshold:
+                        expanded_inliers.append(traj)
+                        errors.append(error)
+                except Exception:
+                    continue
+        
+        if not expanded_inliers:
+            return result  # Fallback to original
+        
+        avg_error = np.mean(errors)
+        
+        print(f"[Expansion] {len(result.inlier_trajectories)} representatives → {len(expanded_inliers)} full trajectories")
+        
+        return ModelFitResult(
+            joint_type=result.joint_type,
+            parameters=result.parameters,
+            inlier_trajectories=expanded_inliers,
+            inlier_count=len(expanded_inliers),
+            total_trajectories=result.total_trajectories,
+            fit_error=avg_error,
+            consensus_score=len(expanded_inliers) / result.total_trajectories
+        )
     
     def _filter_trajectories(self, trajectories: List[Trajectory3D]) -> List[Trajectory3D]:
         """Filter trajectories based on minimum length"""
@@ -221,7 +338,6 @@ class RANSACCore:
             if len(traj.points) >= self.config.min_trajectory_length
         ]
     
-
     def _fit_joint_model(self, 
                         joint_model: JointModelBase, 
                         trajectories: List[Trajectory3D]) -> Optional[ModelFitResult]:
@@ -312,21 +428,53 @@ class RANSACCore:
             print(f"Insufficient inliers: {best_inlier_count} < {self.config.min_inliers}")
             return None
         
-        # Refine parameters using all inliers
+        # --- Refinement Phase ---
         print(f"Refining parameters with {best_inlier_count} inliers...")
-        refined_params = joint_model.refine_parameters(best_inliers, best_params)
-        
-        # Calculate final fit error
+
+        try:
+            refined_params = joint_model.refine_parameters(best_inliers, best_params)
+        except Exception as e:
+            print(f"[WARN] Refinement threw an exception: {e}")
+            refined_params = best_params
+
+        # Validate refined parameters
+        def params_valid(p):
+            if p is None:
+                return False
+            arrs = []
+            for val in vars(p).values():
+                if isinstance(val, (list, tuple, np.ndarray)):
+                    arrs.append(np.asarray(val, dtype=float))
+                elif isinstance(val, (float, int)):
+                    arrs.append(np.array([val], dtype=float))
+            return all(np.all(np.isfinite(a)) for a in arrs)
+
+        if not params_valid(refined_params):
+            print("[WARN] Refinement produced invalid (NaN/Inf) parameters; reverting to pre-refinement params.")
+            refined_params = best_params
+
+        # --- Compute final error robustly ---
         errors = []
         for traj in best_inliers:
-            error = joint_model.calculate_trajectory_error(traj, refined_params)
-            errors.append(error)
-        
-        avg_error = np.mean(errors)
+            try:
+                e = joint_model.calculate_trajectory_error(traj, refined_params)
+                if np.isfinite(e):
+                    errors.append(e)
+            except Exception:
+                continue
+
+        if len(errors) == 0:
+            avg_error = float('inf')
+        else:
+            avg_error = np.mean(errors)
+
+        if not np.isfinite(avg_error):
+            print("[WARN] Final avg error non-finite; rejecting this model.")
+            return None
+
         consensus_score = best_inlier_count / len(trajectories)
-        
         print(f"Final result: {best_inlier_count} inliers, avg error: {avg_error:.4f}m")
-        
+
         return ModelFitResult(
             joint_type=joint_model.get_joint_type(),
             parameters=refined_params,
@@ -374,7 +522,6 @@ class RANSACCore:
             sample = random.sample(trajectories, sample_size)
         
         return sample
-
 
 # Convenience function for external use
 def estimate_joint_from_trajectories(trajectories_3d: List[Trajectory3D],
