@@ -1,11 +1,11 @@
 """
-Post-Processing Module for Joint Estimation Pipeline
+Post-Processing Module for Joint Estimation Pipeline 
 
-This module handles the final phase of the 4D RANSAC pipeline:
-- Range of motion calculation (angle_min/max for hinges, translation_min/max for sliders)
-- Parameter refinement and validation
-- Quality metrics and confidence scores
-- Output formatting and visualization support
+Key improvements:
+1. Zero-referenced motion (angle_min=0, translation_min=0)
+2. Proper frame indexing from Point3D.frame attribute
+3. Handles sparse temporal data from preprocessing
+4. More robust outlier filtering
 """
 
 import numpy as np
@@ -18,7 +18,6 @@ from data_structures import (
     JointType
 )
 
-
 class PostProcessor:
     """
     Post-processing for joint estimation results.
@@ -29,7 +28,7 @@ class PostProcessor:
     def __init__(self):
         pass
     
-    def process_result(self, result: JointEstimationResult) -> JointEstimationResult:
+    def process_result(self, result: JointEstimationResult) -> Tuple[JointEstimationResult, dict]:
         """
         Complete post-processing of joint estimation result.
         
@@ -40,25 +39,23 @@ class PostProcessor:
             Enhanced result with range of motion and refined parameters
         """
         if not result.success:
-            return result
+            return result, {}
         
         print(f"=== Post-Processing {result.joint_type.value.upper()} Joint ===")
         
         # Calculate range of motion
         if result.joint_type == JointType.HINGE:
-            refined_params = self._calculate_hinge_range_of_motion(
+            refined_params, per_frame_values = self._calculate_hinge_range_of_motion(
                 result.get_hinge_params(), result.inlier_trajectories
             )
         elif result.joint_type == JointType.SLIDER:
-            refined_params = self._calculate_slider_range_of_motion(
+            refined_params, per_frame_values = self._calculate_slider_range_of_motion(
                 result.get_slider_params(), result.inlier_trajectories
             )
         else:
             refined_params = result.parameters
+            per_frame_values = {}
         
-        per_frame_articulation = self._calculate_per_frame_articulation(
-            refined_params, result.inlier_trajectories, result.joint_type
-        )
         # Validate refined parameters
         validation_score = self._validate_parameters(refined_params, result.inlier_trajectories)
         
@@ -67,40 +64,42 @@ class PostProcessor:
             success=result.success,
             joint_type=result.joint_type,
             parameters=refined_params,
-            confidence=min(result.confidence + validation_score * 0.1, 1.0),  # Boost confidence slightly
+            confidence=min(result.confidence + validation_score * 0.1, 1.0),
             inlier_trajectories=result.inlier_trajectories,
             total_trajectories=result.total_trajectories,
             processing_time=result.processing_time,
-            error_message=result.error_message,
-            per_frame_articulation=per_frame_articulation
+            error_message=result.error_message 
         )
-        
+
         # Print summary
         self._print_result_summary(enhanced_result)
         
-        return enhanced_result
+        return enhanced_result, per_frame_values
     
     def _calculate_hinge_range_of_motion(self, 
-                                       hinge_params: HingeParameters,
-                                       inlier_trajectories: List[Trajectory3D]) -> HingeParameters:
+                                    hinge_params: HingeParameters,
+                                    inlier_trajectories: List[Trajectory3D]) -> Tuple[HingeParameters, dict]:
         """
-        Calculate angle_min and angle_max for hinge joint.
+        Calculate angle_min, angle_max, and per-frame angles for hinge joint.
+        Zero-referenced: angle_min = 0, angles represent opening from closed state.
         
-        Following Li & Wan 2016: "For each frame, calculate the angle of the door 
-        relative to its starting position. The min and max of these angles are your range."
+        Returns:
+            (HingeParameters, per_frame_angles) where per_frame_angles is dict {frame_idx: angle}
         """
         print("Calculating hinge range of motion...")
         
-        all_angles = []
+        # Store angles per frame, keyed by ACTUAL frame number from Point3D
+        frame_angles = {}  # {frame_idx: [angle1, angle2, ...]}
         
+        # First pass: calculate all angles relative to their trajectory's first point
         for traj in inlier_trajectories:
             if len(traj.points) < 2:
                 continue
             
-            # Use first point as reference
+            # Use first point as reference (closed state) for THIS trajectory
             reference_point = np.array([traj.points[0].x, traj.points[0].y, traj.points[0].z])
             
-            for point in traj.points[1:]:
+            for point in traj.points:
                 current_point = np.array([point.x, point.y, point.z])
                 
                 # Calculate rotation angle relative to reference
@@ -109,30 +108,49 @@ class PostProcessor:
                     hinge_params.axis, hinge_params.pivot
                 )
                 
-                all_angles.append(angle)
+                frame_idx = point.frame
+                if frame_idx not in frame_angles:
+                    frame_angles[frame_idx] = []
+                frame_angles[frame_idx].append(angle)
         
-        if len(all_angles) == 0:
+        if len(frame_angles) == 0:
             print("Warning: No angles calculated, using default range")
             return HingeParameters(
                 axis=hinge_params.axis,
                 pivot=hinge_params.pivot,
                 angle_min=0.0,
                 angle_max=0.0
-            )
-
-        all_angles = np.unwrap(np.array(all_angles))  # ensure continuity
-        angle_min = np.percentile(all_angles, 5)   # 5th percentile
-        angle_max = np.percentile(all_angles, 98)  # 98th percentile
+            ), {}
+        
+        # Aggregate angles per frame using robust median
+        per_frame_angles_raw = {
+            frame_idx: np.median(angles)
+            for frame_idx, angles in frame_angles.items()
+        }
+        
+        # Zero-reference
+        angle_offset = min(per_frame_angles_raw.values())
+        
+        per_frame_angles = {
+            frame_idx: angle - angle_offset
+            for frame_idx, angle in per_frame_angles_raw.items()
+        }
+        
+        # Calculate range
+        angle_min = 0.0  # Always start at 0 (closed position)
+        angle_max = max(per_frame_angles.values())
         
         print(f"Hinge range: {np.degrees(angle_min):.1f}° to {np.degrees(angle_max):.1f}°")
+        print(f"Total range of motion: {np.degrees(angle_max):.1f}°")
+        print(f"Per-frame angles computed for {len(per_frame_angles)} frames (sparse sampling)")
         
         return HingeParameters(
             axis=hinge_params.axis,
             pivot=hinge_params.pivot,
             angle_min=angle_min,
             angle_max=angle_max
-        )
-    
+        ), per_frame_angles
+        
     def _calculate_rotation_angle(self, 
                                 reference_point: np.ndarray,
                                 current_point: np.ndarray,
@@ -168,130 +186,77 @@ class PostProcessor:
     
     def _calculate_slider_range_of_motion(self,
                                         slider_params: SliderParameters,
-                                        inlier_trajectories: List[Trajectory3D]) -> SliderParameters:
+                                        inlier_trajectories: List[Trajectory3D]) -> Tuple[SliderParameters, dict]:
         """
-        Calculate translation_min and translation_max for slider joint.
+        Calculate translation_min, translation_max, and per-frame translations.
+        Zero-referenced: translation_min = 0, values represent extension from closed state.
         
-        Following Li & Wan 2016: "For each frame, calculate the distance the drawer 
-        has traveled along its direction vector v."
+        Returns:
+            (SliderParameters, per_frame_translations) where per_frame_translations is dict {frame_idx: translation}
         """
         print("Calculating slider range of motion...")
         
-        all_distances = []
+        # Store translations per frame, keyed by ACTUAL frame number
+        frame_translations = {}  # {frame_idx: [trans1, trans2, ...]}
         
         for traj in inlier_trajectories:
             if len(traj.points) < 2:
                 continue
             
-            # Use first point as reference
+            # Use first point as reference (closed state)
             reference_point = np.array([traj.points[0].x, traj.points[0].y, traj.points[0].z])
             
-            for point in traj.points[1:]:
+            for point in traj.points:
                 current_point = np.array([point.x, point.y, point.z])
                 
                 # Calculate translation distance along direction
                 displacement = current_point - reference_point
                 distance = np.dot(displacement, slider_params.direction)
                 
-                all_distances.append(distance)
+                # Use the actual frame number from Point3D.frame
+                frame_idx = point.frame
+                if frame_idx not in frame_translations:
+                    frame_translations[frame_idx] = []
+                frame_translations[frame_idx].append(distance)
         
-        if len(all_distances) == 0:
+        if len(frame_translations) == 0:
             print("Warning: No distances calculated, using default range")
             return SliderParameters(
                 direction=slider_params.direction,
                 reference_point=slider_params.reference_point,
                 translation_min=0.0,
                 translation_max=0.0
-            )
+            ), {}
         
-        all_distances = np.array(all_distances)
-        translation_min = np.min(all_distances)
-        translation_max = np.max(all_distances)
+        # Aggregate translations per frame using robust median
+        per_frame_translations_raw = {
+            frame_idx: np.median(translations)  
+            for frame_idx, translations in frame_translations.items()
+        }
+        
+        # Zero-reference: find the minimum translation (closed state) and shift
+        translation_offset = min(per_frame_translations_raw.values())
+        
+        # Shift all translations so minimum is at 0
+        per_frame_translations = {
+            frame_idx: trans - translation_offset
+            for frame_idx, trans in per_frame_translations_raw.items()
+        }
+        
+        # Calculate range
+        translation_min = 0.0
+        translation_max = max(per_frame_translations.values())
         
         print(f"Slider range: {translation_min:.3f}m to {translation_max:.3f}m")
+        print(f"Total range of motion: {translation_max:.3f}m")
+        print(f"Per-frame translations computed for {len(per_frame_translations)} frames (sparse sampling)")
         
         return SliderParameters(
             direction=slider_params.direction,
             reference_point=slider_params.reference_point,
             translation_min=translation_min,
             translation_max=translation_max
-        )
-    
-
-    def _calculate_per_frame_articulation(self,
-                                        parameters: object,
-                                        inlier_trajectories: List[Trajectory3D],
-                                        joint_type: JointType) -> Dict:
-        """
-        Calculate per-frame articulation values for mapping to multi-view data.
-
-        Returns:
-            Dict with frame_idx → articulation_value mapping
-        """
-        # Group points by frame
-        frame_articulation = {}
-        
-        if joint_type == JointType.HINGE:
-            hinge_params = parameters
-            
-            # For each inlier trajectory
-            for traj in inlier_trajectories:
-                reference_point = np.array([traj.points[0].x, traj.points[0].y, traj.points[0].z])
-                
-                for frame_idx, point in enumerate(traj.points):
-                    current_point = np.array([point.x, point.y, point.z])
-                    
-                    angle = self._calculate_rotation_angle(
-                        reference_point, current_point,
-                        hinge_params.axis, hinge_params.pivot
-                    )
-                    
-                    if frame_idx not in frame_articulation:
-                        frame_articulation[frame_idx] = []
-                    frame_articulation[frame_idx].append(angle)
-            
-            # Average angles per frame
-            per_frame_values = {}
-            for frame_idx, angles in frame_articulation.items():
-                per_frame_values[frame_idx] = float(np.median(angles))
-        
-        elif joint_type == JointType.SLIDER:
-            slider_params = parameters
-            
-            for traj in inlier_trajectories:
-                reference_point = np.array([traj.points[0].x, traj.points[0].y, traj.points[0].z])
-                
-                for frame_idx, point in enumerate(traj.points):
-                    current_point = np.array([point.x, point.y, point.z])
-                    displacement = current_point - reference_point
-                    distance = np.dot(displacement, slider_params.direction)
-                    
-                    if frame_idx not in frame_articulation:
-                        frame_articulation[frame_idx] = []
-                    frame_articulation[frame_idx].append(distance)
-            
-            per_frame_values = {}
-            for frame_idx, distances in frame_articulation.items():
-                per_frame_values[frame_idx] = float(np.median(distances))
-        
-        # Normalize to [0, 1]
-        values = np.array(list(per_frame_values.values()))
-        min_val, max_val = values.min(), values.max()
-        
-        normalized = {}
-        for frame_idx, val in per_frame_values.items():
-            if max_val > min_val:
-                normalized[frame_idx] = (val - min_val) / (max_val - min_val)
-            else:
-                normalized[frame_idx] = 0.0
-        
-        return {
-            'raw_values': per_frame_values,
-            'normalized': normalized,
-            'min': float(min_val),
-            'max': float(max_val)
-        }
-
+        ), per_frame_translations
 
     def _validate_parameters(self, 
                            parameters: object,
@@ -312,12 +277,12 @@ class PostProcessor:
         quality_scores = []
         
         # Check trajectory coverage (more trajectories = better)
-        coverage_score = min(len(inlier_trajectories) / 20.0, 1.0)  # Cap at 20 trajectories
+        coverage_score = min(len(inlier_trajectories) / 20.0, 1.0)
         quality_scores.append(coverage_score)
         
         # Check temporal consistency (longer trajectories = better)
         avg_traj_length = np.mean([len(traj.points) for traj in inlier_trajectories])
-        temporal_score = min(avg_traj_length / 10.0, 1.0)  # Cap at 10 frames
+        temporal_score = min(avg_traj_length / 10.0, 1.0)
         quality_scores.append(temporal_score)
         
         # Check motion magnitude (significant motion = better)
@@ -331,7 +296,7 @@ class PostProcessor:
         
         if motion_magnitudes:
             avg_motion = np.mean(motion_magnitudes)
-            motion_score = min(avg_motion / 0.5, 1.0)  # Cap at 0.5m movement
+            motion_score = min(avg_motion / 0.5, 1.0)
             quality_scores.append(motion_score)
         
         return np.mean(quality_scores)
@@ -451,7 +416,7 @@ class PostProcessor:
                 
                 # Mark reference point
                 ax.scatter(ref_point[0], ref_point[1], ref_point[2],
-                          color='blue', s=200, marker='*', label='Pivot')
+                          color='blue', s=200, marker='*', label='Reference')
         
         # Formatting
         ax.legend()
@@ -487,8 +452,7 @@ class PostProcessor:
         plt.show()
 
 
-# Convenience functions
-def process_joint_result(result: JointEstimationResult) -> JointEstimationResult:
+def process_joint_result(result: JointEstimationResult) -> Tuple[JointEstimationResult, dict]:
     """Convenience function for post-processing joint estimation results."""
     processor = PostProcessor()
     return processor.process_result(result)

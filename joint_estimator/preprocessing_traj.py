@@ -20,7 +20,7 @@ def preprocess_trajectories(
     max_acceleration_percentile: float = 95,
     accel_threshold: float = 0.5,
     use_savgol: bool = True,
-    sample_stride: int = 21,
+    sample_stride: int = 5,
 ) -> List[Trajectory3D]:
     """
     Joint-agnostic trajectory preprocessing.
