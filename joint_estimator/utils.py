@@ -443,7 +443,7 @@ def export_joint_and_inliers_tapip3d(result, inlier_trajectories, output_dir,
                 intrinsics=intrinsics,
                 extrinsics=extrinsics,
                 image_size=image_size,
-                coordinate_convention='opengl',
+                coordinate_convention='opencv',
                 debug=False  
             )
             

@@ -57,19 +57,28 @@ class TemporalVoxelMaskGenerator:
         return metadata
     
     def load_depth_image(self, depth_path: str) -> np.ndarray:
-        """Load 16-bit depth image and convert to meters."""
-        depth_img = cv2.imread(depth_path, cv2.IMREAD_ANYDEPTH)
-        if depth_img is None:
+        """Load depth image (.npy or .png) and convert to meters."""
+        path = Path(depth_path)
+        if not path.exists():
             raise FileNotFoundError(f"Depth image not found: {depth_path}")
-        
-        # Convert to meters
+
+        if path.suffix == ".npy":
+            depth = np.load(path).astype(np.float32)
+            # Optional sanity: if values are in mm scale
+            if np.max(depth) > 100:   # e.g., 5000 → mm
+                depth = depth / 1000.0
+            return depth
+
+        depth_img = cv2.imread(str(path), cv2.IMREAD_ANYDEPTH)
+        if depth_img is None:
+            raise FileNotFoundError(f"Unable to load depth image: {path}")
+
+        # Convert to meters (uses existing config values)
         depth_meters = depth_img.astype(np.float32) / self.depth_scale
-        
-        # Clamp to valid range
         depth_meters[depth_meters < self.depth_min] = 0
         depth_meters[depth_meters > self.depth_max] = 0
-        
         return depth_meters
+
     
     def load_mask_image(self, mask_path: str) -> np.ndarray:
         """Load 2D binary mask."""
@@ -121,13 +130,19 @@ class TemporalVoxelMaskGenerator:
         y_cam = (v_valid - cy) * z_valid / fy
         z_cam = z_valid  # +Z forward
 
-        # Convert OpenCV → OpenGL convention for NeRF poses
-        # (X, Y, Z) → (X, -Y, -Z)
-        points_cam = np.stack([x_cam, -y_cam, -z_cam, np.ones_like(x_cam)], axis=1)
+        points_cam = np.stack([x_cam, y_cam, z_cam, np.ones_like(x_cam)], axis=1)
 
-        
         # Transform to world coordinates
-        points_world = (extrinsics @ points_cam.T).T[:, :3]
+        NERF_TO_OPENCV = np.array([
+            [1, 0, 0, 0],
+            [0, -1, 0, 0],
+            [0, 0, -1, 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+
+        c2w_nerf = extrinsics
+        c2w_opencv = c2w_nerf @ NERF_TO_OPENCV 
+        points_world = (c2w_opencv @ points_cam.T).T[:, :3]
         
         return points_world.astype(np.float32)
     

@@ -6,21 +6,17 @@
 ################################################################################
 
 set -e  # Exit on error
-
-
 ################################################################################
 # Configuration
 ################################################################################
 
 # Parse command line arguments
-SCENE_NAME=${1:-"prismatic_real"}
 CUDA_DEVICE=${2:-0}
 SKIP_PRECHANGE=${3:-false}  # Set to 'true' to skip pre-change processing
 SKIP_3DGS_TRAIN=${4:-false}  # Set to 'true' to skip 3DGS training
 
 # Project paths
 PROJECT_ROOT="/local/home/pmishra/cvg/arti-splatfacto"
-CD_OUTPUT_ROOT="${PROJECT_ROOT}/output_CD/${SCENE_NAME}"
 OUTPUT_FOLDER="${PROJECT_ROOT}/outputs"
 NERFSTUDIO_FOLDER="/local/home/pmishra/nerfstudio"
 
@@ -39,41 +35,37 @@ CURRENT_TIME=$(date +%Y-%m-%d_%H%M%S)
 ################################################################################
 
 PRECHANGE_DATA_DIR="data_real/day5/pre_raw"
+PRECHANGE_R3D_PATH="${PRECHANGE_DATA_DIR}/2025-10-23--14-19-03.r3d"
 PRECHANGE_OUTPUT_DIR="data_real/day5/pre"
 PRECHANGE_STRIDE=10
 PRECHANGE_START=50
 PRECHANGE_END=2200
-PRECHANGE_PC_SUBSAMPLE=4
-PRECHANGE_VOXEL_DOWNSAMPLE=0.01
+PRECHANGE_DOWNSAMPLE=2
+PRECHANGE_PC_SUBSAMPLE=8
+PRECHANGE_VOXEL_DOWNSAMPLE=0.02
 
 # Pre-trained checkpoint (update after first run)
-PRETRAINED_CONFIG="${PRECHANGE_OUTPUT_DIR}/splatfacto/qed-splatter/2025-10-30_165923/config.yml"
-CHECKPOINT_PATH="${PRECHANGE_OUTPUT_DIR}/splatfacto/qed-splatter/2025-10-30_165923/nerfstudio_models"
+PRETRAINED_CONFIG="${PRECHANGE_OUTPUT_DIR}/splatfacto/qed-splatter/2025-11-07_164416/config.yml"
+CHECKPOINT_PATH="${PRECHANGE_OUTPUT_DIR}/splatfacto/qed-splatter/2025-11-07_164416/nerfstudio_models"
 
 ################################################################################
 # Multi-view dynamic sequence parameters
 ################################################################################
 
 MULTI_DATA_DIR="data_real/day6/prism_raw"
+MULTI_R3D_PATH="${MULTI_DATA_DIR}/2025-11-04--10-55-19.r3d"
 MULTI_OUTPUT="data_real/day6/prism"
 MULTI_START=200
 MULTI_END=1500
 MULTI_STRIDE=7
-MULTI_DOWNSAMPLE=2
 MULTI_VOXEL_DOWNSAMPLE=0.02
 
-################################################################################
-# Algorithm parameters
-################################################################################
 
 NUM_RETRIEVAL=20
-RANSAC_THRESH=8.0
+RANSAC_THRESH=5.0
 BATCHSIZE_REFINEMENT=8
 MAX_QUERY_POINTS=100
 
-################################################################################
-# Helper Functions
-################################################################################
 
 print_step() {
     echo ""
@@ -104,33 +96,38 @@ check_dir_exists() {
 # if [ "$SKIP_PRECHANGE" != "true" ]; then
 #     print_step "STEP 1: Processing pre-change RGBD data"
     
-#     python scripts/export_nerf_format.py \
-#         --data_dir "$PRECHANGE_DATA_DIR" \
+#     python process_data/r3d_to_nerf.py \
+#         --r3d_data_dir "$PRECHANGE_R3D_PATH" \
 #         --output_dir "$PRECHANGE_OUTPUT_DIR" \
 #         --stride $PRECHANGE_STRIDE \
-#         --start_frame $PRECHANGE_START \
-#         --end_frame $PRECHANGE_END \
+#         --start $PRECHANGE_START \
+#         --end $PRECHANGE_END \
+#         --downsample_factor $PRECHANGE_DOWNSAMPLE \
 #         --pc_subsample $PRECHANGE_PC_SUBSAMPLE \
 #         --voxel_downsample $PRECHANGE_VOXEL_DOWNSAMPLE
     
 #     echo "✓ Pre-change data processed"
 # fi
 
-# ################################################################################
-# # STEP 2: Process Multi-View RGBD Data
-# ################################################################################
+
+# # # ################################################################################
+# # # # STEP 2: Process Multi-View RGBD Data
+# # # ################################################################################
 
 # print_step "STEP 2: Processing multi-view RGBD data"
 
-# python scripts/export_nerf_format.py \
-#     --data_dir "$MULTI_DATA_DIR" \
+# python process_data/r3d_to_nerf.py \
+#     --r3d_data_dir "$MULTI_R3D_PATH" \
 #     --output_dir "$MULTI_OUTPUT" \
 #     --stride $MULTI_STRIDE \
-#     --start_frame $MULTI_START \
-#     --end_frame $MULTI_END \
+#     --start $MULTI_START \
+#     --end $MULTI_END \
+#     --downsample_factor $PRECHANGE_DOWNSAMPLE \
 #     --voxel_downsample $MULTI_VOXEL_DOWNSAMPLE
 
 # echo "✓ Multi-view data processed"
+
+# # exit 0
 
 # ################################################################################
 # # STEP 3: HLoc Reconstruction for Pre-Change Geometry Anchoring
@@ -139,15 +136,16 @@ check_dir_exists() {
 # if [ "$SKIP_PRECHANGE" != "true" ]; then
 #     print_step "STEP 3: HLoc reconstruction for pre-change geometry"
     
-#     python scripts/hloc_reconstruct.py \
+#     python process_data/hloc_reconstruct.py \
 #         --data_dir "$PRECHANGE_OUTPUT_DIR"
     
 #     echo "✓ Pre-change HLoc reconstruction complete"
 # fi
 
-# ################################################################################
-# # STEP 4: Train Static 3DGS with Splatfacto
-# ################################################################################
+
+################################################################################
+# STEP 4: Train Static 3DGS with Splatfacto + Depth
+################################################################################
 
 # if [ "$SKIP_3DGS_TRAIN" != "true" ]; then
 #     print_step "STEP 4: Training static 3DGS with splatfacto"
@@ -163,10 +161,11 @@ check_dir_exists() {
 #         --pipeline.model.warmup_length 200 \
 #         --machine.num-devices 1 \
 #         --viewer.quit-on-train-completion True \
-#         nerfstudio-data --data "$PRECHANGE_OUTPUT_DIR/transforms_pre.json" \
+#         nerfstudio-data --data "$PRECHANGE_OUTPUT_DIR/transforms_arkit.json" \
+#         --depth_unit_scale_factor 1.0 \
 #         --auto-scale-poses=False --center-method none --orientation-method none \
 #         --load-3D-points True \
-#         --train_split_fraction 0.8
+#         --train_split_fraction 0.9 \
     
 #     echo "✓ Static 3DGS training complete"
 #     echo ""
@@ -174,22 +173,25 @@ check_dir_exists() {
 #     echo "New checkpoint should be in: $PRECHANGE_OUTPUT_DIR/splatfacto/qed-splatter/$CURRENT_TIME/"
 # fi
 
-# ################################################################################
-# # STEP 5: HLoc Localization for Multi-View Sequence
-# ################################################################################
+# # # ################################################################################
+# # # # STEP 5: HLoc Localization for Multi-View Sequence
+# # # ################################################################################
 
 # print_step "STEP 5: HLoc localization for multi-view sequence"
 
-# python scripts/hloc_localize.py \
+# python process_data/hloc_localize.py \
 #     --pre_sfm_dir "$PRECHANGE_OUTPUT_DIR/hloc_outputs" \
 #     --post_image_dir "$MULTI_OUTPUT/frames" \
-#     --old_transforms_path "$MULTI_OUTPUT/transforms_pre.json" \
-#     --new_transforms_path "$MULTI_OUTPUT/transforms_aligned.json" \
+#     --arkit_transforms_path "$MULTI_OUTPUT/transforms_arkit.json" \
+#     --new_transforms_path "$MULTI_OUTPUT/transforms_localized.json" \
 #     --num_retrieval $NUM_RETRIEVAL \
 #     --ransac_thresh $RANSAC_THRESH \
-#     --align_arkit
+#     --align_arkit \
+#     --visualize
 
 # echo "✓ Multi-view localization complete"
+# exit 0 
+
 
 # ################################################################################
 # # STEP 6: Change Detection Using DINO Features
@@ -199,21 +201,21 @@ check_dir_exists() {
 
 # # Validate required files
 # check_file_exists "$PRETRAINED_CONFIG"
-# check_file_exists "$MULTI_OUTPUT/transforms_aligned.json"
+# check_file_exists "$MULTI_OUTPUT/transforms_localized.json"
 
 # # mkdir -p "${CHANGE_OUTPUT}"
 
-# python change_det/change_detection_dino.py \
+# python change_det/change_detection_sam.py \
 #     --config "${PRETRAINED_CONFIG}" \
 #     --output "${MULTI_OUTPUT}" \
-#     --transform "${MULTI_OUTPUT}/transforms_aligned.json" \
+#     --transform "${MULTI_OUTPUT}/transforms_localized.json" \
 #     --debug
 
 # echo "✓ Change detection complete"
 
-################################################################################
-# STEP 7: SAM2 Video Object Segmentation
-################################################################################
+# ################################################################################
+# # STEP 7: SAM2 Video Object Segmentation
+# ################################################################################
 
 print_step "STEP 7: Generating SAM2 masks via video object segmentation"
 
@@ -248,42 +250,6 @@ OUTPUT_MASK_DIR="${MULTI_OUTPUT}/mask"
 # echo "✓ SAM2 mask generation complete"
 # conda deactivate
 
-# ################################################################################
-# # STEP 8: TAPIP3D Trajectory Extraction
-# ################################################################################
-
-# print_step "STEP 8: Extracting 3D point trajectories with TAPIP3D"
-
-# # Check if mask exists
-# FIRST_MASK="${OUTPUT_MASK_DIR}/frame_00001.png"
-# check_file_exists "$FIRST_MASK"
-
-# CONDA_ENV="tapip3d"
-# if [ -z "${CONDA_EXE:-}" ]; then
-#     echo "🔍 Locating conda base..."
-#     CONDA_BASE=$(conda info --base)
-#     source "$CONDA_BASE/etc/profile.d/conda.sh"
-# else
-#     CONDA_BASE=$(dirname $(dirname "$CONDA_EXE"))
-#     source "$CONDA_BASE/etc/profile.d/conda.sh"
-# fi
-
-# echo "🔧 Activating conda environment: $CONDA_ENV"
-# conda activate "$CONDA_ENV"
-
-# TAPIP3D_DIR="/local/home/pmishra/cvg/TAPIP3D"
-
-# python "$TAPIP3D_DIR/inference_nerf_mask.py" \
-#     --input_path "${MULTI_OUTPUT}/transforms_aligned.json" \
-#     --mask_path "$FIRST_MASK" \
-#     --max_query_points $MAX_QUERY_POINTS
-
-# echo "✓ TAPIP3D trajectory extraction complete"
-
-
-
-
-
 ################################################################################
 # STEP 8: TAPIP3D Inference
 ################################################################################
@@ -291,7 +257,7 @@ OUTPUT_MASK_DIR="${MULTI_OUTPUT}/mask"
 
 TAPIP3D_DIR="/local/home/pmishra/cvg/TAPIP3D"
 TAPIP3D_OUTPUT_DIR="${MULTI_OUTPUT}/tapip3d/"
-TRANSFORMS_PATH="${MULTI_OUTPUT}/transforms_aligned.json"
+TRANSFORMS_PATH="${MULTI_OUTPUT}/transforms_localized.json"
 MASK_SAMPLE="${OUTPUT_MASK_DIR}/frame_00001.png"
 
 check_file_exists "$MASK_SAMPLE"
@@ -312,7 +278,7 @@ set +u
 conda activate "$CONDA_ENV"
 set -u
 
-TRANSFORMS_PATH=$(realpath "$MULTI_OUTPUT/transforms_aligned.json")
+TRANSFORMS_PATH=$(realpath "$MULTI_OUTPUT/transforms_localized.json")
 MASK_SAMPLE=$(realpath "$OUTPUT_MASK_DIR/frame_00001.png")
 TAPIP_OUTPUT_DIR=$(realpath "$MULTI_OUTPUT/tapip3d")
 # mkdir -p "$TAPIP_OUTPUT_DIR"
@@ -324,14 +290,6 @@ TAPIP_OUTPUT_DIR=$(realpath "$MULTI_OUTPUT/tapip3d")
 #     --mask_path "$MASK_SAMPLE" \
 #     --output_dir "$TAPIP_OUTPUT_DIR" \
 #     --max_query_points $MAX_QUERY_POINTS
-
-
-
-
-### to visulalize results, run:
-# python visualize.py from TAPIP3D_DIR with RESULT_FILE as input
-
-
 
 
 ################################################################################
@@ -361,31 +319,31 @@ JOINT_OUTPUT_DIR="${MULTI_OUTPUT}/ransac_joints"
 # mkdir -p "$JOINT_OUTPUT_DIR"
 
 
-python joint_estimator/main.py \
-    --tapip3d_result "$TAPIP_OUTPUT_DIR" \
-    --out_dir "$JOINT_OUTPUT_DIR" \
-    --camera_metadata "$TRANSFORMS_PATH" \
-    --data_dir "$MULTI_OUTPUT" \
-    --use_temp
+# python joint_estimator/main.py \
+#     --tapip3d_result "$TAPIP_OUTPUT_DIR" \
+#     --out_dir "$JOINT_OUTPUT_DIR" \
+#     --camera_metadata "$TRANSFORMS_PATH" \
+#     --data_dir "$MULTI_OUTPUT" \
+#     --use_temp
 
-echo "✓ 4D RANSAC joint discovery complete: $JOINT_OUTPUT_DIR"
+# echo "✓ 4D RANSAC joint discovery complete: $JOINT_OUTPUT_DIR"
 
-################################################################################
-# STEP 10: Merge Articulation Data into Transforms
-################################################################################
+# ################################################################################
+# # STEP 10: Merge Articulation Data into Transforms
+# ################################################################################
 
-print_step "STEP 10: Merging articulation data into transforms"
+# print_step "STEP 10: Merging articulation data into transforms"
 
-python joint_estimator/merge_arti_data.py \
-    --joint_schemas "${JOINT_OUTPUT_DIR}/joint_schemas.json" \
-    --transforms_post "${MULTI_OUTPUT}/transforms_aligned.json" \
-    --output "${MULTI_OUTPUT}/transforms_post.json" \
-    --use_masks
+# python joint_estimator/merge_arti_data.py \
+#     --joint_schemas "${JOINT_OUTPUT_DIR}/joint_schemas.json" \
+#     --transforms_post "${MULTI_OUTPUT}/transforms_localized.json" \
+#     --output "${MULTI_OUTPUT}/transforms_post.json" \
+#     --use_masks
 
-echo "✓ Articulation data merged"
+# echo "✓ Articulation data merged"
 
 
-exit 0
+# exit 0
 
 ################################################################################
 # STEP 11: Train Articulated Splatfacto
@@ -395,7 +353,7 @@ print_step "STEP 11: Training articulated splatfacto model"
 
 
 TRANSFORM_JSON="${MULTI_OUTPUT}/transforms_post.json"
-OBJ_MASK_FILE="${MULTI_OUTPUT}/tapip/obj_masks/obj_${Joint_type}.pt"
+OBJ_MASK_FILE="${MULTI_OUTPUT}/ransac_joints/obj_masks/obj_prismatic.pt"
 
 ns-train arti_splatfacto \
     --vis viewer \
@@ -414,7 +372,8 @@ ns-train arti_splatfacto \
     --auto-scale-poses=False \
     --center-method none \
     --orientation-method none \
-    --train_split_fraction 0.9
+    --train_split_fraction 0.9 \
+    --depth_unit_scale_factor 1.0
 
 echo "✓ Articulated splatfacto training complete"
 

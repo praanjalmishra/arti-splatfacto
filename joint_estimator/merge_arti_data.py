@@ -1,229 +1,234 @@
 """
-Merge articulation priors from 4D RANSAC with multi-view transforms.
-
-Takes:
-  - joint_schemas.json (from RANSAC: axis, pivot, per-frame θ)
-  - multiview/transforms_post.json (camera poses + timestamps)
-  
-Outputs:
-  - multiview/transforms_articulated.json (merged format for training)
+Merge joint_schemas.json and transforms_post.json into ArtiSplatfacto format.
 
 Usage:
-    python merge_articulation_data.py \
-        --joint_schemas output/joint_schemas.json \
-        --multiview_transforms dataset/sync_data/multiview/transforms_post.json \
-        --output dataset/sync_data/multiview/transforms_articulated.json
+    python merge_arti_data.py \
+        --joint_schemas dataset/sync_data/joint_schemas.json \
+        --transforms_post dataset/sync_data/multiview/transforms_post.json \
+        --output dataset/sync_data/multiview/transforms.json \
+        --mask_dir dataset/sync_data/multiview/masks
 """
 
-import json
 import argparse
-from pathlib import Path
+import json
 import numpy as np
+from pathlib import Path
+from typing import Dict, List
 
 
-def load_joint_schemas(path: str) -> dict:
-    """Load joint parameters from RANSAC output."""
-    with open(path, 'r') as f:
-        data = json.load(f)
-    
-    if isinstance(data, list) and len(data) > 0:
-        return data[0]  # Take first joint
-    return data
-
-
-def load_transforms(path: str) -> dict:
-    """Load camera transforms JSON."""
-    with open(path, 'r') as f:
-        return json.load(f)
-
-
-def interpolate_articulation(time_val: float, per_frame_data: dict) -> float:
+def interpolate_joint_angle(time: float, per_frame_data: Dict[int, float], 
+                            n_temporal_steps: int) -> float:
     """
-    Interpolate articulation value for a given timestamp.
+    Interpolate joint angle/translation for a given normalized time [0,1].
     
     Args:
-        time_val: Normalized time in [0, 1]
-        per_frame_data: Dict with 'normalized' frame_idx -> theta mapping
-    
+        time: Normalized time in [0,1]
+        per_frame_data: Dict mapping frame_idx to angle/translation
+        n_temporal_steps: Total number of temporal steps in video sequence
+        
     Returns:
-        Interpolated theta value
+        Interpolated joint angle/translation
     """
-    normalized = per_frame_data['normalized']
-    frame_indices = sorted([int(k) for k in normalized.keys()])
-    
-    if not frame_indices:
+    if not per_frame_data:
         return 0.0
     
-    # Map time [0,1] to frame index
-    max_frame = frame_indices[-1]
-    target_frame = time_val * max_frame
+    # Map normalized time to frame index
+    frame_float = time * (n_temporal_steps - 1)
+    frame_idx = int(np.round(frame_float))
+    
+    # Clamp to valid range
+    frame_idx = max(0, min(frame_idx, n_temporal_steps - 1))
+    
+    # Get value at this frame (or interpolate if needed)
+    if frame_idx in per_frame_data:
+        return per_frame_data[frame_idx]
+    
+    # Linear interpolation between nearest frames
+    sorted_frames = sorted(per_frame_data.keys())
     
     # Find surrounding frames
-    lower_idx = int(np.floor(target_frame))
-    upper_idx = int(np.ceil(target_frame))
+    lower_frame = max([f for f in sorted_frames if f <= frame_idx], default=sorted_frames[0])
+    upper_frame = min([f for f in sorted_frames if f >= frame_idx], default=sorted_frames[-1])
     
-    # Clamp to available frames
-    lower_idx = max(min(lower_idx, max_frame), 0)
-    upper_idx = max(min(upper_idx, max_frame), 0)
-    
-    # Get theta values
-    theta_lower = normalized.get(str(lower_idx), 0.0)
-    theta_upper = normalized.get(str(upper_idx), 0.0)
+    if lower_frame == upper_frame:
+        return per_frame_data[lower_frame]
     
     # Linear interpolation
-    if lower_idx == upper_idx:
-        return theta_lower
-    
-    alpha = target_frame - lower_idx
-    return (1 - alpha) * theta_lower + alpha * theta_upper
+    alpha = (frame_idx - lower_frame) / (upper_frame - lower_frame)
+    return per_frame_data[lower_frame] * (1 - alpha) + per_frame_data[upper_frame] * alpha
 
 
-def create_articulated_transforms(joint_data: dict, 
-                                 multiview_data: dict,
-                                 mask_dir: str = None) -> dict:
+def merge_transforms(joint_schemas_path: str, transforms_post_path: str, 
+                     output_path: str, mask_dir: bool) -> None:
     """
-    Merge joint parameters with multi-view transforms.
+    Merge joint schemas and multi-view transforms into ArtiSplatfacto format.
     
     Args:
-        joint_data: Joint parameters from RANSAC
-        multiview_data: Multi-view camera transforms
-        mask_dir: Optional directory for mask files
-    
-    Returns:
-        Merged transform data in articulated format
+        joint_schemas_path: Path to joint_schemas.json from 4D RANSAC
+        transforms_post_path: Path to transforms_post.json from multi-view capture
+        output_path: Path to save merged transforms.json
+        mask_dir: Optional directory containing mask files
     """
-    # Extract articulation metadata
-    articulation_metadata = {
-        "joint_type": joint_data["joint_type"],
-        "joint_axis": joint_data["joint_axis"],
-        "joint_pivot": joint_data["joint_pivot"],
-        "joint_limits": joint_data["joint_limits"]
+    # Load input files
+    with open(joint_schemas_path, 'r') as f:
+        joint_schemas = json.load(f)
+    
+    with open(transforms_post_path, 'r') as f:
+        transforms_post = json.load(f)
+    
+    print(f"Loaded {len(joint_schemas)} joint schemas")
+    print(f"Loaded {len(transforms_post['frames'])} multi-view frames")
+    
+    output = {
+        "camera_model": transforms_post.get("camera_model", "PINHOLE"),
+        "fl_x": transforms_post["fl_x"],
+        "fl_y": transforms_post["fl_y"],
+        "cx": transforms_post["cx"],
+        "cy": transforms_post["cy"],
+        "w": transforms_post["w"],
+        "h": transforms_post["h"],
+        "k1": transforms_post.get("k1", 0.0),
+        "k2": transforms_post.get("k2", 0.0),
+        "p1": transforms_post.get("p1", 0.0),
+        "p2": transforms_post.get("p2", 0.0),
     }
     
-    # Check if per-frame articulation exists
-    has_per_frame = "per_frame_articulation" in joint_data
-    per_frame_data = joint_data.get("per_frame_articulation", {})
+    if "ply_file_path" in transforms_post:
+        output["ply_file_path"] = transforms_post["ply_file_path"]
     
-    # Process each frame
-    articulated_frames = []
-    
-    for frame in multiview_data["frames"]:
-        time_val = frame.get("time", 0.0)
+    # Build articulation block from joint schemas
+    articulations = []
+    for joint in joint_schemas:
+        joint_type = joint["joint_type"]
         
-        # Get or interpolate articulation value
-        if has_per_frame and per_frame_data:
-            theta = interpolate_articulation(time_val, per_frame_data)
-        else:
-            # Fallback: use joint_angle if present
-            theta = frame.get("joint_angle", 0.0)
-        
-        # Create new frame entry
-        new_frame = {
-            "file_path": frame["file_path"],
-            "transform_matrix": frame["transform_matrix"],
-            "articulation_value": round(theta, 6)
+        articulation = {
+            "joint_type": joint_type,
+            "joint_axis": joint["joint_axis"],
+            "joint_pivot": joint["joint_pivot"],
         }
         
-        # Add depth if present
-        if "depth_file_path" in frame:
-            new_frame["depth_file_path"] = frame["depth_file_path"]
+        # Add limits if present
+        if "joint_limits" in joint and joint["joint_limits"][0] is not None:
+            articulation["joint_limits"] = joint["joint_limits"]
         
-        # Add mask path if directory provided
+        # Extract per-frame data for interpolation
+        if joint_type == "revolute":
+            per_frame_key = "per_frame_angles"
+        else:
+            per_frame_key = "per_frame_translations"
+
+        per_frame_data = joint.get(per_frame_key, {})
+
+        # Convert string keys to int
+        per_frame_data = {int(k): v for k, v in per_frame_data.items()}
+
+        # If revolute, convert from degrees → radians and round
+        if joint_type == "revolute":
+            per_frame_data = {k: round(np.radians(v), 4) for k, v in per_frame_data.items()}
+
+        articulation["_per_frame_data"] = per_frame_data  # Store for interpolation
+        articulations.append(articulation)
+
+    
+    output["articulations"] = articulations
+    
+    # Determine number of temporal steps from per-frame data
+    n_temporal_steps = 0
+    for art in articulations:
+        if art["_per_frame_data"]:
+            n_temporal_steps = max(n_temporal_steps, max(art["_per_frame_data"].keys()) + 1)
+    
+    if n_temporal_steps == 0:
+        print("Warning: No per-frame data found, using default temporal steps")
+        n_temporal_steps = 10
+    
+    print(f"Detected {n_temporal_steps} temporal steps from joint schemas")
+    
+    # Process frames
+    output_frames = []
+    n_frames = len(transforms_post["frames"])
+
+    for i, frame_data in enumerate(transforms_post["frames"]):
+        # Copy base frame data
+        output_frame = {
+            "file_path": frame_data["file_path"],
+            "transform_matrix": frame_data["transform_matrix"],
+        }
+
+        if "depth_file_path" in frame_data:
+            output_frame["depth_file_path"] = frame_data["depth_file_path"]
+
+        # Derive normalized time based on frame index (if no explicit "time")
+        time = frame_data.get("time", i / (n_frames - 1) if n_frames > 1 else 0.0)
+        output_frame["time"] = time
+
+        if "joint_angle" in frame_data:
+            output_frame["joint_angle_gt"] = frame_data["joint_angle"]
+
+        # Interpolate joint angles
+        joint_angles = []
+        for articulation in articulations:
+            per_frame_data = articulation["_per_frame_data"]
+            interpolated_value = interpolate_joint_angle(time, per_frame_data, n_temporal_steps)
+            interpolated_value = round(interpolated_value, 3)
+            joint_angles.append(interpolated_value)
+
+        output_frame["joint_angle"] = joint_angles[0] if len(joint_angles) == 1 else joint_angles
+
         if mask_dir:
-            # Assume mask has same name as RGB
-            rgb_name = Path(frame["file_path"]).name
-            mask_name = rgb_name.replace(".png", "_mask.png")
-            new_frame["mask_file_path"] = f"{mask_dir}/{mask_name}"
-        
-        articulated_frames.append(new_frame)
-    
-    # Build output structure
-    output = {
-        "camera_model": multiview_data.get("camera_model", "OPENCV"),
-        "fl_x": multiview_data["fl_x"],
-        "fl_y": multiview_data["fl_y"],
-        "cx": multiview_data["cx"],
-        "cy": multiview_data["cy"],
-        "w": multiview_data["w"],
-        "h": multiview_data["h"],
-        "k1": multiview_data.get("k1", 0.0),
-        "k2": multiview_data.get("k2", 0.0),
-        "p1": multiview_data.get("p1", 0.0),
-        "p2": multiview_data.get("p2", 0.0),
-        "articulation": articulation_metadata,
-        "frames": articulated_frames
-    }
-    
-    # Add PLY path if present
-    if "ply_file_path" in multiview_data:
-        output["ply_file_path"] = multiview_data["ply_file_path"]
-    
-    return output
+            frame_name = Path(frame_data["file_path"]).name
+            frame_name = Path(frame_name).with_suffix(".png")
+            output_frame["mask_file_path"] = str(Path("mask") / frame_name)
 
+        output_frames.append(output_frame)
 
-def print_summary(output_data: dict):
-    """Print summary of merged data."""
-    print("\n" + "="*60)
-    print("ARTICULATED TRANSFORMS SUMMARY")
-    print("="*60)
     
-    articulation = output_data["articulation"]
-    print(f"Joint Type: {articulation['joint_type']}")
-    print(f"Joint Axis: {articulation['joint_axis']}")
-    print(f"Joint Pivot: {articulation['joint_pivot']}")
-    print(f"Joint Limits: {articulation['joint_limits']}")
+    output["frames"] = output_frames
     
-    print(f"\nTotal Frames: {len(output_data['frames'])}")
+    # Remove temporary per-frame data from articulations
+    for art in output["articulations"]:
+        art.pop("_per_frame_data", None)
     
-    # Articulation value statistics
-    theta_values = [f["articulation_value"] for f in output_data["frames"]]
-    print(f"Articulation Range: [{min(theta_values):.3f}, {max(theta_values):.3f}]")
-    print(f"Unique Values: {len(set(theta_values))}")
+    # Save merged output
+    with open(output_path, 'w') as f:
+        json.dump(output, f, indent=2)
     
-    # Check for masks
-    has_masks = any("mask_file_path" in f for f in output_data["frames"])
-    print(f"Mask Files: {'Yes' if has_masks else 'No'}")
+    print(f"\n=== MERGE COMPLETE ===")
+    print(f"Output: {output_path}")
+    print(f"Frames: {len(output_frames)}")
+    print(f"Articulations: {len(articulations)}")
+    print(f"Time range: [{min(f['time'] for f in output_frames):.3f}, {max(f['time'] for f in output_frames):.3f}]")
     
-    # Check for depth
-    has_depth = any("depth_file_path" in f for f in output_data["frames"])
-    print(f"Depth Files: {'Yes' if has_depth else 'No'}")
-    
-    print("="*60 + "\n")
+    # Print joint angle statistics
+    for i, art in enumerate(articulations):
+        angles = [f["joint_angle"] if isinstance(f["joint_angle"], float) else f["joint_angle"][i] 
+                  for f in output_frames]
+        print(f"\nJoint {i} ({art['joint_type']}):")
+        print(f"  Range: [{min(angles):.4f}, {max(angles):.4f}]")
+        if art["joint_type"] == "revolute":
+            print(f"  Range (degrees): [{np.degrees(min(angles)):.1f}°, {np.degrees(max(angles)):.1f}°]")
+        else:
+            print(f"  Range (meters): [{min(angles):.3f}m, {max(angles):.3f}m]")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Merge articulation priors with multi-view transforms"
+        description="Merge joint schemas and multi-view transforms for ArtiSplatfacto"
     )
     
+    parser.add_argument("--joint_schemas", type=str, required=True,
+                       help="Path to joint_schemas.json from 4D RANSAC")
+    parser.add_argument("--transforms_post", type=str, required=True,
+                       help="Path to transforms_post.json from multi-view capture")
+    parser.add_argument("--output", type=str, required=True,
+                       help="Path to save merged transforms.json")
     parser.add_argument(
-        "--joint_schemas",
-        type=str,
-        required=True,
-        help="Path to joint_schemas.json from RANSAC"
+        "--use_masks",
+        action="store_true",
+        help="If set, include masks alongside frames"
     )
-    
-    parser.add_argument(
-        "--multiview_transforms",
-        type=str,
-        required=True,
-        help="Path to multiview transforms_post.json"
-    )
-    
-    parser.add_argument(
-        "--output",
-        type=str,
-        required=True,
-        help="Output path for merged transforms_articulated.json"
-    )
-    
-    parser.add_argument(
-        "--mask_dir",
-        type=str,
-        default=None,
-        help="Directory containing mask files (optional)"
-    )
-    
+
+
     args = parser.parse_args()
     
     # Validate inputs
@@ -231,35 +236,20 @@ def main():
         print(f"Error: Joint schemas not found: {args.joint_schemas}")
         return 1
     
-    if not Path(args.multiview_transforms).exists():
-        print(f"Error: Transforms not found: {args.multiview_transforms}")
+    if not Path(args.transforms_post).exists():
+        print(f"Error: Transforms not found: {args.transforms_post}")
         return 1
     
-    print("Loading data...")
-    joint_data = load_joint_schemas(args.joint_schemas)
-    multiview_data = load_transforms(args.multiview_transforms)
+    # Create output directory
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     
-    print(f"Loaded {len(multiview_data['frames'])} frames")
-    print(f"Joint type: {joint_data['joint_type']}")
-    
-    print("\nMerging articulation data...")
-    output_data = create_articulated_transforms(
-        joint_data=joint_data,
-        multiview_data=multiview_data,
-        mask_dir=args.mask_dir
+    # Merge transforms
+    merge_transforms(
+        joint_schemas_path=args.joint_schemas,
+        transforms_post_path=args.transforms_post,
+        output_path=args.output,
+        mask_dir=args.use_masks
     )
-    
-    # Save output
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(output_path, 'w') as f:
-        json.dump(output_data, f, indent=2)
-    
-    print(f"\nSaved to: {output_path}")
-    
-    # Print summary
-    print_summary(output_data)
     
     return 0
 

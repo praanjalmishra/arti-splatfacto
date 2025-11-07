@@ -1,23 +1,6 @@
 """
-R3D to NeRF Format Converter with Anchored Alignment
+R3D to NeRF Format Converter
 
-This script converts Record3D (.r3d) captures to NeRF/3DGS format with support for:
-1. Frame subsampling (stride, start, end)
-2. Coordinate system conversion (ARKit -> NeRF/COLMAP)
-3. Anchored alignment to pre-change reference model
-4. Point cloud generation for visualization
-
-Output structure:
-dataset_root/
- ├── frames/
- │    ├── frame_00001.jpg
- │    ├── frame_00002.jpg
- │    └── ...
- ├── depth/
- │    ├── frame_00001.png (16-bit depth in mm)
- │    ├── frame_00002.png
- │    └── ...
- └── transforms.json (NeRF format with camera parameters)
 """
 
 import argparse
@@ -34,31 +17,13 @@ from tqdm import tqdm
 import open3d as o3d
 
 from data_utils import get_posed_rgbd_dataset, get_xyz
-from dataset_class import PosedRGBDItem, R3DDataset
-
-
-def arkit_to_nerf_transform() -> np.ndarray:
-    """
-    Convert ARKit coordinate system to NeRF/COLMAP coordinate system.
-    
-    ARKit: +X right, +Y up, +Z backward (right-handed)
-    NeRF/COLMAP: +X right, +Y down, +Z forward (right-handed)
-    
-    Transformation: Rotate 180° around X-axis
-    """
-    return np.array([
-        [1,  0,  0, 0],
-        [0, -1,  0, 0],
-        [0,  0, -1, 0],
-        [0,  0,  0, 1]
-    ], dtype=np.float64)
+from dataset_class import R3DDataset
 
 
 def pose_to_nerf_matrix(pose: np.ndarray) -> np.ndarray:
-    """Convert OpenCV-style (R3DDataset) camera pose to NeRF/Blender-style pose."""
-    # 180° rotation around X axis (flip Y and Z)
+    """Convert OpenCV-style (R3DDataset) camera pose to OpenGL-style pose."""
     R_flip = np.diag([1, -1, -1, 1])
-    nerf_pose = pose @ R_flip   # post-multiply for camera-to-world
+    nerf_pose = pose @ R_flip  
     return nerf_pose
 
 
@@ -70,8 +35,8 @@ def create_transforms_json(
     camera_angle_x: Optional[float] = None
 ) -> Dict[str, Any]:
     """
-    Create transforms.json in NeRF format.
-    
+    Create transforms_arkit.json in NeRF format.
+
     Args:
         dataset: R3D dataset
         frame_indices: List of frame indices to include
@@ -81,25 +46,21 @@ def create_transforms_json(
     Returns:
         Dictionary containing transform data
     """
-    # Get intrinsics from first frame
     sample_item = dataset[frame_indices[0]]
     intrinsics = sample_item.intrinsics.numpy()
     
-    # Extract camera parameters
     fx = intrinsics[0, 0]
     fy = intrinsics[1, 1]
     cx = intrinsics[0, 2]
     cy = intrinsics[1, 2]
     
-    # Get image dimensions
     _, h, w = sample_item.image.shape
     
-    # Calculate camera_angle_x (horizontal FOV) if not provided
     if camera_angle_x is None:
         camera_angle_x = 2 * np.arctan(w / (2 * fx))
     
-    # Initialize transforms dictionary
     transforms = {
+        "camera_model": "PINHOLE",
         "camera_angle_x": float(camera_angle_x),
         "fl_x": float(fx),
         "fl_y": float(fy),
@@ -107,23 +68,20 @@ def create_transforms_json(
         "cy": float(cy),
         "w": int(w),
         "h": int(h),
-        "frames": [],
-        "ply_file_path": "fused_pc.ply"
+        "ply_file_path": "fused_pc.ply",
+        "frames": []
     }
-    
-    # Add each frame
-    for idx in tqdm(frame_indices, desc="Creating transforms.json"):
+
+    for idx in tqdm(frame_indices, desc="Creating transforms_arkit.json"):
         item = dataset[idx]
         pose = item.pose.numpy()
         
-        # Convert to NeRF coordinate system
         nerf_pose = pose_to_nerf_matrix(pose)
         
-        # Create frame entry
         frame_number = frame_indices.index(idx) + 1
         frame_entry = {
             "file_path": f"frames/frame_{frame_number:05d}.jpg",
-            "depth_file_path": f"depth/frame_{frame_number:05d}.png",
+            "depth_file_path": f"depth/frame_{frame_number:05d}.npy",
             "transform_matrix": nerf_pose.tolist(),
             # "original_index": int(idx)
         }
@@ -137,7 +95,8 @@ def export_frames_and_depth(
     dataset: R3DDataset,
     frame_indices: List[int],
     output_dir: Path,
-    depth_scale: float = 1000.0
+    # depth_scale: float = 1000.0,
+    # save_npy: bool = True,
 ):
     """
     Export RGB frames and depth maps.
@@ -158,103 +117,105 @@ def export_frames_and_depth(
         item = dataset[idx]
         frame_number = frame_indices.index(idx) + 1
         
-        # Export RGB frame
         rgb_image = item.image.permute(1, 2, 0).numpy()
         rgb_image = (rgb_image * 255).astype(np.uint8)
         rgb_pil = Image.fromarray(rgb_image)
         rgb_path = frames_dir / f"frame_{frame_number:05d}.jpg"
         rgb_pil.save(rgb_path, quality=95)
         
-        # Export depth map (16-bit PNG in millimeters)
         depth = item.depth.squeeze(0).numpy()
         
-        # Convert to millimeters and handle invalid depths
-        depth_mm = depth * depth_scale
-        depth_mm[depth < 0] = 0  # Set invalid depths to 0
-        depth_mm = np.clip(depth_mm, 0, 65535)  # Clip to 16-bit range
-        depth_uint16 = depth_mm.astype(np.uint16)
+        # Save as .npy (metric depth in meters)
+        depth_npy_path = depth_dir / f"frame_{frame_number:05d}.npy"
+        np.save(depth_npy_path, depth)
+    
+        # # Also save PNG for visualization (optional)
+        # depth_mm = depth * depth_scale
+        # depth_mm[depth < 0] = 0
+        # depth_mm = np.clip(depth_mm, 0, 65535)
+        # depth_uint16 = depth_mm.astype(np.uint16)
         
-        depth_pil = Image.fromarray(depth_uint16, mode='I;16')
-        depth_path = depth_dir / f"frame_{frame_number:05d}.png"
-        depth_pil.save(depth_path)
-
+        # depth_pil = Image.fromarray(depth_uint16, mode='I;16')
+        # depth_path = depth_dir / f"frame_{frame_number:05d}.png"
+        # depth_pil.save(depth_path)
 
 def generate_point_cloud(
-    dataset: R3DDataset,
+    dataset,
     frame_indices: List[int],
     output_path: Path,
     subsample_ratio: float = 0.1,
-    voxel_size: float = 0.01
+    voxel_size: float = 0.01,
+    batch_size: int = 50,
 ):
     """
-    Generate and save a fused point cloud from selected frames.
-    
+    Generate and save a fused point cloud from selected frames, safely and efficiently.
+
     Args:
         dataset: R3D dataset
         frame_indices: List of frame indices to use
         output_path: Output path for PLY file
         subsample_ratio: Ratio of points to keep per frame (0-1)
         voxel_size: Voxel size for downsampling
+        batch_size: Number of frames to fuse before intermediate downsampling
     """
-    all_points = []
-    all_colors = []
-    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     print(f"Generating point cloud from {len(frame_indices)} frames...")
-    
-    for idx in tqdm(frame_indices, desc="Processing frames for point cloud"):
+    all_pcd = o3d.geometry.PointCloud()
+
+    batch_points = []
+    batch_colors = []
+
+    for i, idx in enumerate(tqdm(frame_indices, desc="Processing frames")):
         item = dataset[idx]
-        
-        # Get XYZ coordinates
+
         depth = item.depth.unsqueeze(0)
         mask = item.mask.unsqueeze(0)
         pose = item.pose.unsqueeze(0)
         intrinsics = item.intrinsics.unsqueeze(0)
-        
-        xyz = get_xyz(depth, mask, pose, intrinsics)
-        xyz = xyz.squeeze(0)  # (H, W, 3)
-        
-        # Get RGB colors
-        rgb = item.image.permute(1, 2, 0)  # (H, W, 3)
-        
-        # Create subsample mask
-        valid_mask = ~mask.squeeze(0).squeeze(0)  # (H, W)
-        
+
+        xyz = get_xyz(depth, mask, pose, intrinsics).squeeze(0)
+        rgb = item.image.permute(1, 2, 0)
+
+        valid_mask = ~mask.squeeze(0).squeeze(0)
         if subsample_ratio < 1.0:
-            subsample_mask = torch.rand(valid_mask.shape) < subsample_ratio
+            subsample_mask = torch.rand(valid_mask.shape, device=valid_mask.device) < subsample_ratio
             valid_mask = valid_mask & subsample_mask
-        
-        # Extract valid points
+
         valid_points = xyz[valid_mask].cpu().numpy()
         valid_colors = rgb[valid_mask].cpu().numpy()
-        
-        if len(valid_points) > 0:
-            all_points.append(valid_points)
-            all_colors.append(valid_colors)
-    
-    if not all_points:
-        print("Warning: No valid points found!")
-        return
-    
-    # Concatenate all points
-    points = np.vstack(all_points)
-    colors = np.vstack(all_colors)
-    
-    print(f"Total points before downsampling: {len(points):,}")
-    
-    # Create Open3D point cloud
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    pcd.colors = o3d.utility.Vector3dVector(colors)
-    
-    # Voxel downsampling
+
+        if len(valid_points) == 0:
+            continue
+
+        batch_points.append(valid_points)
+        batch_colors.append(valid_colors)
+
+        if (i + 1) % batch_size == 0 or (i + 1) == len(frame_indices):
+            pts = np.vstack(batch_points)
+            cols = np.vstack(batch_colors)
+            batch_points.clear()
+            batch_colors.clear()
+
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(pts)
+            pcd.colors = o3d.utility.Vector3dVector(cols)
+
+            if voxel_size > 0:
+                pcd = pcd.voxel_down_sample(voxel_size)
+
+            all_pcd += pcd  # merge
+            del pcd, pts, cols
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # Final downsampling
     if voxel_size > 0:
-        print(f"Downsampling with voxel size {voxel_size}...")
-        pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
-        print(f"Points after downsampling: {len(pcd.points):,}")
-    
-    # Save point cloud
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    o3d.io.write_point_cloud(str(output_path), pcd)
+        print(f"Final voxel downsampling with size {voxel_size}...")
+        all_pcd = all_pcd.voxel_down_sample(voxel_size)
+
+    print(f"Final point count: {len(all_pcd.points):,}")
+
+    o3d.io.write_point_cloud(str(output_path), all_pcd)
     print(f"Point cloud saved to {output_path}")
 
 
@@ -267,7 +228,8 @@ def convert_r3d_to_nerf(
     downsample_factor: Union[int, float] = 1,
     pc_subsample: float = 0.1,
     voxel_downsample: float = 0.01,
-    generate_pc: bool = True
+    generate_pc: bool = True,
+    use_depth_shape: bool = False,
 ):
     """
     Main conversion function.
@@ -283,12 +245,11 @@ def convert_r3d_to_nerf(
         generate_pc: Whether to generate point cloud
     """
     print(f"Loading R3D dataset from {data_path}...")
-    dataset = get_posed_rgbd_dataset(key='r3d', path=str(data_path), use_depth_shape=False, downsample_factor=downsample_factor)
+    dataset = get_posed_rgbd_dataset(key='r3d', path=str(data_path), use_depth_shape=use_depth_shape, downsample_factor=downsample_factor)
     
     total_frames = len(dataset)
     print(f"Total frames in dataset: {total_frames}")
     
-    # Determine frame indices to process
     if end_frame is None:
         end_frame = total_frames
     else:
@@ -297,18 +258,15 @@ def convert_r3d_to_nerf(
     frame_indices = list(range(start_frame, end_frame, stride))
     print(f"Processing {len(frame_indices)} frames (stride={stride}, start={start_frame}, end={end_frame})")
     
-    # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Export frames and depth
     print("\n=== Exporting frames and depth maps ===")
     export_frames_and_depth(dataset, frame_indices, output_dir)
     
-    # Create transforms.json
-    print("\n=== Creating transforms.json ===")
+    # print("\n=== Creating transforms.json ===")
     transforms = create_transforms_json(dataset, frame_indices, output_dir)
     
-    transforms_path = output_dir / "transforms.json"
+    transforms_path = output_dir / "transforms_arkit.json"
     with open(transforms_path, 'w') as f:
         json.dump(transforms, f, indent=2)
     print(f"Transforms saved to {transforms_path}")
@@ -325,7 +283,6 @@ def convert_r3d_to_nerf(
             voxel_size=voxel_downsample
         )
     
-    # Save metadata
     metadata = {
         "source_file": str(data_path),
         "total_frames": total_frames,
@@ -340,10 +297,6 @@ def convert_r3d_to_nerf(
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2)
     
-    print(f"\n✓ Conversion complete! Output saved to {output_dir}")
-    print(f"  - {len(frame_indices)} RGB frames in ./frames/")
-    print(f"  - {len(frame_indices)} depth maps in ./depth/")
-    print(f"  - Camera parameters in ./transforms.json")
     if generate_pc:
         print(f"  - Point cloud in ./fused_pc.ply")
 
@@ -353,7 +306,7 @@ def main():
         description="Convert Record3D (.r3d) to NeRF format with anchoring support"
     )
     parser.add_argument(
-        "--data_dir",
+        "--r3d_data_dir",
         type=str,
         required=True,
         help="Path to .r3d file"
@@ -384,7 +337,7 @@ def main():
     )
     parser.add_argument(
         "--downsample_factor",
-        type=Union[int, float],
+        type=int,
         default=2,
         help="Downsample factor for dataset (default: 1)"
     )
@@ -408,7 +361,7 @@ def main():
     
     args = parser.parse_args()
     
-    data_path = Path(args.data_dir)
+    data_path = Path(args.r3d_data_dir)
     output_dir = Path(args.output_dir)
     
     if not data_path.exists():

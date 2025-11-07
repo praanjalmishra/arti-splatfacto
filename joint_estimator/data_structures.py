@@ -180,6 +180,7 @@ class RANSACConfig:
     confidence: float = 0.99  # Desired confidence level
     min_trajectory_length: int = 5  # Minimum points per trajectory
     early_termination_threshold: float = 0.8  # Stop if this fraction are inliers
+    use_tms_preclustering: bool = True
 
 
 # Pipeline Configuration
@@ -190,6 +191,7 @@ class TrajectoryFilterConfig:
     min_length: int = 5  # Minimum trajectory length
     max_velocity_jump: float = 0.5  # Maximum frame-to-frame velocity change (m/s)
     smoothing_window: int = 3  # Window size for trajectory smoothing
+    max_tracks: Optional[int] = None
 
 
 @dataclass
@@ -236,7 +238,6 @@ class JointEstimationResult:
     total_trajectories: int
     processing_time: float  # Seconds
     error_message: Optional[str] = None
-    per_frame_articulation: Optional[Dict[int, float]] = None  
     
     def is_hinge(self) -> bool:
         return self.joint_type == JointType.HINGE

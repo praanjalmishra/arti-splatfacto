@@ -8,6 +8,7 @@ with the existing RANSAC pipeline.
 import numpy as np
 from typing import List, Tuple
 from pathlib import Path
+import os
 
 from data_structures import (
     Trajectory3D, Point3D, TrajectoryFilterConfig
@@ -35,8 +36,17 @@ def load_tapip3d_trajectories(
         - metadata: Dict with intrinsics, extrinsics, query_points
     """
     
+    if os.path.isdir(npz_path):
+        npz_files = sorted(
+            [f for f in os.listdir(npz_path) if f.endswith(".npz")],
+            reverse=True
+        )
+        if not npz_files:
+            raise FileNotFoundError(f"No .result.npz file found in directory: {npz_path}")
+        npz_path = os.path.join(npz_path, npz_files[0])
+
     # Load TAPIP3D output
-    data = np.load(npz_path)
+    data = np.load(npz_path, allow_pickle=True)
     
     coords = data['coords']      # (T, N, 3)
     visibs = data['visibs']      # (T, N)

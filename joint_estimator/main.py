@@ -487,7 +487,6 @@ def main():
         print("GENERATING TEMPORAL VOXEL MASK")
         print("="*60)
         
-        # Initialize voxel generator
         voxel_generator = TemporalVoxelMaskGenerator(
             voxel_resolution=args.voxel_resolution,
             depth_scale=args.depth_scale,
@@ -497,7 +496,6 @@ def main():
             padding=0.0
         )
         
-        # Generate voxel mask from temporal RGB-D
         voxel_data = voxel_generator.generate_voxel_mask(
             data_dir=args.data_dir,
             metadata_path=args.camera_metadata,

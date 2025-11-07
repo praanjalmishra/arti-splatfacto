@@ -246,24 +246,30 @@ class HingeJointModel(JointModelBase):
     
     def _solve_pivot_point(self, R: np.ndarray, t: np.ndarray) -> np.ndarray:
         """
-        Solve for pivot point using Li & Wan 2016 equation: (I - R)c = t
+        Solve for pivot using least squares with regularization.
+        For hinge: (I - R)c = t
         """
         I = np.eye(3)
         A = I - R
         
-        # Solve linear system (I - R)c = t
+        # Check condition number - if too high, the system is ill-conditioned
+        cond = np.linalg.cond(A)
+        
+        if cond > 1e6:  # Very ill-conditioned
+            # Use the axis direction to constrain the solution
+            # Pivot should be close to the centroid of motion
+            # This is a geometric constraint
+            return t / (2.0 - 2.0 * np.trace(R) / 3.0 + 1e-8)
+        
+        # Add small regularization for stability
+        A_reg = A.T @ A + 1e-6 * np.eye(3)
+        b_reg = A.T @ t
+        
         try:
-            # Use least squares since the system may be under-constrained
-            pivot, residuals, rank, s = np.linalg.lstsq(A, t, rcond=None)
+            pivot = np.linalg.solve(A_reg, b_reg)
             return pivot
-        except np.linalg.LinAlgError:
-            # If direct solution fails, find minimum norm solution
-            try:
-                pivot = np.linalg.pinv(A) @ t
-                return pivot
-            except:
-                # Fallback: use translation centroid
-                return t / 2
+        except:
+            return np.linalg.pinv(A) @ t
     
     def _rotation_matrix_to_axis_angle(self, R: np.ndarray) -> Tuple[np.ndarray, float]:
         """Convert rotation matrix to axis-angle representation."""
@@ -325,46 +331,80 @@ class HingeJointModel(JointModelBase):
         # Rotate and translate back
         rotated = R @ translated + pivot
         return rotated
-    
+        
     def calculate_trajectory_error(self, trajectory: Trajectory3D, joint_params: HingeParameters) -> float:
         """
-        Calculate fitting error following Li & Wan 2016 Equation 11:
-        D_h(f_i, f_k) = min_θ ||M_{h,θ} p_i - p_k||
-        
-        Key insight: For hinge motion, we test if 80% of trajectory lifespan 
-        can be explained by rotation around the hinge axis.
+        Robust hinge trajectory error computation.
+        Safe for noisy or partially degenerate depth trajectories.
         """
-        if len(trajectory.points) < 2:
+        # --- Basic sanity checks ---
+        if len(trajectory.points) < 2 or joint_params is None:
             return float('inf')
-        
+
+        # Validate joint parameters
+        try:
+            axis = np.asarray(joint_params.axis, dtype=float)
+            pivot = np.asarray(joint_params.pivot, dtype=float)
+        except Exception:
+            return float('inf')
+
+        if not np.all(np.isfinite(axis)) or not np.all(np.isfinite(pivot)):
+            return float('inf')
+
+        # Normalize axis safely
+        axis_norm = np.linalg.norm(axis)
+        if axis_norm < 1e-8:
+            return float('inf')
+        axis = axis / axis_norm
+
+        # --- Extract trajectory points ---
         points = trajectory.get_all_positions()
-        reference_point = points[0]  # Use first frame as reference
-        
+        if not np.all(np.isfinite(points)):
+            return float('inf')
+
+        reference_point = points[0]
+        total_frames = len(points) - 1
+        if total_frames <= 0:
+            return float('inf')
+
         valid_fits = 0
-        total_frames = len(points) - 1  # Exclude reference frame
         errors = []
-        
-        for i, current_point in enumerate(points[1:], 1):
-            # Find optimal rotation angle θ that minimizes ||M_{h,θ} p_i - p_k||
-            min_error = self._find_optimal_hinge_angle(
-                reference_point, current_point, 
-                joint_params.axis, joint_params.pivot
-            )
-            
+
+        # Adaptive threshold based on motion scale
+        motion_scale = np.mean(np.linalg.norm(np.diff(points, axis=0), axis=1))
+        eps_h = max(0.05, 0.1 * motion_scale)  # relaxed threshold for real data
+
+        for current_point in points[1:]:
+            # Skip invalid points
+            if not np.all(np.isfinite(current_point)):
+                continue
+
+            try:
+                min_error = self._find_optimal_hinge_angle(
+                    reference_point, current_point, axis, pivot
+                )
+                if not np.isfinite(min_error):
+                    continue
+            except Exception:
+                continue
+
             errors.append(min_error)
-            
-            # Following paper: point supports hinge if error < threshold
-            if min_error <= 0.05:  # εh = 0.05 from paper
+            if min_error <= eps_h:
                 valid_fits += 1
-        
-        # Following paper: "discard hinge if supporting points < 80% of lifespan"
-        support_ratio = valid_fits / total_frames if total_frames > 0 else 0
-        
+
+        if len(errors) == 0:
+            return float('inf')
+
+        support_ratio = valid_fits / total_frames
         if support_ratio < 0.8:
-            return float('inf')  # Reject this hinge
-        
-        # Return average error for valid trajectory
-        return np.mean(errors)
+            return float('inf')
+
+        avg_error = np.mean(errors)
+        if not np.isfinite(avg_error):
+            return float('inf')
+
+        return avg_error
+
     
     def _find_optimal_hinge_angle(self, 
                                  p_reference: np.ndarray,
@@ -510,55 +550,65 @@ class HingeJointModel(JointModelBase):
         v2 = p3 - p1
         normal = np.cross(v1, v2)
         
-        if np.linalg.norm(normal) < 1e-8:
+        if np.linalg.norm(normal) < 1e-6:
             raise ValueError("Collinear points")
         
         normal = normal / np.linalg.norm(normal)
         
-        # Find circle center using perpendicular bisectors
-        # Midpoints of two chords
-        mid12 = (p1 + p2) / 2
-        mid23 = (p2 + p3) / 2
-        
-        # Directions perpendicular to chords (in the plane)
-        dir12 = np.cross(normal, p2 - p1)
-        dir23 = np.cross(normal, p3 - p2)
-        
-        # Solve intersection of two lines: mid12 + t*dir12 = mid23 + s*dir23
-        # This is a simple 3D line intersection problem
-        
-        # Use simplified approach: center is equidistant from all 3 points
-        # Solve system: |center - p1|² = |center - p2|² = |center - p3|²
-        
-        A = 2 * np.array([p2 - p1, p3 - p1])
-        b = np.array([
-            np.dot(p2, p2) - np.dot(p1, p1),
-            np.dot(p3, p3) - np.dot(p1, p1)
-        ])
-        
-        # Project to 2D for stable solving
+        # Create orthonormal basis for the plane
         u = v1 / np.linalg.norm(v1)
         v = np.cross(normal, u)
+        v = v / np.linalg.norm(v)
         
-        # Convert to 2D coordinates
+        # Convert to 2D coordinates in the plane
         p1_2d = np.array([0, 0])
-        p2_2d = np.array([np.dot(p2 - p1, u), np.dot(p2 - p1, v)])
-        p3_2d = np.array([np.dot(p3 - p1, u), np.dot(p3 - p1, v)])
+        p2_2d = np.array([np.dot(v1, u), np.dot(v1, v)])
         
-        # Solve 2D circle center
-        A_2d = 2 * np.array([
-            [p2_2d[0], p2_2d[1]],
-            [p3_2d[0], p3_2d[1]]
-        ])
-        b_2d = np.array([
-            p2_2d[0]**2 + p2_2d[1]**2,
-            p3_2d[0]**2 + p3_2d[1]**2
-        ])
+        v3 = p3 - p1
+        p3_2d = np.array([np.dot(v3, u), np.dot(v3, v)])
         
-        center_2d = np.linalg.solve(A_2d, b_2d)
+        # Solve for 2D circle center using perpendicular bisector method
+        # Midpoints of chords
+        mid12 = p2_2d / 2
+        mid13 = p3_2d / 2
+        
+        # Slopes of perpendicular bisectors
+        # For chord 1-2: perpendicular to (p2_2d - p1_2d) = p2_2d
+        # For chord 1-3: perpendicular to (p3_2d - p1_2d) = p3_2d
+        
+        # Build linear system: center lies on both perpendicular bisectors
+        # Line 1: passes through mid12, perpendicular to p2_2d
+        # Line 2: passes through mid13, perpendicular to p3_2d
+        
+        # Use the standard circle center formula for 3 points
+        D = 2 * (p1_2d[0] * (p2_2d[1] - p3_2d[1]) + 
+                p2_2d[0] * (p3_2d[1] - p1_2d[1]) + 
+                p3_2d[0] * (p1_2d[1] - p2_2d[1]))
+        
+        if abs(D) < 1e-8:
+            raise ValueError("Points are nearly collinear")
+        
+        p1_norm = np.dot(p1_2d, p1_2d)
+        p2_norm = np.dot(p2_2d, p2_2d)
+        p3_norm = np.dot(p3_2d, p3_2d)
+        
+        center_2d_x = ((p1_norm * (p2_2d[1] - p3_2d[1]) + 
+                        p2_norm * (p3_2d[1] - p1_2d[1]) + 
+                        p3_norm * (p1_2d[1] - p2_2d[1])) / D)
+        
+        center_2d_y = ((p1_norm * (p3_2d[0] - p2_2d[0]) + 
+                        p2_norm * (p1_2d[0] - p3_2d[0]) + 
+                        p3_norm * (p2_2d[0] - p1_2d[0])) / D)
+        
+        center_2d = np.array([center_2d_x, center_2d_y])
         
         # Convert back to 3D
         center_3d = p1 + center_2d[0] * u + center_2d[1] * v
+        
+        # Validate radius
+        radius = np.linalg.norm(center_3d - p1)
+        if not (0.001 < radius < 5.0):  # Sanity check
+            raise ValueError(f"Invalid radius: {radius}")
         
         return center_3d, normal
 
