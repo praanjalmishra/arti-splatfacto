@@ -152,6 +152,17 @@ class ArtiSplatfactoDataParser(DataParser):
                 depth_filenames.append(None)
 
 
+            ## add mask path
+            mask_rel = None
+            if "mask_path" in fr:
+                mask_rel = Path(fr["mask_path"])
+            elif "mask_file_path" in fr:
+                mask_rel = Path(fr["mask_file_path"])
+
+            if mask_rel is not None and str(mask_rel) != "":
+                mask_filenames.append(self._get_fname(mask_rel, data_dir, "mask"))
+            else:
+                mask_filenames.append(None)
 
 
             # NEW: separate pre- and post-masks
@@ -221,7 +232,7 @@ class ArtiSplatfactoDataParser(DataParser):
         poses_all[:, :3, 3] *= scale_factor
 
         image_filenames = [image_filenames[i] for i in indices]
-        # mask_filenames   = [mask_filenames[i] if mask_filenames[i] is not None else None for i in indices]
+        mask_filenames   = [mask_filenames[i] if mask_filenames[i] is not None else None for i in indices]
         mask_pre_filenames = [mask_pre_filenames[i] if mask_pre_filenames[i] is not None else None for i in indices]
         mask_post_filenames = [mask_post_filenames[i] if mask_post_filenames[i] is not None else None for i in indices]
         depth_filenames = [depth_filenames[i] for i in indices] if len(depth_filenames) > 0 else []
@@ -284,9 +295,9 @@ class ArtiSplatfactoDataParser(DataParser):
         metadata = {
             "depth_filenames": depth_filenames if any(x is not None for x in depth_filenames) else None,
             "depth_unit_scale_factor": self.config.depth_unit_scale_factor,
-            # "mask_filenames": mask_filenames if any(x is not None for x in mask_filenames) else None,
-            "mask_pre_filenames": mask_pre_filenames if any(x is not None for x in mask_pre_filenames) else None,
-            "mask_post_filenames": mask_post_filenames if any(x is not None for x in mask_post_filenames) else None,
+            "mask": mask_filenames if any(x is not None for x in mask_filenames) else None,
+            # "mask_pre_filenames": mask_pre_filenames if any(x is not None for x in mask_pre_filenames) else None,
+            # "mask_post_filenames": mask_post_filenames if any(x is not None for x in mask_post_filenames) else None,
             "scene_path": str(data_dir / self.config.obj_mask_dir),
         }
         if self.config.load_dynamic_objects:

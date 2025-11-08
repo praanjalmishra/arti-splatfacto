@@ -32,6 +32,7 @@ import torchvision.transforms.functional as TF
 from arti_splatfacto.utils.debug_utils import decode_id_map, save_debug_id_maps, depth_debug
 from arti_splatfacto.utils.img_utils import psnr_masked, crop_imgs_w_masks, compute_2D_bbox, batch_crop_resize,batch_crop_resize
 from arti_splatfacto.utils.articulation_utils import apply_joint_transform, apply_joint_transform_prismatic, apply_articulation_to_optimizer_params
+from arti_splatfacto.utils.normal_utils import normal_from_depth_image
 
 @torch_compile()
 def get_viewmat(optimized_camera_to_world):
@@ -85,6 +86,12 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
     """If True, output depth information during training"""
 
     depth_debug_vis: bool = True
+
+    ### normal regularization parameters
+    use_normal_reg: bool = True
+    normal_lambda: float = 0.1 
+    smooth_normals: bool = False  
+    normal_debug_vis: bool = True  
 
 
 class ArtiSplatfactoModel(SplatfactoModel):    
@@ -469,35 +476,36 @@ class ArtiSplatfactoModel(SplatfactoModel):
             print(f"⚠️ Step {step}: Skipping canonical strategy (0 visible canonical Gaussians)")
 
 
-    # get_loss_dict with background accumulation penalty
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         pred_img = outputs["rgb"]
-
         mask = batch.get("mask", None)
 
+        # print("batch keys:", batch.keys())
+        # import pdb; pdb.set_trace()
+
+        
         if mask is not None:
             assert mask.shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
             gt_img = gt_img * mask
             pred_img = pred_img * mask
         
-
-        # === Losses ===
+        # === Main Losses ===
         Ll1 = torch.abs(gt_img - pred_img).mean()
         simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...],
                                 pred_img.permute(2, 0, 1)[None, ...])
         loss_dict = {
             "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
         }
-
-        # # Background accumulation penalty
+        
+        # === Background accumulation penalty ===
         if mask is not None and "accumulation" in outputs:
             accumulation = outputs["accumulation"]
             background_mask = ~mask.bool()
             background_acc_loss = (background_mask * accumulation).mean()
             loss_dict["background_acc_penalty"] = 0.1 * background_acc_loss
-
-        # Scale regularization
+        
+        # === Scale regularization ===
         if self.config.use_scale_regularization and self.step % 10 == 0:
             scales = torch.exp(self.gauss_params["scales"])
             scale_ratios = scales.max(dim=-1)[0] / (scales.min(dim=-1)[0] + 1e-8)
@@ -507,8 +515,8 @@ class ArtiSplatfactoModel(SplatfactoModel):
         else:
             scale_reg = torch.tensor(0.0).to(self.device)
         loss_dict["scale_reg"] = scale_reg
-
-        # MCMC extras
+        
+        # === MCMC extras ===
         if self.config.strategy == "mcmc":
             if self.config.mcmc_opacity_reg > 0.0:
                 loss_dict["mcmc_opacity_reg"] = (
@@ -518,48 +526,165 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 loss_dict["mcmc_scale_reg"] = (
                     self.config.mcmc_scale_reg * torch.abs(torch.exp(self.gauss_params["scales"])).mean()
                 )
-
-        # Camera + bilateral grid
+        
+        # === Camera + bilateral grid ===
         if self.training:
             self.camera_optimizer.get_loss_dict(loss_dict)
-            if self.config.use_bilateral_grid:
-                loss_dict["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)
-
+        if self.config.use_bilateral_grid:
+            loss_dict["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)
+        
+        # === Depth Loss ===
         if self.config.use_depth and "depth_image" in batch:
             depth_out = outputs["depth"]
             depth_gt = self.get_gt_img(batch["depth_image"])
-
+            
             if mask is not None:
                 assert mask.shape[:2] == depth_out.shape[:2] == depth_gt.shape[:2]
                 depth_out = depth_out * mask
                 depth_gt = depth_gt * mask
-
+            
             if self.config.depth_debug_vis and self.step % 1000 == 0:
                 depth_debug(self.step, depth_out, depth_gt, mask)
-
+            
             # Ensure valid values
             depth_out = torch.clamp(depth_out, min=1e-4)
             depth_gt = torch.clamp(depth_gt, min=1e-4)
             valid = torch.isfinite(depth_out) & torch.isfinite(depth_gt)
             if mask is not None:
                 valid &= (mask > 0.5)
-
+            
             # Log-scale L1 loss
             if valid.any():
                 depth_loss = (torch.log(depth_out[valid]) - torch.log(depth_gt[valid])).abs().mean()
             else:
                 depth_loss = torch.tensor(0.0, device=depth_out.device)
-
             loss_dict["depth_loss"] = self.config.depth_lambda * depth_loss
-
+        
+        # === Normal Regularization ===
+        if self.config.use_normal_reg and "depth_image" in batch and self.training:
+            try:
+                # Extract intrinsics directly from batch (added by datamanager)
+                fx = batch["fx"].item() if isinstance(batch["fx"], torch.Tensor) else batch["fx"]
+                fy = batch["fy"].item() if isinstance(batch["fy"], torch.Tensor) else batch["fy"]
+                cx = batch["cx"].item() if isinstance(batch["cx"], torch.Tensor) else batch["cx"]
+                cy = batch["cy"].item() if isinstance(batch["cy"], torch.Tensor) else batch["cy"]
+                c2w = batch["c2w"]
+                
+                # Get image size
+                depth_gt = self.get_gt_img(batch["depth_image"])
+                img_size = (depth_gt.shape[1], depth_gt.shape[0])  # (W, H)
+                
+                # Compute normals from ground truth depth
+                normals_gt = normal_from_depth_image(
+                    depths=depth_gt.squeeze(-1),
+                    fx=fx, fy=fy, cx=cx, cy=cy,
+                    img_size=img_size,
+                    c2w=c2w,
+                    device=self.device,
+                    smooth=self.config.smooth_normals
+                )
+                
+                # Compute normals from rendered depth
+                depth_out = outputs["depth"]
+                normals_pred = normal_from_depth_image(
+                    depths=depth_out.squeeze(-1),
+                    fx=fx, fy=fy, cx=cx, cy=cy,
+                    img_size=img_size,
+                    c2w=c2w,
+                    device=self.device,
+                    smooth=False
+                )
+                
+                # Apply mask if available
+                mask = batch.get("mask", None)
+                if mask is not None:
+                    mask_3d = mask.expand_as(normals_gt)
+                    normals_gt = normals_gt * mask_3d
+                    normals_pred = normals_pred * mask_3d
+                    valid_mask = (mask > 0.5).squeeze(-1)
+                else:
+                    valid_mask = torch.ones(normals_gt.shape[:2], dtype=torch.bool, device=self.device)
+                
+                # Filter out invalid normals
+                valid_normals_gt = torch.norm(normals_gt, dim=-1) > 0.1
+                valid_normals_pred = torch.norm(normals_pred, dim=-1) > 0.1
+                valid_mask = valid_mask & valid_normals_gt & valid_normals_pred
+                
+                if valid_mask.any():
+                    # Cosine similarity loss
+                    dot_product = (normals_pred[valid_mask] * normals_gt[valid_mask]).sum(dim=-1)
+                    normal_loss = 1 - dot_product.abs()
+                    normal_loss = normal_loss.mean()
+                    
+                    loss_dict["normal_loss"] = self.config.normal_lambda * normal_loss
+                    
+                    # Debug info
+                    if self.step % 1000 == 0:
+                        mean_dot = dot_product.mean().item()
+                        print(f"Normal loss - mean dot product: {mean_dot:.4f}, loss: {normal_loss.item():.4f}")
+                else:
+                    loss_dict["normal_loss"] = torch.tensor(0.0, device=self.device)
+                    if self.step % 1000 == 0:
+                        print("Warning: No valid normals for loss computation")
+                    
+            except Exception as e:
+                import traceback
+                print(f"Warning: Normal computation failed at step {self.step}")
+                print(f"Error: {e}")
+                traceback.print_exc()
+                loss_dict["normal_loss"] = torch.tensor(0.0, device=self.device)
+        
         if self.step % 1000 == 0 and not getattr(self, '_debug_saved_this_step', False):
             self._debug_saved_this_step = True
             save_debug_id_maps(self, batch)
-            # import pdb; pdb.set_trace()
+            
+            if self.config.normal_debug_vis and "normal_loss" in loss_dict:
+                try:
+                    self._save_normal_debug(normals_gt, normals_pred, mask)
+                except:
+                    pass
         elif self.step % 1000 != 0:
             self._debug_saved_this_step = False
         
         return loss_dict
+
+    def _save_normal_debug(self, normals_gt, normals_pred, mask=None):
+        """Helper to save normal visualization for debugging"""
+        import matplotlib
+        matplotlib.use("Agg")  # ✅ ensures safe offscreen rendering
+
+        import matplotlib.pyplot as plt
+        from pathlib import Path
+
+        debug_dir = Path("debug_normals")
+        debug_dir.mkdir(exist_ok=True)
+
+        # Convert normals to RGB (map from [-1, 1] to [0, 1])
+        normals_gt_vis = (normals_gt + 1) / 2
+        normals_pred_vis = (normals_pred + 1) / 2
+
+        if mask is not None:
+            normals_gt_vis = normals_gt_vis * mask
+            normals_pred_vis = normals_pred_vis * mask
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        axes[0].imshow(normals_gt_vis.detach().cpu().numpy())
+        axes[0].set_title("GT Normals")
+        axes[0].axis('off')
+
+        axes[1].imshow(normals_pred_vis.detach().cpu().numpy())
+        axes[1].set_title("Predicted Normals")
+        axes[1].axis('off')
+
+        diff = torch.abs(normals_gt_vis - normals_pred_vis).mean(dim=-1)
+        axes[2].imshow(diff.detach().cpu().numpy(), cmap='hot')
+        axes[2].set_title("Difference")
+        axes[2].axis('off')
+
+        plt.tight_layout()
+        plt.savefig(debug_dir / f"normals_step_{self.step:06d}.png", dpi=150, bbox_inches='tight')
+        plt.close()
+
 
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
         """

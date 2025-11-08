@@ -80,7 +80,17 @@ class ArtiSplatfactoDataManager(FullImageDatamanager[TDataset], Generic[TDataset
             camera.metadata = {}
         camera.metadata["cam_idx"] = self.image_idx
 
+        cam = camera[0] 
+        data.update({
+            "fx": cam.fx.item() if isinstance(cam.fx, torch.Tensor) else float(cam.fx),
+            "fy": cam.fy.item() if isinstance(cam.fy, torch.Tensor) else float(cam.fy),
+            "cx": cam.cx.item() if isinstance(cam.cx, torch.Tensor) else float(cam.cx),
+            "cy": cam.cy.item() if isinstance(cam.cy, torch.Tensor) else float(cam.cy),
+            "c2w": cam.camera_to_worlds.squeeze(0).detach().to(self.device),  # shape (4, 4)
+        })
+
         return camera, data
+
 
     def next_eval(self, step: int) -> Tuple[Cameras, Dict]:
         """Returns the next evaluation image and camera."""
@@ -96,7 +106,17 @@ class ArtiSplatfactoDataManager(FullImageDatamanager[TDataset], Generic[TDataset
             camera.metadata = {}
         camera.metadata["cam_idx"] = image_idx
 
+        cam = camera[0]
+        data.update({
+            "fx": cam.fx.item() if isinstance(cam.fx, torch.Tensor) else float(cam.fx),
+            "fy": cam.fy.item() if isinstance(cam.fy, torch.Tensor) else float(cam.fy),
+            "cx": cam.cx.item() if isinstance(cam.cx, torch.Tensor) else float(cam.cx),
+            "cy": cam.cy.item() if isinstance(cam.cy, torch.Tensor) else float(cam.cy),
+            "c2w": cam.camera_to_worlds.squeeze(0).detach().to(self.device),
+        })
+
         return camera, data
+
 
     def next_eval_image(self, step: int) -> Tuple[Cameras, Dict]:
         """Returns a random evaluation image (no image reuse tracking)."""
