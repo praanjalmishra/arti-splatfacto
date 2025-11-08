@@ -85,9 +85,6 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
     """If True, output depth information during training"""
 
     depth_debug_vis: bool = True
-    canon_refine_every: int = 10
-    canon_densify_grad_thresh: float = 0.0012
-    canon_densify_size_thresh: float = 0.015
 
 
 class ArtiSplatfactoModel(SplatfactoModel):    
@@ -95,20 +92,35 @@ class ArtiSplatfactoModel(SplatfactoModel):
     config: ArtiSplatfactoModelConfig
 
     def __init__(self, *args, **kwargs):
-        self.metadata = kwargs.pop("metadata", {}) or {}
         super().__init__(*args, **kwargs)
         
-        self.joint_type = self.obj_3d_seg.joint_type 
+        # Joint configuration
+        self.joint_pivot = self.obj_3d_seg.joint_pivot.to(self.device)
+        self.joint_axis = F.normalize(self.obj_3d_seg.joint_axis.to(self.device), dim=0)
+        self.joint_type = self.obj_3d_seg.joint_type
+
+
+        # Get joint angles from metadata if available
+        self.metadata = kwargs.get("metadata", {})
+        self.joint_angles = self.metadata.get("joint_angles", None)
+
+    
 
     def populate_modules(self):
         """Populates the modules of the model."""
         super().populate_modules()
         print("Populating ArtiSplatfactoModel modules...")
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dim_sh = num_sh_bases(self.config.sh_degree)
+        def make_param(shape, requires_grad=True):
+            return torch.nn.Parameter(
+                torch.empty(shape, device="cuda" if torch.cuda.is_available() else "cpu", dtype=torch.float32),
+                requires_grad=requires_grad,
+            )
 
-        # Base Splatfacto parameter dicts
+        dim_sh = num_sh_bases(self.config.sh_degree)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Use ParameterDict like base model
         self.gauss_params = torch.nn.ParameterDict({
             "means":         torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
             "scales":        torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
@@ -118,7 +130,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "opacities":     torch.nn.Parameter(torch.empty((0, 1), device=device, requires_grad=True)),
         })
 
-        # Canonical and fixed parameter sets
+        # Canonical gaussians (trainable)
         self.gauss_params_canonical = torch.nn.ParameterDict({
             "means":         torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
             "scales":        torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
@@ -128,6 +140,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "opacities":     torch.nn.Parameter(torch.empty((0, 1), device=device, requires_grad=True)),
         })
 
+        # Fixed gaussians (non-trainable but still Parameters for saving)
         self.gauss_params_fixed = torch.nn.ParameterDict({
             "means":         torch.nn.Parameter(torch.empty((0, 3), device=device), requires_grad=False),
             "scales":        torch.nn.Parameter(torch.empty((0, 3), device=device), requires_grad=False),
@@ -137,74 +150,12 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "opacities":     torch.nn.Parameter(torch.empty((0, 1), device=device), requires_grad=False),
         })
 
-        # Load object articulation info
         self.obj_3d_seg = Object3DSeg.load(self.config.obj_mask_file, device=device)
-        initial_pivot = self.obj_3d_seg.joint_pivot.to(device)
-        initial_axis = F.normalize(self.obj_3d_seg.joint_axis.to(device), dim=0)
-
-        # Store initial pivot as buffer for regularization
-        self.register_buffer('initial_joint_pivot', initial_pivot.clone())
         
-        # Shared articulation parameters (NOW as Parameters)
-        self.joint_pivot = torch.nn.Parameter(initial_pivot.clone(), requires_grad=True)
-        self.joint_axis_raw = torch.nn.Parameter(initial_axis.clone(), requires_grad=True)
 
-        # Per-frame joint angles
-        joint_angles_meta = self.metadata.get("joint_angles", [])
-        num_frames = len(joint_angles_meta)
-        print(f"Found {num_frames} frames with joint angles")
-
-        if num_frames > 0:
-            # Fix the warning: use torch.as_tensor instead of torch.tensor
-            initial_angles = torch.as_tensor(joint_angles_meta, dtype=torch.float32, device=device)
-        else:
-            initial_angles = torch.zeros(1, device=device)
-
-        self.joint_angles = torch.nn.Parameter(initial_angles.clone(), requires_grad=True)
-        
-        # Store max angle if available for regularization
-        if hasattr(self.obj_3d_seg, 'joint_angle'):
-            self.register_buffer('max_joint_angle', self.obj_3d_seg.joint_angle.to(device))
-
-        # Metrics
         self.rgb_metrics = RGBMetrics()
         self.depth_metrics = DepthMetrics()
         self.mse_loss = torch.nn.MSELoss()
-
-        print(f"Initialized joint parameters:")
-        print(f"  Pivot: {self.joint_pivot.data}")
-        print(f"  Axis (normalized): {self.joint_axis.data}")
-        print(f"  Angles: {num_frames} frames, range [{initial_angles.min():.2f}, {initial_angles.max():.2f}]")
-
-
-        # self.strategy_state = self.strategy.initialize_state(scene_scale=0.1)
-        
-        # Canonical strategy (more aggressive - NEW!)
-        self.strategy_canonical = DefaultStrategy(
-            prune_opa=0.005,
-            grow_grad2d=self.config.canon_densify_grad_thresh,  
-            grow_scale3d=self.config.canon_densify_size_thresh, 
-            grow_scale2d=self.config.split_screen_size,
-            prune_scale3d=self.config.cull_scale_thresh,
-            prune_scale2d=self.config.cull_screen_size,
-            refine_scale2d_stop_iter=self.config.stop_screen_size_at,
-            refine_start_iter=self.config.warmup_length,
-            refine_stop_iter=self.config.stop_split_at,
-            reset_every=self.config.reset_alpha_every * self.config.refine_every,
-            refine_every=self.config.refine_every,
-            pause_refine_after_reset=self.num_train_data + self.config.refine_every,
-            absgrad=self.config.use_absgrad,
-            revised_opacity=False,
-            verbose=True,
-        )
-
-
-        self.strategy_state_canonical = self.strategy_canonical.initialize_state(scene_scale=0.1)
-
-    @property
-    def joint_axis(self):
-        """Always return normalized axis"""
-        return F.normalize(self.joint_axis_raw, dim=0)
 
 
     def state_dict(self, *args, **kwargs):
@@ -258,27 +209,20 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 groups[optimizer_name] = [self.gauss_params_canonical[internal_name]]
                 print(f"Added param group '{optimizer_name}': {self.gauss_params_canonical[internal_name].shape}")
         
-        if hasattr(self, 'joint_pivot') and self.joint_pivot is not None:
-            groups["joint_pivot"] = [self.joint_pivot]
-            print(f"Added param group 'joint_pivot': {self.joint_pivot.shape}")
+        print(f"[debug] Created {len(groups)} parameter groups")
+        return groups
         
-        if hasattr(self, 'joint_axis_raw') and self.joint_axis_raw is not None:
-            groups["joint_axis"] = [self.joint_axis_raw]  # Note: optimizer gets raw, not normalized
-            print(f"Added param group 'joint_axis': {self.joint_axis_raw.shape}")
-        
-        if hasattr(self, 'joint_angles') and self.joint_angles is not None:
-            groups["joint_angles"] = [self.joint_angles]
-            print(f"Added param group 'joint_angles': {self.joint_angles.shape} (num_frames={self.joint_angles.numel()})")
-        
-        print(f"[debug] Created {len(groups)} parameter groups total")
-        return groups        
-        
+    
     def _initialize_and_partition(self, state_dict: Dict[str, torch.Tensor]):
         """
-        From a full-scene checkpoint: split into object (surface) + canonical (interior) + background.
-        Uses depth-based heuristic to separate exterior from interior Gaussians.
+        From a full-scene checkpoint: split into trainable object + fixed background.
+        (Canonical stays empty here; you can fill it later if you have an exposed mask.)
         """
         print("Initializing from full scene: partitioning Gaussians...")
+
+        # self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
+        print("obj mask points:", self.obj_3d_seg)
+        # self.obj_3d_seg.refine_mask(dilate_k=4, erode_k=1)
 
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
@@ -313,21 +257,25 @@ class ArtiSplatfactoModel(SplatfactoModel):
         n_canon = self.gauss_params_canonical["means"].shape[0]
         n_bg = self.gauss_params_fixed["means"].shape[0]
 
-        print(f"\nPartitioning complete:")
-        print(f"  Object (moving): {n_obj}")
-        print(f"  Canonical (revealed): {n_canon}")
-        print(f"  Background (fixed): {n_bg}")
-        print(f"  Total: {n_obj + n_canon + n_bg} / {all_means.shape[0]}")
 
-        # if hasattr(self, "gauss_params_fixed") and "opacities" in self.gauss_params_fixed:
-        #     print("Dimming background Gaussians for canonical visibility...")
-        #     self.gauss_params_fixed["opacities"].data[:] = -10.0  
-        
-
+        print(f"Partitioning complete. Trainable: {self.gauss_params['means'].shape[0]}, Canonical: {self.gauss_params_canonical['means'].shape[0]}, Fixed: {self.gauss_params_fixed['means'].shape[0]}")
 
     def load_state_dict(self, state_dict: Dict[str, torch.Tensor], **kwargs):
         print(f"Loading state_dict (Training mode: {self.training})")
         assert self.config.obj_mask_file is not None and self.config.obj_mask_file.exists()
+
+        # self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
+        if hasattr(self.obj_3d_seg, 'joint_axis') and self.obj_3d_seg.joint_axis is not None:
+            self.joint_axis = self.obj_3d_seg.joint_axis.to(self.device)
+            # self.joint_axis = torch.tensor([0.0, 1.0, 0.0], device=self.device)
+            print(f"Updated joint axis from mask: {self.joint_axis}")
+        if hasattr(self.obj_3d_seg, 'joint_pivot') and self.obj_3d_seg.joint_pivot is not None:
+            self.joint_pivot = self.obj_3d_seg.joint_pivot.to(self.device)
+            print(f"Updated joint pivot from mask: {self.joint_pivot}")
+        if hasattr(self.obj_3d_seg, 'joint_angle') and self.obj_3d_seg.joint_angle is not None:
+            self.max_joint_angle = self.obj_3d_seg.joint_angle.to(self.device)
+            print(f"Updated joint angles from mask: {self.max_joint_angle}")
+
 
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
@@ -372,23 +320,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
             )
         }
 
-        if "joint_pivot" in state_dict:
-            self.joint_pivot.data.copy_(state_dict["joint_pivot"].to(self.device))
-            print(f"Loaded joint_pivot from checkpoint: {self.joint_pivot.data}")
-            
-        if "joint_axis_raw" in state_dict:
-            self.joint_axis_raw.data.copy_(state_dict["joint_axis_raw"].to(self.device))
-            print(f"Loaded joint_axis_raw from checkpoint: {self.joint_axis_raw.data}")
-            
-        if "joint_angles" in state_dict:
-            self.joint_angles.data.copy_(state_dict["joint_angles"].to(self.device))
-            print(f"Loaded joint_angles from checkpoint: shape={self.joint_angles.shape}, range=[{self.joint_angles.min():.3f}, {self.joint_angles.max():.3f}]")
-
-        # Also load the buffer if it was saved
-        if "initial_joint_pivot" in state_dict:
-            self.initial_joint_pivot.copy_(state_dict["initial_joint_pivot"].to(self.device))
-            print(f"Loaded initial_joint_pivot buffer from checkpoint")
-
         super().load_state_dict(non_gauss_state, strict=False)
         self.step = 0
         
@@ -402,6 +333,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         self.optimizers = optimizers.optimizers
         self.schedulers = optimizers.schedulers
 
+
     def step_post_backward(self, step):
         """Apply strategy to both object and canonical parameters separately"""
         assert step == self.step
@@ -413,12 +345,14 @@ class ArtiSplatfactoModel(SplatfactoModel):
             """Create empty info dict with proper absgrad tensor"""
             empty_ids = torch.empty(0, dtype=torch.long, device=self.device)
             
-            key = self.strategy.key_for_gradient
+            # Create empty tensor for the gradient key with absgrad
+            key = self.strategy.key_for_gradient  # Usually "means2d"
             if hasattr(self, 'combined_info') and self.combined_info and key in self.combined_info:
                 ref_tensor = self.combined_info[key]
                 empty_tensor = torch.empty((0,) + ref_tensor.shape[1:], 
                                         device=self.device, dtype=ref_tensor.dtype)
             else:
+                # Fallback - means2d is typically (N, 2)
                 empty_tensor = torch.empty((0, 2), device=self.device, dtype=torch.float32)
             
             empty_tensor.absgrad = torch.empty_like(empty_tensor)
@@ -428,14 +362,12 @@ class ArtiSplatfactoModel(SplatfactoModel):
         if hasattr(self, 'combined_info') and self.combined_info and self.combined_info.get("gaussian_ids") is not None:
             visible_ids = self.combined_info["gaussian_ids"]
             n_obj = self.n_obj_rendered
-            n_canon = self.gauss_params_canonical['means'].shape[0]
             
-            # Split IDs: [0, n_obj) = object, [n_obj, n_obj+n_canon) = canonical, [n_obj+n_canon, ...) = background
+            # Split IDs: first n_obj belong to object, rest to canonical
             obj_mask = visible_ids < n_obj
-            canon_mask = (visible_ids >= n_obj) & (visible_ids < n_obj + n_canon)
-            bg_mask = visible_ids >= (n_obj + n_canon)  # Background mask (ignore these)
+            canon_mask = visible_ids >= n_obj
             
-            # Create object info
+            # Create object info with proper absgrad handling
             if obj_mask.any():
                 obj_visible_ids = visible_ids[obj_mask]
                 obj_info = {"gaussian_ids": obj_visible_ids}
@@ -445,8 +377,10 @@ class ArtiSplatfactoModel(SplatfactoModel):
                         continue
                         
                     if isinstance(v, torch.Tensor) and v.shape[0] == len(visible_ids):
+                        # Extract object portion
                         obj_tensor = v[obj_mask].contiguous()
                         
+                        # Handle absgrad if present
                         if hasattr(v, 'absgrad') and v.absgrad is not None:
                             obj_tensor.absgrad = v.absgrad[obj_mask].contiguous()
                         
@@ -456,9 +390,9 @@ class ArtiSplatfactoModel(SplatfactoModel):
             else:
                 obj_info = create_empty_info_with_absgrad()
             
-            # Create canonical info
+            # Create canonical info with proper absgrad handling
             if canon_mask.any():
-                canon_visible_ids = visible_ids[canon_mask] - n_obj  # Adjust to 0-based
+                canon_visible_ids = visible_ids[canon_mask] - n_obj  # Adjust IDs to 0-based
                 canon_info = {"gaussian_ids": canon_visible_ids}
                 
                 for k, v in self.combined_info.items():
@@ -468,6 +402,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
                     if isinstance(v, torch.Tensor) and v.shape[0] == len(visible_ids):
                         canon_tensor = v[canon_mask].contiguous()
                         
+
                         if hasattr(v, 'absgrad') and v.absgrad is not None:
                             canon_tensor.absgrad = v.absgrad[canon_mask].contiguous()
                         
@@ -476,17 +411,11 @@ class ArtiSplatfactoModel(SplatfactoModel):
                         canon_info[k] = v
             else:
                 canon_info = create_empty_info_with_absgrad()
-            
-            # Log background visibility (but don't process it - it's fixed!)
-            if bg_mask.any():
-                n_bg_visible = bg_mask.sum().item()
-                print(f"  Background: {n_bg_visible} visible Gaussians (fixed, no strategy applied)")
-                
         else:
             obj_info = create_empty_info_with_absgrad()
             canon_info = create_empty_info_with_absgrad()
         
-        # Verify absgrad presence
+        # Verify absgrad is present before calling strategy
         gradient_key = self.strategy.key_for_gradient
         if gradient_key in obj_info and not hasattr(obj_info[gradient_key], 'absgrad'):
             print(f"WARNING: Object info missing absgrad for {gradient_key}")
@@ -496,7 +425,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
             print(f"WARNING: Canonical info missing absgrad for {gradient_key}")
             canon_info[gradient_key].absgrad = torch.empty_like(canon_info[gradient_key])
         
-        # Apply strategy to object parameters
         obj_optimizers = {name.replace('obj_', ''): opt for name, opt in self.optimizers.items() if name.startswith('obj_')}
         
         print(f"Object: {len(obj_info['gaussian_ids'])} visible Gaussians")
@@ -512,20 +440,22 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 packed=True,
             )
         else:
-            print(f"  Skipping object strategy (0 visible)")
+            print(f"[Debug] Step {step}: Skipping object strategy (0 visible object Gaussians)")
+
         
         n_obj_after = self.gauss_params['means'].shape[0]
-        print(f"  Object: {n_obj_before} → {n_obj_after} Gaussians")
+        print(f"   Object strategy complete: {n_obj_before} → {n_obj_after} Gaussians")
         
-        # Apply strategy to canonical parameters
+        # 2. Apply strategy to CANONICAL parameters
         canon_optimizers = {name.replace('canon_', ''): opt for name, opt in self.optimizers.items() if name.startswith('canon_')}
         
         print(f"Canonical: {len(canon_info['gaussian_ids'])} visible Gaussians")
         n_canon_before = self.gauss_params_canonical['means'].shape[0]
         
+        # Initialize canonical strategy state if needed
         if not hasattr(self, 'strategy_state_canonical'):
             self.strategy_state_canonical = self.strategy.initialize_state(scene_scale=0.1)
-        
+
         if canon_info["gaussian_ids"].numel() > 0:
             self.strategy.step_post_backward(
                 params=self.gauss_params_canonical,
@@ -536,10 +466,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 packed=True,
             )
         else:
-            print(f"  Skipping canonical strategy (0 visible)")
-        
-        n_canon_after = self.gauss_params_canonical['means'].shape[0]
-        print(f"  Canonical: {n_canon_before} → {n_canon_after} Gaussians")
+            print(f"⚠️ Step {step}: Skipping canonical strategy (0 visible canonical Gaussians)")
 
 
     # get_loss_dict with background accumulation penalty
@@ -547,14 +474,13 @@ class ArtiSplatfactoModel(SplatfactoModel):
         gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         pred_img = outputs["rgb"]
 
-        # time_val = float(batch["time"])  
         mask = batch.get("mask", None)
 
         if mask is not None:
-            mask = self._downscale_if_required(mask.to(self.device))
             assert mask.shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
             gt_img = gt_img * mask
             pred_img = pred_img * mask
+        
 
         # === Losses ===
         Ll1 = torch.abs(gt_img - pred_img).mean()
@@ -569,7 +495,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             accumulation = outputs["accumulation"]
             background_mask = ~mask.bool()
             background_acc_loss = (background_mask * accumulation).mean()
-            loss_dict["background_acc_penalty"] = 0.3 * background_acc_loss
+            loss_dict["background_acc_penalty"] = 0.1 * background_acc_loss
 
         # Scale regularization
         if self.config.use_scale_regularization and self.step % 10 == 0:
@@ -626,34 +552,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
             loss_dict["depth_loss"] = self.config.depth_lambda * depth_loss
 
-        if self.training and hasattr(self, 'joint_axis_raw'):
-            # 1. Keep axis normalized (should be automatic with property, but enforce it)
-            axis_length = self.joint_axis_raw.norm()
-            axis_unit_penalty = (axis_length - 1.0).abs()
-            loss_dict["joint_axis_unit"] = 0.01 * axis_unit_penalty
-            
-            # # 2. Temporal smoothness on joint angles (optional but recommended)
-            # if hasattr(self, 'joint_angles') and len(self.joint_angles) > 1:
-            #     angle_diff = self.joint_angles[1:] - self.joint_angles[:-1]
-            #     angle_smoothness = angle_diff.abs().mean()
-            #     loss_dict["joint_angle_smooth"] = 0.001 * angle_smoothness
-            
-            # # 3. Optional: Keep angles within reasonable bounds
-            # if hasattr(self, 'joint_angles') and hasattr(self, 'max_joint_angle'):
-            #     # Soft constraint to keep angles near the expected range
-            #     angle_bound_penalty = torch.clamp(
-            #         self.joint_angles.abs() - self.max_joint_angle * 1.1, 
-            #         min=0.0
-            #     ).mean()
-            #     loss_dict["joint_angle_bound"] = 0.01 * angle_bound_penalty
-            
-            # # 4. Optional: Prevent pivot from drifting too far from initial estimate
-            # if hasattr(self, 'initial_joint_pivot'):
-            #     pivot_drift = (self.joint_pivot - self.initial_joint_pivot).norm()
-            #     # Only penalize if drift exceeds a threshold (e.g., 0.1 meters)
-            #     pivot_drift_penalty = torch.clamp(pivot_drift - 0.1, min=0.0)
-            #     loss_dict["joint_pivot_drift"] = 0.001 * pivot_drift_penalty
-
         if self.step % 1000 == 0 and not getattr(self, '_debug_saved_this_step', False):
             self._debug_saved_this_step = True
             save_debug_id_maps(self, batch)
@@ -661,7 +559,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
         elif self.step % 1000 != 0:
             self._debug_saved_this_step = False
         
-
         return loss_dict
 
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
@@ -743,14 +640,14 @@ class ArtiSplatfactoModel(SplatfactoModel):
     def get_joint_angle_for_camera(self, camera: Cameras) -> float:
         """Extract joint angle from camera.times (interpolated) or metadata (fixed)"""
 
-        if hasattr(camera, 'times') and camera.times is not None:
+        if hasattr(camera, 'times') and camera.times is not None and self.joint_angles is not None:
             time_val = float(camera.times.flatten()[0])
             num_frames = len(self.joint_angles)
-            
-            # Map time [0, 1] to frame index
             frame_idx = int(time_val * (num_frames - 1))
             frame_idx = max(0, min(frame_idx, num_frames - 1))
-            return self.joint_angles[frame_idx]
+            joint_angle = self.joint_angles[frame_idx].item()
+            # print(f"Time {time_val:.3f} → Joint angle {joint_angle:.3f} rad")
+            return joint_angle
 
         if hasattr(camera, 'metadata') and camera.metadata is not None:
             joint_angle = camera.metadata.get("joint_angle", 0.0)
@@ -762,52 +659,100 @@ class ArtiSplatfactoModel(SplatfactoModel):
     def get_gaussians_for_render(self, camera: Cameras) -> Dict[str, torch.Tensor]:
         """
         Prepare Gaussians for rendering with per-frame articulation.
-        Training: object (articulated) + canonical (identity) + background (fixed)
-        Eval: object (articulated) + canonical (identity) + background (fixed)
+        Training: object (articulated) + canonical (identity)
+        Eval: object (articulated) + canonical (identity) + background
         """
         
         joint_angle = self.get_joint_angle_for_camera(camera)
         
         articulated_obj_params = apply_articulation_to_optimizer_params(self, joint_angle)
 
-        combined_params = {}
-        for name in articulated_obj_params.keys():
-            obj_tensor = articulated_obj_params[name]
-            canon_tensor = self.gauss_params_canonical[name] if self.training else self.gauss_params_canonical[name].data
-            combined_params[name] = torch.cat([obj_tensor, canon_tensor], dim=0)
-        
-        if (hasattr(self, "gauss_params_fixed") and 
-            self.gauss_params_fixed is not None and 
-            len(self.gauss_params_fixed) > 0 and
-            self.gauss_params_fixed["means"].shape[0] > 0):
+        if self.training:
             
-            full_scene_params = {}
-            for name in combined_params.keys():
-                combined_tensor = combined_params[name]
-                bg_tensor = self.gauss_params_fixed[name].data  
+            combined_params = {}
+            for name in articulated_obj_params.keys():
+                obj_tensor = articulated_obj_params[name]
+                canon_tensor = self.gauss_params_canonical[name]  # Canonical at identity pose
                 
-                if combined_tensor.device != bg_tensor.device:
-                    bg_tensor = bg_tensor.to(combined_tensor.device)
-                
-                full_scene_params[name] = torch.cat([combined_tensor, bg_tensor], dim=0)
+                # Concatenate along the first dimension (number of Gaussians)
+                combined_params[name] = torch.cat([obj_tensor, canon_tensor], dim=0)
             
             n_obj = articulated_obj_params['means'].shape[0]
             n_canon = self.gauss_params_canonical['means'].shape[0]
-            n_bg = self.gauss_params_fixed['means'].shape[0]
-            total = full_scene_params['means'].shape[0]
+            total = combined_params['means'].shape[0]
             
-            mode = "Training" if self.training else "Eval"
-            print(f"[{mode} render]: obj({n_obj}) + canon({n_canon}) + bg({n_bg}) = {total} total")
-            
-            return full_scene_params
-        else:
-            # No background available
-            n_obj = articulated_obj_params['means'].shape[0]
-            n_canon = self.gauss_params_canonical['means'].shape[0]
-            mode = "Training" if self.training else "Eval"
-            print(f"[{mode} render]: obj({n_obj}) + canon({n_canon}) = {n_obj + n_canon} total (no background)")
-            
+            # print(f"[Training render]: obj({n_obj}) + canon({n_canon}) = {total} total")
+            # print(f"   Object: articulated at {joint_angle:.3f} rad")
+            # print(f"   Canonical: identity pose")
+
             return combined_params
+        else:
+            # Evaluation mode: object (articulated) + canonical (identity) + background
+            print(f"[ Eval mode]: combining articulated object + canonical + background")
+            
+            # Start with articulated object + canonical
+            combined_params = {}
+            for name in articulated_obj_params.keys():
+                obj_tensor = articulated_obj_params[name]
+                canon_tensor = self.gauss_params_canonical[name].data  # Use .data for eval
+                combined_params[name] = torch.cat([obj_tensor, canon_tensor], dim=0)
+            
+            # Add background if available
+            if (hasattr(self, "gauss_params_fixed") and 
+                self.gauss_params_fixed is not None and 
+                len(self.gauss_params_fixed) > 0 and
+                self.gauss_params_fixed["means"].shape[0] > 0):
+                
+                full_scene_params = {}
+                for name in combined_params.keys():
+                    combined_tensor = combined_params[name]
+                    bg_tensor = self.gauss_params_fixed[name].data
+                    
+                    if combined_tensor.device != bg_tensor.device:
+                        bg_tensor = bg_tensor.to(combined_tensor.device)
+                    
+                    full_scene_params[name] = torch.cat([combined_tensor, bg_tensor], dim=0)
+                
+                n_obj = articulated_obj_params['means'].shape[0]
+                n_canon = self.gauss_params_canonical['means'].shape[0]
+                n_bg = self.gauss_params_fixed['means'].shape[0]
+                total = full_scene_params['means'].shape[0]
+                
+                print(f"[Eval render check]:")
+                print(f"   Object: {n_obj}, Canonical: {n_canon}, Background: {n_bg}, Total: {total}")
+                
+                return full_scene_params
+            else:
+                print("[!!] No background gaussians found - rendering object + canonical only")
+                return combined_params
+
+
+    # def _apply_articulation_to_canonical_params(self, joint_angle: float) -> Dict[str, torch.Tensor]:
+    #     """
+    #     Apply per-frame articulation to the canonical object parameters.
+    #     """
+    #     if joint_angle == 0.0:
+    #         return {name: param.data for name, param in self.gauss_params.items()}
+        
+    #     means_articulated, quats_articulated = apply_joint_transform(
+    #         means=self.gauss_params["means"].data,  # Use .data
+    #         quats=self.gauss_params["quats"].data,  # Use .data
+    #         joint_pivot=self.joint_pivot.to(self.device),
+    #         joint_axis=self.joint_axis.to(self.device),
+    #         joint_angle=joint_angle
+    #     )
+        
+    #     articulated_params = {}
+    #     for name, param in self.gauss_params.items():
+    #         if name == "means":
+    #             articulated_params[name] = means_articulated
+    #         elif name == "quats":
+    #             articulated_params[name] = quats_articulated
+    #         else:
+    #             articulated_params[name] = param.data  # Use .data
+        
+    #     return articulated_params
+
 
     def get_outputs(self, camera: Cameras, render_id_map: bool = False) -> Dict[str, Union[torch.Tensor, List]]:
         """Takes in a camera and returns a dictionary of outputs with articulation."""
@@ -918,13 +863,13 @@ class ArtiSplatfactoModel(SplatfactoModel):
         
 
         # inject joint information for the new mask aware strategy
-        # if self.info is not None:
-        #     self.info["joint_angle"] = joint_angle
-        #     self.info["joint_pivot"] = self.joint_pivot
-        #     self.info["joint_axis"] = self.joint_axis
-        #     self.info["joint_type"] = self.joint_type
-        #     if self.step % 100 == 0:  # Log occasionally
-        #         print(f"Injected joint_angle={joint_angle:.3f} into render info")
+        if self.info is not None:
+            self.info["joint_angle"] = joint_angle
+            self.info["joint_pivot"] = self.joint_pivot
+            self.info["joint_axis"] = self.joint_axis
+            self.info["joint_type"] = self.joint_type
+            if self.step % 100 == 0:  # Log occasionally
+                print(f"Injected joint_angle={joint_angle:.3f} into render info")
         
         if self.training:
             self.strategy.step_pre_backward(
@@ -1026,9 +971,27 @@ class ArtiSplatfactoModel(SplatfactoModel):
             metrics_dict["cc_ssim"] = float(cc_ssim)
             metrics_dict["cc_lpips"] = float(cc_lpips)
 
-        mask = batch.get("mask", None)
-        if mask is not None:
-            mask = self._downscale_if_required(mask.to(self.device))
+        time_val = float(batch["time"])
+        mask_pre = batch.get("mask_pre", None)
+        mask_post = batch.get("mask_post", None)
+
+        if mask_pre is not None:
+            mask_pre = self._downscale_if_required(mask_pre.to(self.device))
+        if mask_post is not None:
+            mask_post = self._downscale_if_required(mask_post.to(self.device))
+
+        # --- Mask selection logic (same as training) ---
+        if time_val <= 0.25 and mask_post is not None:
+            mask = mask_post
+        elif time_val >= 0.25 and mask_pre is not None and mask_post is not None:
+            mask = torch.clamp(mask_pre + mask_post, 0.0, 1.0)
+        else:
+            mask = None 
+
+        # print(f"mask shape: {mask.shape if mask is not None else None}")
+        # print(f"gt_rgb shape: {gt_rgb.shape}")
+        # print(f"predicted_rgb shape: {predicted_rgb.shape}")
+        # print(mask.shape, mask.dtype)
 
         import os
         import torchvision.utils as vutils
@@ -1044,7 +1007,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             debug_gt_masked = gt_rgb * mask_expanded
             debug_pred_masked = predicted_rgb * mask_expanded
 
-            debug = True  # Set to True to enable debug saving
+            debug = False  # Set to True to enable debug saving
             
             # === Save only every 1000 steps ===
             if self.step % 1000 == 0 and debug:
