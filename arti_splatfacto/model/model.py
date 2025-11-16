@@ -38,6 +38,9 @@ from arti_splatfacto.utils.articulation_utils import apply_joint_transform, appl
 from arti_splatfacto.utils.normal_utils import normal_from_depth_image
 from arti_splatfacto.utils.loss_utils import opacity_loss
 from arti_splatfacto.utils.depth_loss import DepthLoss, compute_scale_and_shift
+from nerfstudio.utils.rich_utils import CONSOLE
+
+
 
 @torch_compile()
 def get_viewmat(optimized_camera_to_world):
@@ -104,6 +107,8 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
     opacity_lambda_obj: float = 0.01
     opacity_lambda_canon: float = 5e-4
 
+    training_mode: str = field(default="articulation")
+
 
 class ArtiSplatfactoModel(SplatfactoModel):    
 
@@ -120,6 +125,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         if self.config.use_depth:
             self.depth_loss_fn = DepthLoss()
+
 
 
     def populate_modules(self):
@@ -268,6 +274,20 @@ class ArtiSplatfactoModel(SplatfactoModel):
         # Actual angle = t * max_angle
         angles = t * max_angle_clamped
         return angles
+
+
+    def configure_training_stage(self):
+        """
+        Configure model parameters based on training_mode.
+        Called after loading checkpoint in recovery mode.
+        """
+        if self.config.training_mode == "recovery":
+            self.setup_recovery_stage()
+        elif self.config.training_mode == "articulation":
+            CONSOLE.print("[cyan]Articulation mode: Standard parameter configuration[/cyan]")
+        else:
+            raise ValueError(f"Unknown training_mode: {self.config.training_mode}")
+
         
     def state_dict(self, *args, **kwargs):
         state = super().state_dict(*args, **kwargs)
@@ -283,10 +303,117 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         return state
 
+
+    def setup_recovery_stage(self):
+        """
+        Configure model for recovery stage:
+        - Freeze geometry (means, scales, quats) for object + canonical + background
+        - Enable radiance (features_dc, features_rest, opacities) for ALL including background
+        - Restore background opacity from dimmed state
+        - Freeze joint geometry (pivot, axis, max_angle)
+        - Keep joint_t_raw trainable for per-frame alignment
+        - Articulation transforms remain ACTIVE (just not optimized)
+        """
+        CONSOLE.print("\n" + "="*70)
+        CONSOLE.print("[bold yellow]CONFIGURING MODEL FOR RECOVERY STAGE[/bold yellow]")
+        CONSOLE.print("="*70)
+        
+        # 1. Freeze geometric parameters
+        geometric_params = ["means", "scales", "quats"]
+        
+        CONSOLE.print("\n[cyan]Freezing geometric parameters...[/cyan]")
+        for param_name in geometric_params:
+            if param_name in self.gauss_params:
+                self.gauss_params[param_name].requires_grad = False
+                CONSOLE.print(f"  ✓ Froze object {param_name}: {self.gauss_params[param_name].shape}")
+            
+            if param_name in self.gauss_params_canonical:
+                self.gauss_params_canonical[param_name].requires_grad = False
+                CONSOLE.print(f"  ✓ Froze canonical {param_name}: {self.gauss_params_canonical[param_name].shape}")
+            
+            if param_name in self.gauss_params_fixed:
+                self.gauss_params_fixed[param_name].requires_grad = False
+                CONSOLE.print(f"  ✓ Froze background {param_name}: {self.gauss_params_fixed[param_name].shape}")
+        
+        # 2. Enable radiance parameters for ALL sets
+        radiance_params = ["features_dc", "features_rest", "opacities"]
+        
+        CONSOLE.print("\n[green]Enabling radiance parameters...[/green]")
+        for param_name in radiance_params:
+            if param_name in self.gauss_params:
+                self.gauss_params[param_name].requires_grad = True
+                CONSOLE.print(f"  ✓ Enabled object {param_name}: {self.gauss_params[param_name].shape}")
+            
+            if param_name in self.gauss_params_canonical:
+                self.gauss_params_canonical[param_name].requires_grad = True
+                CONSOLE.print(f"  ✓ Enabled canonical {param_name}: {self.gauss_params_canonical[param_name].shape}")
+            
+            if param_name in self.gauss_params_fixed:
+                # KEY: Make background trainable in recovery
+                self.gauss_params_fixed[param_name].requires_grad = True
+                CONSOLE.print(f"  [bold green]✓ Enabled background {param_name}: {self.gauss_params_fixed[param_name].shape}[/bold green]")
+        
+        # 3. Restore background opacity
+        CONSOLE.print("\n[yellow]Restoring background opacity...[/yellow]")
+        if "opacities" in self.gauss_params_fixed:
+            old_min = self.gauss_params_fixed["opacities"].data.min().item()
+            old_max = self.gauss_params_fixed["opacities"].data.max().item()
+            
+            # Reset to 0.0 (sigmoid(0) = 0.5 opacity)
+            self.gauss_params_fixed["opacities"].data.zero_()
+            
+            new_min = self.gauss_params_fixed["opacities"].data.min().item()
+            new_max = self.gauss_params_fixed["opacities"].data.max().item()
+            
+            CONSOLE.print(f"  ✓ Background opacity: [{old_min:.2f}, {old_max:.2f}] → [{new_min:.2f}, {new_max:.2f}]")
+            CONSOLE.print(f"    (sigmoid(0.0) = 0.5, background now at 50% opacity)")
+        
+        # 4. Freeze joint geometry parameters
+        CONSOLE.print("\n[cyan]Freezing joint geometry...[/cyan]")
+        if hasattr(self, 'joint_pivot'):
+            self.joint_pivot.requires_grad = False
+            CONSOLE.print(f"  ✓ Froze joint_pivot: {self.joint_pivot.data}")
+        
+        if hasattr(self, 'joint_axis_raw'):
+            self.joint_axis_raw.requires_grad = False
+            CONSOLE.print(f"  ✓ Froze joint_axis_raw: {self.joint_axis_raw.data}")
+        
+        if hasattr(self, 'max_joint_angle'):
+            self.max_joint_angle.requires_grad = False
+            CONSOLE.print(f"  ✓ Froze max_joint_angle: {self.max_joint_angle.data.item():.4f}")
+        
+        # 5. Keep per-frame articulation trainable
+        CONSOLE.print("\n[green]Keeping per-frame articulation trainable...[/green]")
+        if hasattr(self, 'joint_t_raw'):
+            self.joint_t_raw.requires_grad = True
+            CONSOLE.print(f"  ✓ joint_t_raw remains trainable: {self.joint_t_raw.shape}")
+            CONSOLE.print(f"    Current range: [{self.joint_t_values.min().item():.3f}, {self.joint_t_values.max().item():.3f}]")
+        
+        # 6. Important note about articulation
+        CONSOLE.print("\n[bold yellow]Note: Articulation transforms remain ACTIVE[/bold yellow]")
+        CONSOLE.print("  • get_joint_angle_for_camera() still works")
+        CONSOLE.print("  • apply_articulation_to_optimizer_params() still works")
+        CONSOLE.print("  • Rendering still uses articulated object Gaussians")
+        CONSOLE.print("  • Only joint parameters are frozen, not the transform itself")
+        
+        CONSOLE.print("\n" + "="*70)
+        CONSOLE.print("[bold green]RECOVERY STAGE CONFIGURATION COMPLETE[/bold green]")
+        CONSOLE.print("Geometry: FROZEN | Radiance: TRAINABLE | Articulation: ACTIVE")
+        CONSOLE.print("="*70 + "\n")
+
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
-        """Return optimizer param groups for gaussians."""
+        """Return optimizer param groups based on training mode."""
+        
+        if self.config.training_mode == "recovery":
+            return self.get_recovery_param_groups()
+        else:
+            return self.get_articulation_param_groups()
+    
+    def get_articulation_param_groups(self) -> Dict[str, List[Parameter]]:
+        """Standard parameter groups for articulation training (Stage 2)"""
         groups = {}
         
+        # Object parameters
         obj_param_mapping = {
             "obj_means": "means",
             "obj_scales": "scales", 
@@ -301,9 +428,8 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 internal_name in self.gauss_params and 
                 self.gauss_params[internal_name].numel() > 0):
                 groups[optimizer_name] = [self.gauss_params[internal_name]]
-                print(f"Added param group '{optimizer_name}': {self.gauss_params[internal_name].shape}")
-
-        # Canonical parameters  "means" -> optimizer "canon_means"
+        
+        # Canonical parameters
         canon_param_mapping = {
             "canon_means": "means",
             "canon_scales": "scales",
@@ -318,26 +444,92 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 internal_name in self.gauss_params_canonical and 
                 self.gauss_params_canonical[internal_name].numel() > 0):
                 groups[optimizer_name] = [self.gauss_params_canonical[internal_name]]
-                print(f"Added param group '{optimizer_name}': {self.gauss_params_canonical[internal_name].shape}")
         
+        # Joint parameters
         if hasattr(self, 'joint_pivot') and self.joint_pivot is not None:
             groups["joint_pivot"] = [self.joint_pivot]
-            print(f"Added param group 'joint_pivot': {self.joint_pivot.shape}")
         
         if hasattr(self, 'joint_axis_raw') and self.joint_axis_raw is not None:
-            groups["joint_axis"] = [self.joint_axis_raw]  
-            print(f"Added param group 'joint_axis': {self.joint_axis_raw.shape}")
+            groups["joint_axis"] = [self.joint_axis_raw]
         
         if hasattr(self, 'max_joint_angle') and self.max_joint_angle is not None:
             groups["max_joint_angle"] = [self.max_joint_angle]
-            print(f"Added param group 'max_joint_angle': {self.max_joint_angle.shape}")
                 
         if hasattr(self, 'joint_t_raw') and self.joint_t_raw is not None:
             groups["joint_t_values"] = [self.joint_t_raw]
-            print(f"Added param group 'joint_t_values': {self.joint_t_raw.shape} (num_frames={self.joint_t_raw.numel()})")
 
-        print(f"[debug] Created {len(groups)} parameter groups total")
-        return groups  
+        return groups
+
+
+    def get_recovery_param_groups(self) -> Dict[str, List[Parameter]]:
+        """Parameter groups for recovery training (Stage 3) - radiance only"""
+        groups = {}
+        
+        CONSOLE.print("\n[cyan]Building recovery parameter groups...[/cyan]")
+        
+        # Verify no geometric parameters have optimizers
+        for param_set_name in ["gauss_params", "gauss_params_canonical", "gauss_params_fixed"]:
+            if hasattr(self, param_set_name):
+                param_set = getattr(self, param_set_name)
+                for geom_name in ["means", "scales", "quats"]:
+                    if geom_name in param_set:
+                        param = param_set[geom_name]
+                        if param.requires_grad:
+                            raise RuntimeError(
+                                f"RECOVERY MODE ERROR: {param_set_name}.{geom_name} "
+                                f"has requires_grad=True but should be frozen!"
+                            )
+        
+        
+        # Object radiance
+        obj_radiance = {
+            "obj_features_dc": "features_dc",
+            "obj_features_rest": "features_rest",
+            "obj_opacities": "opacities",
+        }
+        
+        for opt_name, param_name in obj_radiance.items():
+            if (hasattr(self, 'gauss_params') and 
+                param_name in self.gauss_params and 
+                self.gauss_params[param_name].requires_grad):
+                groups[opt_name] = [self.gauss_params[param_name]]
+                CONSOLE.print(f"  ✓ {opt_name}: {self.gauss_params[param_name].shape}")
+        
+        # Canonical radiance
+        canon_radiance = {
+            "canon_features_dc": "features_dc",
+            "canon_features_rest": "features_rest",
+            "canon_opacities": "opacities",
+        }
+        
+        for opt_name, param_name in canon_radiance.items():
+            if (hasattr(self, 'gauss_params_canonical') and 
+                param_name in self.gauss_params_canonical and 
+                self.gauss_params_canonical[param_name].requires_grad):
+                groups[opt_name] = [self.gauss_params_canonical[param_name]]
+                CONSOLE.print(f"  ✓ {opt_name}: {self.gauss_params_canonical[param_name].shape}")
+        
+        # Background radiance (THE KEY ADDITION)
+        bg_radiance = {
+            "bg_features_dc": "features_dc",
+            "bg_features_rest": "features_rest",
+            "bg_opacities": "opacities",
+        }
+        
+        for opt_name, param_name in bg_radiance.items():
+            if (hasattr(self, 'gauss_params_fixed') and 
+                param_name in self.gauss_params_fixed and 
+                self.gauss_params_fixed[param_name].requires_grad):
+                groups[opt_name] = [self.gauss_params_fixed[param_name]]
+                CONSOLE.print(f"  [bold green]✓ {opt_name}: {self.gauss_params_fixed[param_name].shape}[/bold green]")
+        
+        # Per-frame articulation (for alignment)
+        if hasattr(self, 'joint_t_raw') and self.joint_t_raw.requires_grad:
+            groups["joint_t_values"] = [self.joint_t_raw]
+            CONSOLE.print(f"  ✓ joint_t_values: {self.joint_t_raw.shape}")
+        
+        CONSOLE.print(f"\n[green]Total: {len(groups)} recovery parameter groups[/green]\n")
+        return groups
         
     
     def _initialize_and_partition(self, state_dict: Dict[str, torch.Tensor]):
@@ -391,27 +583,11 @@ class ArtiSplatfactoModel(SplatfactoModel):
             print("Dimming background Gaussians for canonical visibility...")
             self.gauss_params_fixed["opacities"].data[:] = -10.0  
         
-
-
-
         print(f"Partitioning complete. Trainable: {self.gauss_params['means'].shape[0]}, Canonical: {self.gauss_params_canonical['means'].shape[0]}, Fixed: {self.gauss_params_fixed['means'].shape[0]}")
 
     def load_state_dict(self, state_dict: Dict[str, torch.Tensor], **kwargs):
         print(f"Loading state_dict (Training mode: {self.training})")
         assert self.config.obj_mask_file is not None and self.config.obj_mask_file.exists()
-
-        # # self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
-        # if hasattr(self.obj_3d_seg, 'joint_axis') and self.obj_3d_seg.joint_axis is not None:
-        #     self.joint_axis = self.obj_3d_seg.joint_axis.to(self.device)
-        #     # self.joint_axis = torch.tensor([0.0, 1.0, 0.0], device=self.device)
-        #     print(f"Updated joint axis from mask: {self.joint_axis}")
-        # if hasattr(self.obj_3d_seg, 'joint_pivot') and self.obj_3d_seg.joint_pivot is not None:
-        #     self.joint_pivot = self.obj_3d_seg.joint_pivot.to(self.device)
-        #     print(f"Updated joint pivot from mask: {self.joint_pivot}")
-        # if hasattr(self.obj_3d_seg, 'joint_angle') and self.obj_3d_seg.joint_angle is not None:
-        #     self.max_joint_angle = self.obj_3d_seg.joint_angle.to(self.device)
-        #     print(f"Updated joint angles from mask: {self.max_joint_angle}")
-
 
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
@@ -474,6 +650,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         super().load_state_dict(non_gauss_state, strict=False)
         self.step = 0
+        self.configure_training_stage()
         
         print(f"Load complete — obj={self.gauss_params['means'].shape[0]}, "
             f"canon={self.gauss_params_canonical['means'].shape[0]}, "
@@ -485,11 +662,28 @@ class ArtiSplatfactoModel(SplatfactoModel):
         self.optimizers = optimizers.optimizers
         self.schedulers = optimizers.schedulers
 
-
     def step_post_backward(self, step):
         """Apply strategy to both object and canonical parameters separately"""
         assert step == self.step
         
+        # === RECOVERY MODE: Skip all geometric refinement ===
+        if self.config.training_mode == "recovery":
+            if step % 500 == 0:
+                CONSOLE.print(f"[yellow]Step {step}: Recovery mode - skipping densification[/yellow]")
+                CONSOLE.print("  • Geometry frozen (no splits/clones/prunes)")
+                CONSOLE.print("  • Radiance optimization only")
+                
+                # Debug: check if background is getting gradients
+                if hasattr(self, 'gauss_params_fixed'):
+                    bg_features_grad = self.gauss_params_fixed['features_dc'].grad
+                    if bg_features_grad is not None:
+                        CONSOLE.print(f"  ✓ Background getting gradients: {bg_features_grad.norm():.6e}")
+                    else:
+                        CONSOLE.print("  [red]✗ Background NOT getting gradients![/red]")
+            
+            return
+        
+        # === ARTICULATION MODE: Normal densification ===
         if not isinstance(self.strategy, DefaultStrategy):
             raise ValueError(f"Only DefaultStrategy supported, got {self.strategy}")
 
@@ -621,7 +815,87 @@ class ArtiSplatfactoModel(SplatfactoModel):
             print(f"⚠️ Step {step}: Skipping canonical strategy (0 visible canonical Gaussians)")
 
 
-    def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
+
+
+
+    def get_loss_dict(self, outputs, batch, metrics_dict=None):
+        """Route to appropriate loss function based on training mode"""
+        if self.config.training_mode == "recovery":
+            return self.get_loss_dict_recovery(outputs, batch, metrics_dict)
+        else:
+            return self.get_loss_dict_articulation(outputs, batch, metrics_dict)
+    
+
+
+    def get_loss_dict_recovery(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
+        """Computes and returns the losses dict.
+
+        Args:
+            outputs: the output to compute loss dict to
+            batch: ground truth batch corresponding to outputs
+            metrics_dict: dictionary of metrics, some of which we can use for loss
+        """
+        gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
+        pred_img = outputs["rgb"]
+
+
+        Ll1 = torch.abs(gt_img - pred_img).mean()
+        simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
+        if self.config.use_scale_regularization and self.step % 10 == 0:
+            scale_exp = torch.exp(self.scales)
+            scale_reg = (
+                torch.maximum(
+                    scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1),
+                    torch.tensor(self.config.max_gauss_ratio),
+                )
+                - self.config.max_gauss_ratio
+            )
+            scale_reg = 0.1 * scale_reg.mean()
+        else:
+            scale_reg = torch.tensor(0.0).to(self.device)
+
+        loss_dict = {
+            "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
+            "scale_reg": scale_reg,
+        }
+
+        # Losses for mcmc
+        if self.config.strategy == "mcmc":
+            if self.config.mcmc_opacity_reg > 0.0:
+                mcmc_opacity_reg = (
+                    self.config.mcmc_opacity_reg * torch.abs(torch.sigmoid(self.gauss_params["opacities"])).mean()
+                )
+                loss_dict["mcmc_opacity_reg"] = mcmc_opacity_reg
+            if self.config.mcmc_scale_reg > 0.0:
+                mcmc_scale_reg = self.config.mcmc_scale_reg * torch.abs(torch.exp(self.gauss_params["scales"])).mean()
+                loss_dict["mcmc_scale_reg"] = mcmc_scale_reg
+
+        if self.training:
+            # Add loss from camera optimizer
+            self.camera_optimizer.get_loss_dict(loss_dict)
+            if self.config.use_bilateral_grid:
+                loss_dict["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)
+
+        if self.config.use_depth and "depth_image" in batch and outputs.get("depth") is not None:
+
+            gt_depth = self._downscale_if_required(batch["depth_image"])
+            gt_depth = gt_depth.to(self.device)
+            depth_mask = gt_depth > 0
+            if depth_mask.any():
+                depth_loss = torch.nn.functional.l1_loss(
+                    outputs["depth"][depth_mask], 
+                    gt_depth[depth_mask]
+                )
+                loss_dict["depth_loss"] = depth_loss * 0.1
+
+        return loss_dict
+
+
+
+
+
+
+    def get_loss_dict_articulation(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         pred_img = outputs["rgb"]
         mask = batch.get("mask", None)
@@ -730,31 +1004,9 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 prev_t = t_values[frame_idx - 1]
                 smooth_penalty = (current_t - prev_t) ** 2
             
-            # Very light weight - let reconstruction loss dominate
             joint_reg = 0.01 * smooth_penalty
             loss_dict["joint_reg"] = joint_reg
             
-            if self.step % 100 == 0:
-                if self.joint_t_raw.grad is not None:
-                    grad_norm = self.joint_t_raw.grad.norm().item()
-                    grad_mean = self.joint_t_raw.grad.abs().mean().item()
-                    print(f"[Joint Grad] t_raw: norm={grad_norm:.6f}, mean={grad_mean:.6f}")
-                    
-                    # Check per-frame gradients
-                    grad_nonzero = (self.joint_t_raw.grad.abs() > 1e-8).sum().item()
-                    print(f"  Frames with gradient: {grad_nonzero}/{len(self.joint_t_raw)}")
-                else:
-                    print(f"[Joint Grad] t_raw: NO GRADIENT!")
-                
-                # Also log max_angle gradient
-                if hasattr(self, 'max_joint_angle') and self.max_joint_angle.grad is not None:
-                    max_angle_grad = self.max_joint_angle.grad.item()
-                    print(f"[Joint Grad] max_angle: {max_angle_grad:.6f}, current_value={self.max_joint_angle.item():.3f}")
-                
-                # Log current state
-                print(f"[Joint State] frame={frame_idx}, t={current_t.item():.3f}, "
-                    f"angle={current_angle.item():.3f}, max_angle={self.max_joint_angle.item():.3f}")
-
         if self.config.use_opacity_regularization and self.training:
 
             obj_opacity = torch.sigmoid(self.gauss_params["opacities"])
@@ -865,40 +1117,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         elif self.step % 100 != 0:
             self._debug_saved_this_step = False
 
-        
-        if self.step % 100 == 0:
-            self.check_joint_gradients()
 
-            print(f"\n=== Batch Analysis [GETLOSS DICT] === step {self.step}")
-            print(f"Batch keys: {batch.keys()}")
-            
-            # Check how many images/frames in this batch
-            if 'image' in batch:
-                img_shape = batch['image'].shape
-                print(f"Image batch shape: {img_shape}")
-            
-            if 'time' in batch:
-                time_val = batch['time']
-                print(f"Time value: {time_val}")
-                print(f"Time shape: {time_val.shape if isinstance(time_val, torch.Tensor) else 'scalar'}")
-                
-                # If time is a tensor with multiple values, you have multiple frames
-                if isinstance(time_val, torch.Tensor):
-                    if time_val.numel() > 1:
-                        print(f"Multiple frames in batch: {time_val.numel()}")
-                        print(f"Time values: {time_val.flatten()[:10]}...")  # First 10
-                    else:
-                        print(f"Single frame in batch, time={time_val.item():.4f}")
-                        
-                        # Calculate which frame this corresponds to
-                        num_frames = len(self.joint_t_values)
-                        frame_idx = int(time_val.item() * (num_frames - 1))
-                        print(f"Frame index: {frame_idx}/{num_frames}")
-            
-            if 'image_idx' in batch:
-                print(f"Image index: {batch['image_idx']}")
-
-            # import pdb; pdb.set_trace()
         
         return loss_dict
 
@@ -1202,45 +1421,33 @@ class ArtiSplatfactoModel(SplatfactoModel):
     def get_gaussians_for_render(self, camera: Cameras) -> Dict[str, torch.Tensor]:
         """
         Prepare Gaussians for rendering with per-frame articulation.
-        Training: object (articulated) + canonical (identity)
-        Eval: object (articulated) + canonical (identity) + background
+        
+        Articulation mode: object (articulated) + canonical (identity)
+        Recovery mode: object (articulated) + canonical (identity) + background
+        Eval mode: object (articulated) + canonical (identity) + background
         """
-        
         joint_angle = self.get_joint_angle_for_camera(camera)
-        
         articulated_obj_params = apply_articulation_to_optimizer_params(self, joint_angle)
-
-        if self.training:
-            
-            combined_params = {}
-            for name in articulated_obj_params.keys():
-                obj_tensor = articulated_obj_params[name]
-                canon_tensor = self.gauss_params_canonical[name]  # Canonical at identity pose
-                
-                # Concatenate along the first dimension (number of Gaussians)
-                combined_params[name] = torch.cat([obj_tensor, canon_tensor], dim=0)
-            
-            n_obj = articulated_obj_params['means'].shape[0]
-            n_canon = self.gauss_params_canonical['means'].shape[0]
-            total = combined_params['means'].shape[0]
-            
-            # print(f"[Training render]: obj({n_obj}) + canon({n_canon}) = {total} total")
-            # print(f"   Object: articulated at {joint_angle:.3f} rad")
-            # print(f"   Canonical: identity pose")
-
-            return combined_params
-        else:
-            # Evaluation mode: object (articulated) + canonical (identity) + background
-            print(f"[ Eval mode]: combining articulated object + canonical + background")
-            
-            # Start with articulated object + canonical
-            combined_params = {}
-            for name in articulated_obj_params.keys():
-                obj_tensor = articulated_obj_params[name]
-                canon_tensor = self.gauss_params_canonical[name].data  # Use .data for eval
-                combined_params[name] = torch.cat([obj_tensor, canon_tensor], dim=0)
-            
-            # Add background if available
+        
+        # Decide whether to include background
+        include_background = (
+            not self.training or  # Eval mode: always include
+            self.config.training_mode == "recovery"  # Recovery training: include
+        )
+        # Articulation training: exclude background (it's frozen and dimmed)
+        
+        # Start with object + canonical
+        combined_params = {}
+        for name in articulated_obj_params.keys():
+            obj_tensor = articulated_obj_params[name]
+            canon_tensor = self.gauss_params_canonical[name]
+            combined_params[name] = torch.cat([obj_tensor, canon_tensor], dim=0)
+        
+        n_obj = articulated_obj_params['means'].shape[0]
+        n_canon = self.gauss_params_canonical['means'].shape[0]
+        
+        # Add background if needed
+        if include_background:
             if (hasattr(self, "gauss_params_fixed") and 
                 self.gauss_params_fixed is not None and 
                 len(self.gauss_params_fixed) > 0 and
@@ -1249,25 +1456,35 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 full_scene_params = {}
                 for name in combined_params.keys():
                     combined_tensor = combined_params[name]
-                    bg_tensor = self.gauss_params_fixed[name].data
+                    bg_tensor = self.gauss_params_fixed[name]
+                    
+                    # In training, keep gradients; in eval, use .data
+                    if not self.training:
+                        bg_tensor = bg_tensor.data
                     
                     if combined_tensor.device != bg_tensor.device:
                         bg_tensor = bg_tensor.to(combined_tensor.device)
                     
                     full_scene_params[name] = torch.cat([combined_tensor, bg_tensor], dim=0)
                 
-                n_obj = articulated_obj_params['means'].shape[0]
-                n_canon = self.gauss_params_canonical['means'].shape[0]
                 n_bg = self.gauss_params_fixed['means'].shape[0]
                 total = full_scene_params['means'].shape[0]
                 
-                print(f"[Eval render check]:")
-                print(f"   Object: {n_obj}, Canonical: {n_canon}, Background: {n_bg}, Total: {total}")
+                if self.step % 100 == 0:
+                    mode = "Recovery" if self.config.training_mode == "recovery" else "Eval"
+                    CONSOLE.print(f"[{mode}] Rendering: Obj({n_obj}) + Canon({n_canon}) + BG({n_bg}) = {total}")
                 
                 return full_scene_params
             else:
-                print("[!!] No background gaussians found - rendering object + canonical only")
-                return combined_params
+                if self.step % 100 == 0:
+                    CONSOLE.print("[yellow]Warning: Background requested but not found[/yellow]")
+        
+        # No background: obj + canon only
+        if self.step % 100 == 0:
+            mode = "Articulation Training" if self.training else "Eval (no BG)"
+            CONSOLE.print(f"[{mode}] Rendering: Obj({n_obj}) + Canon({n_canon}) = {n_obj + n_canon}")
+        
+        return combined_params
 
 
 
