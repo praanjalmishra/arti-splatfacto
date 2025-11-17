@@ -318,23 +318,37 @@ class ArtiSplatfactoModel(SplatfactoModel):
         CONSOLE.print("[bold yellow]CONFIGURING MODEL FOR RECOVERY STAGE[/bold yellow]")
         CONSOLE.print("="*70)
         
-        # 1. Freeze geometric parameters
-        geometric_params = ["means", "scales", "quats"]
+        # # 1. Freeze geometric parameters
+        # geometric_params = ["means", "scales", "quats"]
         
-        CONSOLE.print("\n[cyan]Freezing geometric parameters...[/cyan]")
-        for param_name in geometric_params:
+        # CONSOLE.print("\n[cyan]Freezing geometric parameters...[/cyan]")
+        # for param_name in geometric_params:
+        #     if param_name in self.gauss_params:
+        #         self.gauss_params[param_name].requires_grad = False
+        #         CONSOLE.print(f"  ✓ Froze object {param_name}: {self.gauss_params[param_name].shape}")
+            
+        #     if param_name in self.gauss_params_canonical:
+        #         self.gauss_params_canonical[param_name].requires_grad = False
+        #         CONSOLE.print(f"  ✓ Froze canonical {param_name}: {self.gauss_params_canonical[param_name].shape}")
+            
+        #     if param_name in self.gauss_params_fixed:
+        #         self.gauss_params_fixed[param_name].requires_grad = False
+        #         CONSOLE.print(f"  ✓ Froze background {param_name}: {self.gauss_params_fixed[param_name].shape}")
+        
+        for param_name in ["means", "scales", "quats"]:
             if param_name in self.gauss_params:
-                self.gauss_params[param_name].requires_grad = False
-                CONSOLE.print(f"  ✓ Froze object {param_name}: {self.gauss_params[param_name].shape}")
+                self.gauss_params[param_name].requires_grad = True
+                CONSOLE.print(f"  [green]✓ Kept object {param_name} trainable[/green]")
             
             if param_name in self.gauss_params_canonical:
-                self.gauss_params_canonical[param_name].requires_grad = False
-                CONSOLE.print(f"  ✓ Froze canonical {param_name}: {self.gauss_params_canonical[param_name].shape}")
+                self.gauss_params_canonical[param_name].requires_grad = True
+                CONSOLE.print(f"  [green]✓ Kept canonical {param_name} trainable[/green]")
             
             if param_name in self.gauss_params_fixed:
-                self.gauss_params_fixed[param_name].requires_grad = False
-                CONSOLE.print(f"  ✓ Froze background {param_name}: {self.gauss_params_fixed[param_name].shape}")
+                self.gauss_params_fixed[param_name].requires_grad = True
+                CONSOLE.print(f"  [green]✓ Kept background {param_name} trainable[/green]")
         
+
         # 2. Enable radiance parameters for ALL sets
         radiance_params = ["features_dc", "features_rest", "opacities"]
         
@@ -354,19 +368,19 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 CONSOLE.print(f"  [bold green]✓ Enabled background {param_name}: {self.gauss_params_fixed[param_name].shape}[/bold green]")
         
         # 3. Restore background opacity
-        CONSOLE.print("\n[yellow]Restoring background opacity...[/yellow]")
-        if "opacities" in self.gauss_params_fixed:
-            old_min = self.gauss_params_fixed["opacities"].data.min().item()
-            old_max = self.gauss_params_fixed["opacities"].data.max().item()
+        # CONSOLE.print("\n[yellow]Restoring background opacity...[/yellow]")
+        # if "opacities" in self.gauss_params_fixed:
+        #     old_min = self.gauss_params_fixed["opacities"].data.min().item()
+        #     old_max = self.gauss_params_fixed["opacities"].data.max().item()
             
-            # Reset to 0.0 (sigmoid(0) = 0.5 opacity)
-            self.gauss_params_fixed["opacities"].data.zero_()
+        #     # # Reset to 0.0 (sigmoid(0) = 0.5 opacity)
+        #     # self.gauss_params_fixed["opacities"].data.zero_()
             
-            new_min = self.gauss_params_fixed["opacities"].data.min().item()
-            new_max = self.gauss_params_fixed["opacities"].data.max().item()
+        #     new_min = self.gauss_params_fixed["opacities"].data.min().item()
+        #     new_max = self.gauss_params_fixed["opacities"].data.max().item()
             
-            CONSOLE.print(f"  ✓ Background opacity: [{old_min:.2f}, {old_max:.2f}] → [{new_min:.2f}, {new_max:.2f}]")
-            CONSOLE.print(f"    (sigmoid(0.0) = 0.5, background now at 50% opacity)")
+        #     CONSOLE.print(f"  ✓ Background opacity: [{old_min:.2f}, {old_max:.2f}] → [{new_min:.2f}, {new_max:.2f}]")
+        #     CONSOLE.print(f"    (sigmoid(0.0) = 0.5, background now at 50% opacity)")
         
         # 4. Freeze joint geometry parameters
         CONSOLE.print("\n[cyan]Freezing joint geometry...[/cyan]")
@@ -409,121 +423,61 @@ class ArtiSplatfactoModel(SplatfactoModel):
         else:
             return self.get_articulation_param_groups()
     
-    def get_articulation_param_groups(self) -> Dict[str, List[Parameter]]:
-        """Standard parameter groups for articulation training (Stage 2)"""
-        groups = {}
-        
-        # Object parameters
-        obj_param_mapping = {
-            "obj_means": "means",
-            "obj_scales": "scales", 
-            "obj_quats": "quats",
-            "obj_features_dc": "features_dc",
-            "obj_features_rest": "features_rest",
-            "obj_opacities": "opacities",
-        }
-        
-        for optimizer_name, internal_name in obj_param_mapping.items():
-            if (hasattr(self, 'gauss_params') and 
-                internal_name in self.gauss_params and 
-                self.gauss_params[internal_name].numel() > 0):
-                groups[optimizer_name] = [self.gauss_params[internal_name]]
-        
-        # Canonical parameters
-        canon_param_mapping = {
-            "canon_means": "means",
-            "canon_scales": "scales",
-            "canon_quats": "quats", 
-            "canon_features_dc": "features_dc",
-            "canon_features_rest": "features_rest",
-            "canon_opacities": "opacities",
-        }
-            
-        for optimizer_name, internal_name in canon_param_mapping.items():
-            if (hasattr(self, 'gauss_params_canonical') and 
-                internal_name in self.gauss_params_canonical and 
-                self.gauss_params_canonical[internal_name].numel() > 0):
-                groups[optimizer_name] = [self.gauss_params_canonical[internal_name]]
-        
-        # Joint parameters
-        if hasattr(self, 'joint_pivot') and self.joint_pivot is not None:
-            groups["joint_pivot"] = [self.joint_pivot]
-        
-        if hasattr(self, 'joint_axis_raw') and self.joint_axis_raw is not None:
-            groups["joint_axis"] = [self.joint_axis_raw]
-        
-        if hasattr(self, 'max_joint_angle') and self.max_joint_angle is not None:
-            groups["max_joint_angle"] = [self.max_joint_angle]
-                
-        if hasattr(self, 'joint_t_raw') and self.joint_t_raw is not None:
-            groups["joint_t_values"] = [self.joint_t_raw]
-
-        return groups
-
-
     def get_recovery_param_groups(self) -> Dict[str, List[Parameter]]:
-        """Parameter groups for recovery training (Stage 3) - radiance only"""
+        """Parameter groups for recovery training - radiance + means + quats"""
         groups = {}
         
         CONSOLE.print("\n[cyan]Building recovery parameter groups...[/cyan]")
         
-        # Verify no geometric parameters have optimizers
-        for param_set_name in ["gauss_params", "gauss_params_canonical", "gauss_params_fixed"]:
-            if hasattr(self, param_set_name):
-                param_set = getattr(self, param_set_name)
-                for geom_name in ["means", "scales", "quats"]:
-                    if geom_name in param_set:
-                        param = param_set[geom_name]
-                        if param.requires_grad:
-                            raise RuntimeError(
-                                f"RECOVERY MODE ERROR: {param_set_name}.{geom_name} "
-                                f"has requires_grad=True but should be frozen!"
-                            )
-        
-        
-        # Object radiance
-        obj_radiance = {
+        # Object geometry + radiance
+        obj_params = {
+            "obj_means": "means",              # NOW INCLUDED
+            "obj_quats": "quats",              # NOW INCLUDED
             "obj_features_dc": "features_dc",
             "obj_features_rest": "features_rest",
             "obj_opacities": "opacities",
         }
         
-        for opt_name, param_name in obj_radiance.items():
+        for opt_name, param_name in obj_params.items():
             if (hasattr(self, 'gauss_params') and 
                 param_name in self.gauss_params and 
                 self.gauss_params[param_name].requires_grad):
                 groups[opt_name] = [self.gauss_params[param_name]]
                 CONSOLE.print(f"  ✓ {opt_name}: {self.gauss_params[param_name].shape}")
         
-        # Canonical radiance
-        canon_radiance = {
+        # Canonical geometry + radiance
+        canon_params = {
+            "canon_means": "means",            # NOW INCLUDED
+            "canon_quats": "quats",            # NOW INCLUDED
             "canon_features_dc": "features_dc",
             "canon_features_rest": "features_rest",
             "canon_opacities": "opacities",
         }
         
-        for opt_name, param_name in canon_radiance.items():
+        for opt_name, param_name in canon_params.items():
             if (hasattr(self, 'gauss_params_canonical') and 
                 param_name in self.gauss_params_canonical and 
                 self.gauss_params_canonical[param_name].requires_grad):
                 groups[opt_name] = [self.gauss_params_canonical[param_name]]
                 CONSOLE.print(f"  ✓ {opt_name}: {self.gauss_params_canonical[param_name].shape}")
         
-        # Background radiance (THE KEY ADDITION)
-        bg_radiance = {
+        # Background geometry + radiance
+        bg_params = {
+            "bg_means": "means",               # NOW INCLUDED
+            "bg_quats": "quats",               # NOW INCLUDED
             "bg_features_dc": "features_dc",
             "bg_features_rest": "features_rest",
             "bg_opacities": "opacities",
         }
         
-        for opt_name, param_name in bg_radiance.items():
+        for opt_name, param_name in bg_params.items():
             if (hasattr(self, 'gauss_params_fixed') and 
                 param_name in self.gauss_params_fixed and 
                 self.gauss_params_fixed[param_name].requires_grad):
                 groups[opt_name] = [self.gauss_params_fixed[param_name]]
                 CONSOLE.print(f"  [bold green]✓ {opt_name}: {self.gauss_params_fixed[param_name].shape}[/bold green]")
         
-        # Per-frame articulation (for alignment)
+        # Per-frame articulation
         if hasattr(self, 'joint_t_raw') and self.joint_t_raw.requires_grad:
             groups["joint_t_values"] = [self.joint_t_raw]
             CONSOLE.print(f"  ✓ joint_t_values: {self.joint_t_raw.shape}")
@@ -579,9 +533,9 @@ class ArtiSplatfactoModel(SplatfactoModel):
         # if hasattr(self, 'joint_pivot'):
         #     self.validate_joint_parameters()
 
-        if hasattr(self, "gauss_params_fixed") and "opacities" in self.gauss_params_fixed:
-            print("Dimming background Gaussians for canonical visibility...")
-            self.gauss_params_fixed["opacities"].data[:] = -10.0  
+        # if hasattr(self, "gauss_params_fixed") and "opacities" in self.gauss_params_fixed:
+        #     print("Dimming background Gaussians for canonical visibility...")
+        #     self.gauss_params_fixed["opacities"].data[:] = -10.0  
         
         print(f"Partitioning complete. Trainable: {self.gauss_params['means'].shape[0]}, Canonical: {self.gauss_params_canonical['means'].shape[0]}, Fixed: {self.gauss_params_fixed['means'].shape[0]}")
 

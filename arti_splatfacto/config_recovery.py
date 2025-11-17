@@ -18,7 +18,7 @@ arti_splatfacto_recovery_config = MethodSpecification(
         method_name="arti_splatfacto_recovery",
         steps_per_eval_batch=100,
         steps_per_save=1000,
-        max_num_iterations=10000,  # Shorter recovery phase
+        max_num_iterations=10000, 
         mixed_precision=False,
         pipeline=VanillaPipelineConfig(
             datamanager=FullImageDatamanagerConfig(
@@ -27,7 +27,7 @@ arti_splatfacto_recovery_config = MethodSpecification(
                 cache_images_type="uint8",
             ),
             model=ArtiSplatfactoModelConfig(
-                training_mode="recovery",  # KEY DIFFERENCE
+                training_mode="recovery", 
                 
                 refine_every=100,  
                 stop_split_at=0,
@@ -35,11 +35,18 @@ arti_splatfacto_recovery_config = MethodSpecification(
                 use_scale_regularization=False,  
                 output_depth_during_training=True,
                 use_depth=True,
-                depth_lambda=0.1,  
+                depth_lambda=0.2,  
             )
         ),
         optimizers={
-            # === Object Radiance Only ===
+            "obj_means": {
+                "optimizer": AdamOptimizerConfig(lr=5e-5, eps=1e-15),  # Low LR!
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-6, max_steps=10000),
+            },
+            "obj_quats": {
+                "optimizer": AdamOptimizerConfig(lr=0.0005, eps=1e-15),
+                "scheduler": None,
+            },  
             "obj_features_dc": {
                 "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),  # Lower LR
                 "scheduler": ExponentialDecaySchedulerConfig(
@@ -59,7 +66,14 @@ arti_splatfacto_recovery_config = MethodSpecification(
                 "scheduler": None,
             },
             
-            # === Canonical Radiance Only ===
+            "canon_means": {
+                "optimizer": AdamOptimizerConfig(lr=5e-5, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-6, max_steps=10000),
+            },
+            "canon_quats": {
+                "optimizer": AdamOptimizerConfig(lr=0.0005, eps=1e-15),
+                "scheduler": None,
+            },            
             "canon_features_dc": {
                 "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(
@@ -78,8 +92,15 @@ arti_splatfacto_recovery_config = MethodSpecification(
                 "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),
                 "scheduler": None,
             },
-            
-            # === Background Radiance (THE KEY ADDITION) ===
+
+            "bg_means": {
+                "optimizer": AdamOptimizerConfig(lr=5e-5, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-6, max_steps=10000),
+            },
+            "bg_quats": {
+                "optimizer": AdamOptimizerConfig(lr=0.0005, eps=1e-15),
+                "scheduler": None,
+            },            
             "bg_features_dc": {
                 "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(
