@@ -108,6 +108,8 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
     opacity_lambda_canon: float = 5e-4
 
     training_mode: str = field(default="articulation")
+    joint_correction_lambda: float = 0.01
+
 
 
 class ArtiSplatfactoModel(SplatfactoModel):    
@@ -194,51 +196,25 @@ class ArtiSplatfactoModel(SplatfactoModel):
         )
 
 
-        # Per-frame articulation parameters (t values from 0 to 1)
         joint_angles_meta = self.metadata.get("joint_angles", [])
         num_frames = len(joint_angles_meta)
-        print(f"Found {num_frames} frames with joint angles")
 
         if num_frames > 0:
-            # Convert metadata angles to normalized t values if they exist
-            # Check if metadata is a list/tensor of numbers
-            try:
-                # Try to convert to tensor - handles both lists and tensors
-                if isinstance(joint_angles_meta, torch.Tensor):
-                    meta_tensor = joint_angles_meta.to(device).float()
-                else:
-                    meta_tensor = torch.tensor(joint_angles_meta, device=device, dtype=torch.float32)
-                
-                # Normalize to [0, 1] based on the range in metadata
-                meta_min, meta_max = meta_tensor.min(), meta_tensor.max()
-                if meta_max > meta_min:
-                    initial_t = (meta_tensor - meta_min) / (meta_max - meta_min)
-                    print(f"  Normalized metadata angles from [{meta_min.item():.3f}, {meta_max.item():.3f}] to [0, 1]")
-                else:
-                    # All angles are the same - use uniform distribution
-                    initial_t = torch.linspace(0.0, 1.0, num_frames, device=device, dtype=torch.float32)
-                    print(f"  All metadata angles identical ({meta_min.item():.3f}) - using uniform t distribution")
-            except (ValueError, TypeError):
-                # Metadata is not numeric - start with uniform distribution
-                initial_t = torch.linspace(0.0, 1.0, num_frames, device=device, dtype=torch.float32)
-                print(f"  Non-numeric metadata - using uniform t distribution")
+            # Store prior in physical units (no modification)
+            prior_tensor = torch.tensor(joint_angles_meta, device=device, dtype=torch.float32)
+            self.register_buffer('joint_angles_prior', prior_tensor)
             
-            # Clamp to [0, 1]
-            initial_t = torch.clamp(initial_t, 0.0, 1.0)
+            # Initialize corrections to exactly zero
+            self.joint_angle_deltas = torch.nn.Parameter(torch.zeros(num_frames, device=device))
             
-            # Convert to sigmoid space: logit(t)
-            initial_t_safe = torch.clamp(initial_t * 0.9 + 0.05, 0.05, 0.95) # Avoid inf
+            # Store physical limits
+            joint_min, joint_max = self.obj_3d_seg.joint_limits[0], self.obj_3d_seg.joint_limits[1]
+            self.register_buffer('joint_limits', torch.tensor([joint_min, joint_max], device=device))
             
-            # Raw parameter (unbounded, will be passed through sigmoid to get t ∈ [0,1])
-            self.joint_t_raw = torch.nn.Parameter(
-                torch.log(initial_t_safe / (1 - initial_t_safe)),
-                requires_grad=True
-            )
-            
-            print(f"Initialized {num_frames} joint t-values with sigmoid parameterization")
-            print(f"  Initial t: min={initial_t.min().item():.3f}, max={initial_t.max().item():.3f}, "
-                f"mean={initial_t.mean().item():.3f}")
-            print(f"  Initial max_angle: {initial_max_angle:.3f}")
+            print(f"Initialized joint angles with Δθ correction approach:")
+            print(f"  Prior range: [{prior_tensor.min():.3f}, {prior_tensor.max():.3f}]")
+            print(f"  Physical limits: [{joint_min:.3f}, {joint_max:.3f}]") 
+            print(f"  Corrections initialized to 0.0")
 
         self.rgb_metrics = RGBMetrics()
         self.depth_metrics = DepthMetrics()
@@ -251,29 +227,17 @@ class ArtiSplatfactoModel(SplatfactoModel):
         return F.normalize(self.joint_axis_raw, dim=0)
 
     @property
-    def joint_t_values(self):
-        """Get normalized t values (progress from closed to open) ∈ [0, 1]"""
-        if not hasattr(self, 'joint_t_raw'):
-            return None
-        
-        # Sigmoid ensures output is in (0, 1)
-        t = torch.sigmoid(self.joint_t_raw)
-        # Clamp to exactly [0, 1] for safety
-        return torch.clamp(t, min=0.0, max=1.0)
-
-    @property
     def joint_angles(self):
-        """Get actual joint angles/displacements = t * max_angle"""
-        if not hasattr(self, 'joint_t_raw'):
-            return None
-        
-        t = self.joint_t_values
-        # Ensure max_angle is positive
-        max_angle_clamped = torch.clamp(self.max_joint_angle, min=0.0)
-        
-        # Actual angle = t * max_angle
-        angles = t * max_angle_clamped
-        return angles
+        """Final angles = prior + corrections, clamped to limits"""
+        raw_angles = self.joint_angles_prior + self.joint_angle_deltas
+        return torch.clamp(raw_angles, self.joint_limits[0], self.joint_limits[1])
+
+    @property  
+    def joint_angles_normalized(self):
+        """Normalized angles for stable optimization [0, 1]"""
+        angles = self.joint_angles
+        joint_min, joint_max = self.joint_limits[0], self.joint_limits[1]
+        return (angles - joint_min) / (joint_max - joint_min)
 
 
     def configure_training_stage(self):
@@ -423,6 +387,59 @@ class ArtiSplatfactoModel(SplatfactoModel):
         else:
             return self.get_articulation_param_groups()
     
+
+    def get_articulation_param_groups(self) -> Dict[str, List[Parameter]]:
+        """Standard parameter groups for articulation training (Stage 2)"""
+        groups = {}
+        
+        # Object parameters
+        obj_param_mapping = {
+            "obj_means": "means",
+            "obj_scales": "scales", 
+            "obj_quats": "quats",
+            "obj_features_dc": "features_dc",
+            "obj_features_rest": "features_rest",
+            "obj_opacities": "opacities",
+        }
+        
+        for optimizer_name, internal_name in obj_param_mapping.items():
+            if (hasattr(self, 'gauss_params') and 
+                internal_name in self.gauss_params and 
+                self.gauss_params[internal_name].numel() > 0):
+                groups[optimizer_name] = [self.gauss_params[internal_name]]
+        
+        # Canonical parameters
+        canon_param_mapping = {
+            "canon_means": "means",
+            "canon_scales": "scales",
+            "canon_quats": "quats", 
+            "canon_features_dc": "features_dc",
+            "canon_features_rest": "features_rest",
+            "canon_opacities": "opacities",
+        }
+            
+        for optimizer_name, internal_name in canon_param_mapping.items():
+            if (hasattr(self, 'gauss_params_canonical') and 
+                internal_name in self.gauss_params_canonical and 
+                self.gauss_params_canonical[internal_name].numel() > 0):
+                groups[optimizer_name] = [self.gauss_params_canonical[internal_name]]
+        
+        # Joint parameters
+        if hasattr(self, 'joint_pivot') and self.joint_pivot is not None:
+            groups["joint_pivot"] = [self.joint_pivot]
+        
+        if hasattr(self, 'joint_axis_raw') and self.joint_axis_raw is not None:
+            groups["joint_axis"] = [self.joint_axis_raw]
+        
+        if hasattr(self, 'max_joint_angle') and self.max_joint_angle is not None:
+            groups["max_joint_angle"] = [self.max_joint_angle]
+                
+        if hasattr(self, 'joint_angle_deltas') and self.joint_angle_deltas is not None:
+            groups["joint_corrections"] = [self.joint_angle_deltas]
+            print(f"Added param group 'joint_corrections': {self.joint_angle_deltas.shape}")
+
+        return groups
+
     def get_recovery_param_groups(self) -> Dict[str, List[Parameter]]:
         """Parameter groups for recovery training - radiance + means + quats"""
         groups = {}
@@ -500,7 +517,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
         all_means = state_dict["gauss_params.means"].to(self.device)
-        obj_mask = self.obj_3d_seg.query_refine(all_means, grow=3, thresh=0.01, bbox_margin=0.01).to(torch.bool).cpu()
+        obj_mask = self.obj_3d_seg.query_refine(all_means, grow=3, thresh=0.01, bbox_margin=0.00).to(torch.bool).cpu()
         bg_mask  = ~obj_mask
 
         for p in GAUSS:
@@ -589,9 +606,10 @@ class ArtiSplatfactoModel(SplatfactoModel):
             self.joint_pivot.data.copy_(state_dict["joint_pivot"].to(self.device))
             print(f"Loaded joint_pivot from checkpoint: {self.joint_pivot.data}")
             
-        if "joint_axis_raw" in state_dict:
-            self.joint_axis_raw.data.copy_(state_dict["joint_axis_raw"].to(self.device))
-            print(f"Loaded joint_axis_raw from checkpoint: {self.joint_axis_raw.data}")
+
+        if "joint_angle_deltas" in state_dict:
+            self.joint_angle_deltas.data.copy_(state_dict["joint_angle_deltas"].to(self.device))
+            print(f"Loaded joint_angle_deltas: range=[{self.joint_angle_deltas.min():.4f}, {self.joint_angle_deltas.max():.4f}]")
             
         if "joint_angles" in state_dict:
             self.joint_angles.data.copy_(state_dict["joint_angles"].to(self.device))
@@ -939,27 +957,41 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 print(f"[Depth - Step {self.step}] Loss: {depth_loss:.6f}, "
                     f"Scale: {scale.item():.4f}, Shift: {shift.item():.4f}")
 
-        if hasattr(self, "joint_t_raw") and self.joint_t_raw is not None:
-            t_values = self.joint_t_values
-            angles = self.joint_angles
-            
-            # Get current frame
+        if hasattr(self, "joint_angle_deltas") and self.joint_angle_deltas is not None:
+            # Get current frame info
             time_val = batch['time']
-            num_frames = len(t_values)
+            num_frames = len(self.joint_angle_deltas)
             frame_idx = int(time_val * (num_frames - 1))
             frame_idx = max(0, min(frame_idx, num_frames - 1))
             
-            current_t = t_values[frame_idx]
-            current_angle = angles[frame_idx]
+            # Soft regularization on corrections (spring back to prior)
+            delta_regularization = torch.mean(self.joint_angle_deltas**2)
+            loss_dict["joint_correction_reg"] = self.config.joint_correction_lambda * delta_regularization
             
-            # Temporal smoothness on t-values (optional, can be very light)
+            # Optional: Temporal smoothness between adjacent frame corrections
             smooth_penalty = torch.tensor(0.0, device=self.device)
             if frame_idx > 0:
-                prev_t = t_values[frame_idx - 1]
-                smooth_penalty = (current_t - prev_t) ** 2
+                prev_delta = self.joint_angle_deltas[frame_idx - 1]
+                current_delta = self.joint_angle_deltas[frame_idx]
+                smooth_penalty = (current_delta - prev_delta) ** 2
             
-            joint_reg = 0.01 * smooth_penalty
-            loss_dict["joint_reg"] = joint_reg
+            # Very light temporal smoothness (corrections should change gradually)
+            temporal_reg = 0.01 * smooth_penalty
+            loss_dict["joint_temporal_reg"] = temporal_reg
+            
+            # Debug logging
+            if self.step % 100 == 0:
+                current_correction = self.joint_angle_deltas[frame_idx].item()
+                max_correction = torch.abs(self.joint_angle_deltas).max().item()
+                mean_correction = torch.abs(self.joint_angle_deltas).mean().item()
+                
+                # Current physical angle
+                current_angle = self.joint_angles[frame_idx].item()
+                prior_angle = self.joint_angles_prior[frame_idx].item()
+                
+                print(f"[Joint Corrections - Step {self.step}]")
+                print(f"  Frame {frame_idx}: Prior={prior_angle:.3f}, Final={current_angle:.3f}, Δ={current_correction:.4f}")
+                print(f"  Correction stats: Max={max_correction:.4f}, Mean={mean_correction:.4f}")
             
         if self.config.use_opacity_regularization and self.training:
 
@@ -1343,32 +1375,29 @@ class ArtiSplatfactoModel(SplatfactoModel):
     
     def get_joint_angle_for_camera(self, camera: Cameras):
         """Return a differentiable joint angle tensor."""
+        if hasattr(camera, "metadata") and camera.metadata is not None:
+            angle_val = camera.metadata.get("joint_angles", None)
+            if angle_val is not None:
+                if torch.is_tensor(angle_val):
+                    return angle_val.to(self.device).float()
+                else:
+                    return torch.tensor([float(angle_val)], device=self.device)
 
-        # Case 1: Time-based (training / sequence)
+        # --- Case 2: time-based interpolation (training / sequences) ---
         if hasattr(camera, "times") and camera.times is not None:
-            time_val = camera.times.flatten()[0]  # scalar tensor in [0, 1]
+            time_val = camera.times.flatten()[0]
             num_frames = len(self.joint_angles)
-
-            # Continuous fractional index
             idx_f = time_val * (num_frames - 1)
             idx0 = torch.floor(idx_f).long().clamp(0, num_frames - 2)
             idx1 = idx0 + 1
-            w = idx_f - idx0.float()  # interpolation weight in [0, 1]
-
-            # Linear interpolation between adjacent frame angles
+            w = idx_f - idx0.float()
             angle0 = self.joint_angles[idx0]
             angle1 = self.joint_angles[idx1]
             angle = (1.0 - w) * angle0 + w * angle1
-            return angle  # still differentiable!
+            return angle
 
-        # Case 2: Metadata (eval)
-        if hasattr(camera, "metadata") and camera.metadata is not None:
-            angle = camera.metadata.get("joint_angle", 0.0)
-            return torch.tensor(angle, device=self.device, dtype=torch.float32)
-
-        # Default
-        return torch.tensor(0.0, device=self.device, dtype=torch.float32)
-
+        # --- Default ---
+        return torch.tensor([0.0], device=self.device, dtype=torch.float32)
 
         
 
