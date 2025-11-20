@@ -18,7 +18,7 @@ SKIP_3DGS_TRAIN=${4:-false}  # Set to 'true' to skip 3DGS training
 # Project paths
 PROJECT_ROOT="/local/home/pmishra/cvg/arti-splatfacto"
 OUTPUT_FOLDER="${PROJECT_ROOT}/outputs"
-NERFSTUDIO_FOLDER="/local/home/pmishra/nerfstudio"
+NERFSTUDIO_FOLDER="/local/home/pmishra/cvg/nerfstudio"
 
 # Environment setup
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
@@ -34,37 +34,49 @@ CURRENT_TIME=$(date +%Y-%m-%d_%H%M%S)
 # Pre-change sequence parameters
 ################################################################################
 
-PRECHANGE_DATA_DIR="data_real/day5/pre_raw"
-PRECHANGE_R3D_PATH="${PRECHANGE_DATA_DIR}/2025-10-23--14-19-03.r3d"
-PRECHANGE_OUTPUT_DIR="data_real/day5/pre"
-PRECHANGE_STRIDE=10
-PRECHANGE_START=50
-PRECHANGE_END=2200
+PRECHANGE_DATA_DIR="data_real/day8/pre_raw"
+PRECHANGE_R3D_PATH="${PRECHANGE_DATA_DIR}/pre.r3d"
+PRECHANGE_OUTPUT_DIR="data_real/day8/pre"
+PRECHANGE_STRIDE=11
+PRECHANGE_START=80
+PRECHANGE_END=2600
 PRECHANGE_DOWNSAMPLE=2
 PRECHANGE_PC_SUBSAMPLE=8
 PRECHANGE_VOXEL_DOWNSAMPLE=0.02
 
 # Pre-trained checkpoint (update after first run)
-PRETRAINED_CONFIG="${PRECHANGE_OUTPUT_DIR}/splatfacto/qed-splatter/2025-11-07_164416/config.yml"
-CHECKPOINT_PATH="${PRECHANGE_OUTPUT_DIR}/splatfacto/qed-splatter/2025-11-07_164416/nerfstudio_models"
+PRETRAINED_CONFIG="${PRECHANGE_OUTPUT_DIR}/splatfacto/qed-splatter/2025-11-14_131705/config.yml"
+CHECKPOINT_PATH="${PRECHANGE_OUTPUT_DIR}/splatfacto/qed-splatter/2025-11-14_131705/nerfstudio_models"
 
 ################################################################################
 # Multi-view dynamic sequence parameters
 ################################################################################
 
-MULTI_DATA_DIR="data_real/day6/prism_raw"
-MULTI_R3D_PATH="${MULTI_DATA_DIR}/2025-11-04--10-55-19.r3d"
-MULTI_OUTPUT="data_real/day6/prism"
-MULTI_START=200
+# MULTI_DATA_DIR="data_real/day6/prism_raw"
+# MULTI_R3D_PATH="${MULTI_DATA_DIR}/2025-11-04--10-55-19.r3d"
+# MULTI_OUTPUT="data_real/day6/prism"
+# MULTI_START=200
+# MULTI_END=1500
+# MULTI_STRIDE=7
+# MULTI_VOXEL_DOWNSAMPLE=0.02
+
+
+
+
+MULTI_DATA_DIR="data_real/day8/post_3_raw"
+MULTI_R3D_PATH="${MULTI_DATA_DIR}/post_3.r3d"
+MULTI_OUTPUT="data_real/day8/post_3"
+MULTI_START=50
 MULTI_END=1500
 MULTI_STRIDE=7
 MULTI_VOXEL_DOWNSAMPLE=0.02
 
 
+
 NUM_RETRIEVAL=20
-RANSAC_THRESH=5.0
+RANSAC_THRESH=12.0
 BATCHSIZE_REFINEMENT=8
-MAX_QUERY_POINTS=100
+MAX_QUERY_POINTS=150
 
 
 print_step() {
@@ -89,9 +101,9 @@ check_dir_exists() {
     fi
 }
 
-# ################################################################################
-# # STEP 1: Process Pre-Change RGBD Data
-# ################################################################################
+################################################################################
+# STEP 1: Process Pre-Change RGBD Data
+################################################################################
 
 # if [ "$SKIP_PRECHANGE" != "true" ]; then
 #     print_step "STEP 1: Processing pre-change RGBD data"
@@ -109,12 +121,13 @@ check_dir_exists() {
 #     echo "✓ Pre-change data processed"
 # fi
 
+# exit 0
 
-# # # ################################################################################
-# # # # STEP 2: Process Multi-View RGBD Data
-# # # ################################################################################
+# ################################################################################
+# # STEP 2: Process Multi-View RGBD Data
+# ################################################################################
 
-# print_step "STEP 2: Processing multi-view RGBD data"
+print_step "STEP 2: Processing multi-view RGBD data"
 
 # python process_data/r3d_to_nerf.py \
 #     --r3d_data_dir "$MULTI_R3D_PATH" \
@@ -127,41 +140,74 @@ check_dir_exists() {
 
 # echo "✓ Multi-view data processed"
 
-# # exit 0
+
+# # ################################################################################
+# # ################################################################################
+## new colmap and hloc script
+
+
+# python -m localization.main_pipeline \
+#     --pre "$PRECHANGE_OUTPUT_DIR" \
+#     --post "$MULTI_OUTPUT"
+
+# exit 0
+# --- Activate TAPIP3D environment ---
+CONDA_ENV="nerfstudio_env"
+if [ -z "${CONDA_EXE:-}" ]; then
+    CONDA_BASE=$(conda info --base)
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+else
+    CONDA_BASE=$(dirname $(dirname "$CONDA_EXE"))
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+fi
+
+
+
 
 # ################################################################################
-# # STEP 3: HLoc Reconstruction for Pre-Change Geometry Anchoring
+# # STEP 4: Train Static 3DGS with Splatfacto + Depth
 # ################################################################################
-
-# if [ "$SKIP_PRECHANGE" != "true" ]; then
-#     print_step "STEP 3: HLoc reconstruction for pre-change geometry"
-    
-#     python process_data/hloc_reconstruct.py \
-#         --data_dir "$PRECHANGE_OUTPUT_DIR"
-    
-#     echo "✓ Pre-change HLoc reconstruction complete"
-# fi
-
-
-################################################################################
-# STEP 4: Train Static 3DGS with Splatfacto + Depth
-################################################################################
 
 # if [ "$SKIP_3DGS_TRAIN" != "true" ]; then
-#     print_step "STEP 4: Training static 3DGS with splatfacto"
-    
-#     ns-train qed-splatter --vis viewer+wandb \
+#     print_step "STEP 4: Training static 3DGS with qed-splatter "
+
+#     ns-train qed-splatter --vis viewer \
 #         --output-dir "$PRECHANGE_OUTPUT_DIR/splatfacto" \
 #         --experiment-name "" \
 #         --timestamp $CURRENT_TIME \
 #         --steps_per_eval_all_images 500 \
 #         --pipeline.model.cull_alpha_thresh 0.005 \
 #         --max-num-iterations 20000 \
-#         --pipeline.model.stop_split_at 40000 \
 #         --pipeline.model.warmup_length 200 \
 #         --machine.num-devices 1 \
 #         --viewer.quit-on-train-completion True \
-#         nerfstudio-data --data "$PRECHANGE_OUTPUT_DIR/transforms_arkit.json" \
+#         nerfstudio-data --data "$PRECHANGE_OUTPUT_DIR/transforms_colmap_metric.json" \
+#         --depth_unit_scale_factor 1.0 \
+#         --auto-scale-poses=False --center-method none --orientation-method none \
+#         --load-3D-points True \
+#         --train_split_fraction 0.9 \
+
+# fi
+
+# exit 0
+    
+#     echo "✓ Static 3DGS training complete"
+#     echo ""
+#     echo "IMPORTANT: Update PRETRAINED_CONFIG and CHECKPOINT_PATH variables with the new checkpoint path"
+#     echo "New checkpoint should be in: $PRECHANGE_OUTPUT_DIR/splatfacto/qed-splatter/$CURRENT_TIME/"
+# fi
+
+#     ns-train splatfacto --vis viewer+wandb \
+#         --output-dir "$PRECHANGE_OUTPUT_DIR/splatfacto" \
+#         --experiment-name "" \
+#         --timestamp $CURRENT_TIME \
+#         --steps_per_eval_all_images 500 \
+#         --pipeline.model.cull_alpha_thresh 0.005 \
+#         --max-num-iterations 30000 \
+#         --pipeline.model.warmup_length 200 \
+#         --machine.num-devices 1 \
+#         --viewer.quit-on-train-completion True \
+#         nerfstudio-data --data "$PRECHANGE_OUTPUT_DIR/transforms_colmap.json" \
 #         --depth_unit_scale_factor 1.0 \
 #         --auto-scale-poses=False --center-method none --orientation-method none \
 #         --load-3D-points True \
@@ -173,51 +219,38 @@ check_dir_exists() {
 #     echo "New checkpoint should be in: $PRECHANGE_OUTPUT_DIR/splatfacto/qed-splatter/$CURRENT_TIME/"
 # fi
 
-# # # ################################################################################
-# # # # STEP 5: HLoc Localization for Multi-View Sequence
-# # # ################################################################################
-
-# print_step "STEP 5: HLoc localization for multi-view sequence"
-
-# python process_data/hloc_localize.py \
-#     --pre_sfm_dir "$PRECHANGE_OUTPUT_DIR/hloc_outputs" \
-#     --post_image_dir "$MULTI_OUTPUT/frames" \
-#     --arkit_transforms_path "$MULTI_OUTPUT/transforms_arkit.json" \
-#     --new_transforms_path "$MULTI_OUTPUT/transforms_localized.json" \
-#     --num_retrieval $NUM_RETRIEVAL \
-#     --ransac_thresh $RANSAC_THRESH \
-#     --align_arkit \
-#     --visualize
-
-# echo "✓ Multi-view localization complete"
-# exit 0 
+# python debug_renders/compare_renders.py --data-dir  $MULTI_OUTPUT --trans $MULTI_OUTPUT/transforms_localized.json --out $MULTI_OUTPUT/debug_renders_arkit
 
 
-# ################################################################################
-# # STEP 6: Change Detection Using DINO Features
-# ################################################################################
+# exit 0
 
-# print_step "STEP 6: Running 3DGS change detection"
+################################################################################
+# STEP 6: Change Detection Using DINO Features
+################################################################################
 
-# # Validate required files
-# check_file_exists "$PRETRAINED_CONFIG"
-# check_file_exists "$MULTI_OUTPUT/transforms_localized.json"
+print_step "STEP 6: Running 3DGS change detection"
 
-# # mkdir -p "${CHANGE_OUTPUT}"
+# Validate required files
+check_file_exists "$PRETRAINED_CONFIG"
+check_file_exists "$MULTI_OUTPUT/transforms_reloc.json"
+
+# mkdir -p "${CHANGE_OUTPUT}"
 
 # python change_det/change_detection_sam.py \
 #     --config "${PRETRAINED_CONFIG}" \
 #     --output "${MULTI_OUTPUT}" \
-#     --transform "${MULTI_OUTPUT}/transforms_localized.json" \
+#     --transform "${MULTI_OUTPUT}/transforms_reloc.json" \
 #     --debug
 
 # echo "✓ Change detection complete"
 
-# ################################################################################
-# # STEP 7: SAM2 Video Object Segmentation
-# ################################################################################
 
-print_step "STEP 7: Generating SAM2 masks via video object segmentation"
+# exit 0
+################################################################################
+# STEP 7: SAM2 Video Object Segmentation
+################################################################################
+
+# print_step "STEP 7: Generating SAM2 masks via video object segmentation"
 
 # Define paths
 FRAMES_DIR="${MULTI_OUTPUT}/frames"
@@ -225,39 +258,39 @@ END_MASK_PATH="${MULTI_OUTPUT}/cd_mask"
 OUTPUT_MASK_DIR="${MULTI_OUTPUT}/mask"
 
 
-# CONDA_ENV="sam2"
+CONDA_ENV="sam2"
 
 
-# if [ -z "${CONDA_EXE:-}" ]; then
-#     echo "🔍 Locating conda base..."
-#     CONDA_BASE=$(conda info --base)
-#     source "$CONDA_BASE/etc/profile.d/conda.sh"
-# else
-#     CONDA_BASE=$(dirname $(dirname "$CONDA_EXE"))
-#     source "$CONDA_BASE/etc/profile.d/conda.sh"
-# fi
+if [ -z "${CONDA_EXE:-}" ]; then
+    echo "🔍 Locating conda base..."
+    CONDA_BASE=$(conda info --base)
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+else
+    CONDA_BASE=$(dirname $(dirname "$CONDA_EXE"))
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+fi
 
-# echo "🔧 Activating conda environment: $CONDA_ENV"
-# conda activate "$CONDA_ENV"
+echo "🔧 Activating conda environment: $CONDA_ENV"
+conda activate "$CONDA_ENV"
 
-# SAM2_DIR="/local/home/pmishra/cvg/sam2"
+SAM2_DIR="/local/home/pmishra/cvg/sam2"
 
 # python "$SAM2_DIR/tools/run_sam2_vos_wrapper.py" \
 #     --frames_dir "$FRAMES_DIR" \
 #     --mask_path "$END_MASK_PATH" \
 #     --output_mask_dir "$OUTPUT_MASK_DIR" \
 
-# echo "✓ SAM2 mask generation complete"
-# conda deactivate
+echo "✓ SAM2 mask generation complete"
+conda deactivate
 
-################################################################################
+# ###############################################################################
 # STEP 8: TAPIP3D Inference
-################################################################################
+# ###############################################################################
 
 
 TAPIP3D_DIR="/local/home/pmishra/cvg/TAPIP3D"
 TAPIP3D_OUTPUT_DIR="${MULTI_OUTPUT}/tapip3d/"
-TRANSFORMS_PATH="${MULTI_OUTPUT}/transforms_localized.json"
+TRANSFORMS_PATH="${MULTI_OUTPUT}/transforms_reloc.json"
 MASK_SAMPLE="${OUTPUT_MASK_DIR}/frame_00001.png"
 
 check_file_exists "$MASK_SAMPLE"
@@ -278,12 +311,12 @@ set +u
 conda activate "$CONDA_ENV"
 set -u
 
-TRANSFORMS_PATH=$(realpath "$MULTI_OUTPUT/transforms_localized.json")
+TRANSFORMS_PATH=$(realpath "$MULTI_OUTPUT/transforms_reloc.json")
 MASK_SAMPLE=$(realpath "$OUTPUT_MASK_DIR/frame_00001.png")
 TAPIP_OUTPUT_DIR=$(realpath "$MULTI_OUTPUT/tapip3d")
-# mkdir -p "$TAPIP_OUTPUT_DIR"
+mkdir -p "$TAPIP_OUTPUT_DIR"
 
-# cd "$TAPIP3D_DIR"
+cd "$TAPIP3D_DIR"
 # PYTHONPATH="/local/home/pmishra/cvg/TAPIP3D" \
 # python inference_nerf_mask.py \
 #     --input_path "$TRANSFORMS_PATH" \
@@ -292,6 +325,7 @@ TAPIP_OUTPUT_DIR=$(realpath "$MULTI_OUTPUT/tapip3d")
 #     --max_query_points $MAX_QUERY_POINTS
 
 
+# exit 0
 ################################################################################
 # STEP 9: 4D RANSAC Joint Discovery
 ################################################################################
@@ -316,34 +350,33 @@ set -u
 
 cd "$PROJECT_ROOT"  
 JOINT_OUTPUT_DIR="${MULTI_OUTPUT}/ransac_joints"
-# mkdir -p "$JOINT_OUTPUT_DIR"
+mkdir -p "$JOINT_OUTPUT_DIR"
 
 
-# python joint_estimator/main.py \
+# python -m joint_estimator.main \
 #     --tapip3d_result "$TAPIP_OUTPUT_DIR" \
 #     --out_dir "$JOINT_OUTPUT_DIR" \
 #     --camera_metadata "$TRANSFORMS_PATH" \
 #     --data_dir "$MULTI_OUTPUT" \
 #     --use_temp
 
-# echo "✓ 4D RANSAC joint discovery complete: $JOINT_OUTPUT_DIR"
+echo "✓ 4D RANSAC joint discovery complete: $JOINT_OUTPUT_DIR"
+
 
 # ################################################################################
 # # STEP 10: Merge Articulation Data into Transforms
 # ################################################################################
 
-# print_step "STEP 10: Merging articulation data into transforms"
+print_step "STEP 10: Merging articulation data into transforms"
 
 # python joint_estimator/merge_arti_data.py \
 #     --joint_schemas "${JOINT_OUTPUT_DIR}/joint_schemas.json" \
-#     --transforms_post "${MULTI_OUTPUT}/transforms_localized.json" \
+#     --transforms_post "${MULTI_OUTPUT}/transforms_reloc.json" \
 #     --output "${MULTI_OUTPUT}/transforms_post.json" \
 #     --use_masks
 
 # echo "✓ Articulation data merged"
 
-
-# exit 0
 
 ################################################################################
 # STEP 11: Train Articulated Splatfacto
@@ -353,40 +386,132 @@ print_step "STEP 11: Training articulated splatfacto model"
 
 
 TRANSFORM_JSON="${MULTI_OUTPUT}/transforms_post.json"
-OBJ_MASK_FILE="${MULTI_OUTPUT}/ransac_joints/obj_masks/obj_prismatic.pt"
+OBJ_MASK_FILE="${MULTI_OUTPUT}/ransac_joints/obj_masks/obj_revolute.pt"
+USE_DEPTH=True
+DEPTH_SCALE=1.0
 
-ns-train arti_splatfacto \
-    --vis viewer \
-    --output-dir "${MULTI_OUTPUT}/artisplatfacto" \
-    --experiment-name "" \
-    --timestamp "$CURRENT_TIME" \
-    --steps-per-eval-all-images 100 \
-    --max-num-iterations 30000 \
-    --machine.num-devices 1 \
-    --viewer.quit-on-train-completion True \
-    --load-dir "$CHECKPOINT_PATH" \
-    --pipeline.model.obj-mask-file "$OBJ_MASK_FILE" \
-    --pipeline.model.use-depth True \
-    arti-dataparser \
-    --data "$MULTI_OUTPUT" \
-    --auto-scale-poses=False \
-    --center-method none \
-    --orientation-method none \
-    --train_split_fraction 0.9 \
-    --depth_unit_scale_factor 1.0
+# ns-train arti_splatfacto \
+#     --vis viewer+wandb \
+#     --output-dir "${MULTI_OUTPUT}/artisplatfacto" \
+#     --experiment-name "" \
+#     --timestamp "$CURRENT_TIME" \
+#     --steps-per-eval-all-images 100 \
+#     --max-num-iterations 20000 \
+#     --machine.num-devices 1 \
+#     --viewer.quit-on-train-completion True \
+#     --load-dir "$CHECKPOINT_PATH" \
+#     --pipeline.model.obj-mask-file "$OBJ_MASK_FILE" \
+#     --pipeline.model.use-depth $USE_DEPTH \
+#     arti-dataparser \
+#     --data "$MULTI_OUTPUT" \
+#     --auto-scale-poses=False \
+#     --center-method none \
+#     --orientation-method none \
+#     --train_split_fraction 0.9 \
+#     --depth_unit_scale_factor $DEPTH_SCALE
 
-echo "✓ Articulated splatfacto training complete"
+# echo "✓ Articulated splatfacto training complete"
 
+
+LATEST_TRAIN_RUN=$(ls -td "${MULTI_OUTPUT}/artisplatfacto/arti_splatfacto"/* | head -n 1)
+CHECKPOINT_PATH="${LATEST_TRAIN_RUN}/nerfstudio_models"
+
+echo "Using checkpoint from: $CHECKPOINT_PATH"
+
+#Run recovery phase
+# ns-train arti_splatfacto_recovery \
+#     --vis viewer+wandb \
+#     --output-dir "${MULTI_OUTPUT}/artisplatfacto_refined" \
+#     --experiment-name "" \
+#     --timestamp "$CURRENT_TIME" \
+#     --steps-per-eval-all-images 100 \
+#     --max-num-iterations 2000 \
+#     --machine.num-devices 1 \
+#     --viewer.quit-on-train-completion True \
+#     --load-dir "$CHECKPOINT_PATH" \
+#     --pipeline.model.obj-mask-file "$OBJ_MASK_FILE" \
+#     --pipeline.model.use-depth "$USE_DEPTH" \
+#     arti-dataparser \
+#     --data "$MULTI_OUTPUT" \
+#     --auto-scale-poses=False \
+#     --center-method none \
+#     --orientation-method none \
+#     --train_split_fraction 0.9 \
+#     --depth_unit_scale_factor "$DEPTH_SCALE"
+
+
+# LATEST_TRAIN_RUN=$(ls -td "${MULTI_OUTPUT}/artisplatfacto_refined/arti_splatfacto_recovery"/* | head -n 1)
+CHECKPOINT_PATH="${LATEST_TRAIN_RUN}/nerfstudio_models"
+
+python arti_splatfacto/render.py "$LATEST_TRAIN_RUN/config.yml" --output_dir "${MULTI_OUTPUT}/renders" --render_depth
+
+
+
+
+exit 0
 ################################################################################
 # Pipeline Complete
 ################################################################################
 
 print_step "PIPELINE COMPLETE!"
 
-echo "Results saved to:"
-echo "  - Change detection: ${CHANGE_OUTPUT}"
-echo "  - Masks: ${OUTPUT_MASK_DIR}"
-echo "  - Joint parameters: ${MULTI_OUTPUT}/tapip"
-echo "  - Final model: ${MULTI_OUTPUT}/artisplatfacto"
-echo ""
+
 echo "Pipeline finished at: $(date)"
+
+
+TRANSFORM_JSON="${MULTI_OUTPUT}/transforms_post.json"
+OBJ_MASK_FILE="${MULTI_OUTPUT}/ransac_joints/obj_masks/obj_revolute.pt"
+USE_DEPTH=True
+DEPTH_SCALE=1.0
+
+CHECKPOINT_PATH_2="/local/home/pmishra/cvg/arti-splatfacto/data_real/day8/post/artisplatfacto_refined/arti_splatfacto_recovery/2025-11-17_172007/nerfstudio_models"
+
+ns-train arti_splatfacto \
+    --vis viewer+wandb \
+    --output-dir "${MULTI_OUTPUT}/artisplatfacto" \
+    --experiment-name "" \
+    --timestamp "$CURRENT_TIME" \
+    --steps-per-eval-all-images 100 \
+    --max-num-iterations 20000 \
+    --machine.num-devices 1 \
+    --viewer.quit-on-train-completion True \
+    --load-dir "$CHECKPOINT_PATH_2" \
+    --pipeline.model.obj-mask-file "$OBJ_MASK_FILE" \
+    --pipeline.model.use-depth $USE_DEPTH \
+    arti-dataparser \
+    --data "$MULTI_OUTPUT" \
+    --auto-scale-poses=False \
+    --center-method none \
+    --orientation-method none \
+    --train_split_fraction 0.9 \
+    --depth_unit_scale_factor $DEPTH_SCALE
+
+echo "✓ Articulated splatfacto training complete"
+
+
+# Find the newest training run folder (sorted by modification time)
+LATEST_TRAIN_RUN=$(ls -td "${MULTI_OUTPUT}/artisplatfacto/arti_splatfacto"/* | head -n 1)
+CHECKPOINT_PATH="${LATEST_TRAIN_RUN}/nerfstudio_models"
+
+echo "Using checkpoint from: $CHECKPOINT_PATH"
+
+Run recovery phase
+ns-train arti_splatfacto_recovery \
+    --vis viewer+wandb \
+    --output-dir "${MULTI_OUTPUT}/artisplatfacto_refined" \
+    --experiment-name "" \
+    --timestamp "$CURRENT_TIME" \
+    --steps-per-eval-all-images 100 \
+    --max-num-iterations 2500 \
+    --machine.num-devices 1 \
+    --viewer.quit-on-train-completion True \
+    --load-dir "$CHECKPOINT_PATH" \
+    --pipeline.model.obj-mask-file "$OBJ_MASK_FILE" \
+    --pipeline.model.use-depth "$USE_DEPTH" \
+    arti-dataparser \
+    --data "$MULTI_OUTPUT" \
+    --auto-scale-poses=False \
+    --center-method none \
+    --orientation-method none \
+    --train_split_fraction 0.9 \
+    --depth_unit_scale_factor "$DEPTH_SCALE"
