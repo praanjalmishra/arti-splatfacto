@@ -517,7 +517,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
 
         all_means = state_dict["gauss_params.means"].to(self.device)
-        obj_mask = self.obj_3d_seg.query_refine(all_means, grow=3, thresh=0.01, bbox_margin=0.00).to(torch.bool).cpu()
+        obj_mask = self.obj_3d_seg.query_refine(all_means, grow=3, thresh=0.01, bbox_margin=0.01).to(torch.bool).cpu()
         bg_mask  = ~obj_mask
 
         for p in GAUSS:

@@ -27,16 +27,17 @@ arti_splatfacto_config = MethodSpecification(
                 cache_images_type="uint8",
             ),
             model=ArtiSplatfactoModelConfig(
-                refine_every=10,              # More frequent (was 20)
-                cull_alpha_thresh=0.001,      # Less aggressive culling (was 0.005)
-                densify_grad_thresh=0.0005,   # More sensitive (was 0.0008)
-                densify_size_thresh=0.008,    # Split smaller Gaussians (was 0.01)
-                split_screen_size=0.08,       # Larger screen size threshold (was 0.05)
-                warmup_length=500,            # Keep same
-                stop_split_at=35000,          # Extend densification period (was 25000)
+                refine_every=100,              
+                cull_alpha_thresh=0.005,      # Less aggressive culling (was 0.005)
+                densify_grad_thresh=0.0005,   
+                densify_size_thresh=0.01,    # Split smaller Gaussians (was 0.01)
+                split_screen_size=0.05,       # Larger screen size threshold (was 0.05)
+                warmup_length=500,            
+                stop_split_at=1800,          # Extend densification period (was 25000)
                 reset_alpha_every=15,         # More frequent alpha reset (was 20)
                 use_scale_regularization=True,
                 use_depth = True,
+                training_mode="articulation",
 
             )
         ),
