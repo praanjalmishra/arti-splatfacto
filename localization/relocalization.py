@@ -362,7 +362,7 @@ def run_relocalization(
         c2w = colmap_to_opengl_pose(w2c)
         
         frame = {
-            'file_path': f'./frames/{img_name}',
+            'file_path': f'frames/{img_name}',
             'transform_matrix': c2w.tolist(),
             'num_inliers': int(pose_data['num_inliers'])
         }
