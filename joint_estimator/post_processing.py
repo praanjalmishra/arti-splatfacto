@@ -1,19 +1,23 @@
 """
 Post-Processing Module for Joint Estimation Pipeline 
 
-Key improvements:
+Key improvements over original:
 1. Zero-referenced motion (angle_min=0, translation_min=0)
 2. Proper frame indexing from Point3D.frame attribute
 3. Handles sparse temporal data from preprocessing
-4. More robust outlier filtering
+4. Enhanced outlier filtering with IQR method
+5. Trajectory quality weighting
+6. Temporal smoothing for noisy data
+7. Confidence bounds on estimates
 """
 
 import numpy as np
 from typing import List, Tuple, Optional, Dict
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+from scipy.ndimage import gaussian_filter1d
 
-from data_structures import (
+from joint_estimator.data_structures import (
     Trajectory3D, HingeParameters, SliderParameters, JointEstimationResult,
     JointType
 )
@@ -25,8 +29,16 @@ class PostProcessor:
     Handles range of motion calculation, parameter validation, and result refinement.
     """
     
-    def __init__(self):
-        pass
+    def __init__(self, smoothing_sigma: float = 1.0, outlier_threshold: float = 1.5):
+        """
+        Initialize post-processor with configuration.
+        
+        Args:
+            smoothing_sigma: Gaussian smoothing sigma for temporal filtering
+            outlier_threshold: IQR multiplier for outlier detection (1.5 is standard)
+        """
+        self.smoothing_sigma = smoothing_sigma
+        self.outlier_threshold = outlier_threshold
     
     def process_result(self, result: JointEstimationResult) -> Tuple[JointEstimationResult, dict]:
         """
@@ -76,81 +88,397 @@ class PostProcessor:
         
         return enhanced_result, per_frame_values
     
-    def _calculate_hinge_range_of_motion(self, 
-                                    hinge_params: HingeParameters,
-                                    inlier_trajectories: List[Trajectory3D]) -> Tuple[HingeParameters, dict]:
+    def _calculate_trajectory_weights(self, 
+                                     trajectories: List[Trajectory3D],
+                                     joint_params: object) -> np.ndarray:
+        """
+        Calculate quality weights for each trajectory based on multiple factors.
+        
+        Args:
+            trajectories: List of trajectories to weight
+            joint_params: Joint parameters for motion calculation
+            
+        Returns:
+            Array of weights (one per trajectory)
+        """
+        weights = []
+        
+        for traj in trajectories:
+            if len(traj.points) < 2:
+                weights.append(0.0)
+                continue
+            
+            # Factor 1: Length (longer trajectories are more reliable)
+            length_score = min(len(traj.points) / 10.0, 1.0)
+            
+            # Factor 2: Motion magnitude (more motion = better signal)
+            positions = traj.get_all_positions()
+            motion_magnitude = np.linalg.norm(positions[-1] - positions[0])
+            motion_score = min(motion_magnitude / 0.5, 1.0)
+            
+            # Factor 3: Consistency (less jitter = better)
+            if len(traj.points) >= 3:
+                # Calculate velocity variations
+                velocities = np.diff(positions, axis=0)
+                velocity_magnitudes = np.linalg.norm(velocities, axis=1)
+                consistency_score = 1.0 - min(np.std(velocity_magnitudes) / (np.mean(velocity_magnitudes) + 1e-6), 1.0)
+            else:
+                consistency_score = 0.5
+            
+            # Combine scores (weighted average)
+            weight = 0.4 * length_score + 0.4 * motion_score + 0.2 * consistency_score
+            weights.append(max(weight, 0.1))  # Minimum weight of 0.1
+        
+        return np.array(weights)
+    
+    def _remove_angle_outliers(self, 
+                              angles: np.ndarray, 
+                              weights: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Remove outlier angles using Interquartile Range (IQR) method.
+        
+        Args:
+            angles: Array of angle measurements
+            weights: Corresponding weights
+            
+        Returns:
+            (filtered_angles, filtered_weights)
+        """
+        if len(angles) <= 2:
+            return angles, weights
+        
+        # Calculate quartiles
+        q1 = np.percentile(angles, 25)
+        q3 = np.percentile(angles, 75)
+        iqr = q3 - q1
+        
+        # Define outlier bounds
+        lower_bound = q1 - self.outlier_threshold * iqr
+        upper_bound = q3 + self.outlier_threshold * iqr
+        
+        # Filter outliers
+        mask = (angles >= lower_bound) & (angles <= upper_bound)
+        
+        return angles[mask], weights[mask]
+    
+    def _apply_temporal_smoothing(self, 
+                                 per_frame_values: Dict[int, float],
+                                 method: str = 'gaussian') -> Dict[int, float]:
+        """
+        Apply temporal smoothing to reduce noise in per-frame values.
+        
+        Args:
+            per_frame_values: Dictionary mapping frame indices to values
+            method: Smoothing method ('gaussian', 'moving_average', or 'none')
+            
+        Returns:
+            Smoothed per-frame values
+        """
+        if len(per_frame_values) < 3 or method == 'none':
+            return per_frame_values
+        
+        # Sort by frame index
+        sorted_frames = sorted(per_frame_values.keys())
+        values = np.array([per_frame_values[f] for f in sorted_frames])
+        
+        # Apply smoothing
+        if method == 'gaussian':
+            # Gaussian smoothing with sigma parameter
+            smoothed_values = gaussian_filter1d(values, sigma=self.smoothing_sigma)
+        elif method == 'moving_average':
+            # Simple moving average with window size 3
+            window_size = 3
+            smoothed_values = np.convolve(values, np.ones(window_size)/window_size, mode='same')
+        else:
+            smoothed_values = values
+        
+        # Reconstruct dictionary
+        return {frame: smoothed_values[i] for i, frame in enumerate(sorted_frames)}
+    
+    # def _calculate_hinge_range_of_motion(self, 
+    #                                 hinge_params: HingeParameters,
+    #                                 inlier_trajectories: List[Trajectory3D]) -> Tuple[HingeParameters, dict]:
+    #     """
+    #     Calculate angle_min, angle_max, and per-frame angles for hinge joint.
+    #     Zero-referenced: angle_min = 0, angles represent opening from closed state.
+        
+    #     Improvements:
+    #     - Outlier rejection using IQR method
+    #     - Temporal smoothing for noisy data
+    #     - Weighted averaging by trajectory quality
+    #     - Better handling of angle wrapping
+        
+    #     Returns:
+    #         (HingeParameters, per_frame_angles) where per_frame_angles is dict {frame_idx: angle}
+    #     """
+    #     print("Calculating hinge range of motion...")
+        
+    #     # Store angles per frame with trajectory quality weights
+    #     frame_angles = {}  # {frame_idx: [(angle, weight), ...]}
+        
+    #     # Calculate quality weight for each trajectory based on:
+    #     # 1. Length (longer = better)
+    #     # 2. Motion magnitude (more motion = better)
+    #     # 3. Consistency (less jitter = better)
+    #     trajectory_weights = self._calculate_trajectory_weights(inlier_trajectories, hinge_params)
+        
+    #     # First pass: calculate all angles relative to their trajectory's first point
+    #     for traj_idx, traj in enumerate(inlier_trajectories):
+    #         if len(traj.points) < 2:
+    #             continue
+            
+    #         traj_weight = trajectory_weights[traj_idx]
+            
+    #         # Use first point as reference (closed state) for THIS trajectory
+    #         reference_point = np.array([traj.points[0].x, traj.points[0].y, traj.points[0].z])
+            
+    #         for point in traj.points:
+    #             current_point = np.array([point.x, point.y, point.z])
+                
+    #             # Calculate rotation angle relative to reference
+    #             angle = self._calculate_rotation_angle(
+    #                 reference_point, current_point, 
+    #                 hinge_params.axis, hinge_params.pivot
+    #             )
+                
+    #             frame_idx = point.frame
+    #             if frame_idx not in frame_angles:
+    #                 frame_angles[frame_idx] = []
+    #             frame_angles[frame_idx].append((angle, traj_weight))
+        
+    #     if len(frame_angles) == 0:
+    #         print("Warning: No angles calculated, using default range")
+    #         return HingeParameters(
+    #             axis=hinge_params.axis,
+    #             pivot=hinge_params.pivot,
+    #             angle_min=0.0,
+    #             angle_max=0.0
+    #         ), {}
+        
+    #     # Aggregate angles per frame with outlier rejection and weighting
+    #     per_frame_angles_raw = {}
+    #     per_frame_stds = {}
+        
+    #     for frame_idx, angle_weight_pairs in frame_angles.items():
+    #         angles = np.array([aw[0] for aw in angle_weight_pairs])
+    #         weights = np.array([aw[1] for aw in angle_weight_pairs])
+            
+    #         # Remove outliers using IQR method
+    #         angles_clean, weights_clean = self._remove_angle_outliers(angles, weights)
+            
+    #         if len(angles_clean) == 0:
+    #             continue
+            
+    #         # Weighted average
+    #         per_frame_angles_raw[frame_idx] = np.average(angles_clean, weights=weights_clean)
+    #         per_frame_stds[frame_idx] = np.std(angles_clean)
+        
+    #     if len(per_frame_angles_raw) == 0:
+    #         print("Warning: All angles filtered as outliers, using default range")
+    #         return HingeParameters(
+    #             axis=hinge_params.axis,
+    #             pivot=hinge_params.pivot,
+    #             angle_min=0.0,
+    #             angle_max=0.0
+    #         ), {}
+        
+    #     # Apply temporal smoothing to reduce noise
+    #     per_frame_angles_smoothed = self._apply_temporal_smoothing(per_frame_angles_raw)
+        
+    #     # Zero-reference to minimum angle (closed position)
+    #     angle_offset = min(per_frame_angles_smoothed.values())
+        
+    #     per_frame_angles = {
+    #         frame_idx: angle - angle_offset
+    #         for frame_idx, angle in per_frame_angles_smoothed.items()
+    #     }
+        
+    #     # Calculate range with confidence bounds
+    #     angle_min = 0.0  # Always start at 0 (closed position)
+    #     angle_max = max(per_frame_angles.values())
+        
+    #     # Calculate average uncertainty
+    #     avg_std = np.mean(list(per_frame_stds.values())) if per_frame_stds else 0.0
+        
+    #     print(f"Hinge range: {np.degrees(angle_min):.1f}° to {np.degrees(angle_max):.1f}°")
+    #     print(f"Total range of motion: {np.degrees(angle_max):.1f}°")
+    #     print(f"Average angle uncertainty: ±{np.degrees(avg_std):.1f}°")
+    #     print(f"Per-frame angles computed for {len(per_frame_angles)} frames (sparse sampling)")
+    #     print(f"Applied trajectory weighting and IQR outlier filtering")
+        
+    #     return HingeParameters(
+    #         axis=hinge_params.axis,
+    #         pivot=hinge_params.pivot,
+    #         angle_min=angle_min,
+    #         angle_max=angle_max
+    #     ), per_frame_angles
+        
+
+    def _calculate_hinge_range_of_motion(
+        self, hinge_params: HingeParameters,
+        inlier_trajectories: List[Trajectory3D]
+    ) -> Tuple[HingeParameters, dict]:
         """
         Calculate angle_min, angle_max, and per-frame angles for hinge joint.
         Zero-referenced: angle_min = 0, angles represent opening from closed state.
-        
-        Returns:
-            (HingeParameters, per_frame_angles) where per_frame_angles is dict {frame_idx: angle}
+
+        Fixes:
+        - Use global reference (first visible frame) instead of per-trajectory reference
+        - Enforce zero angle at closed (minimum) configuration
+        - Preserve outlier filtering, smoothing, and weighting
         """
-        print("Calculating hinge range of motion...")
-        
-        # Store angles per frame, keyed by ACTUAL frame number from Point3D
-        frame_angles = {}  # {frame_idx: [angle1, angle2, ...]}
-        
-        # First pass: calculate all angles relative to their trajectory's first point
+
+        print("Calculating hinge range of motion (global reference fix)...")
+
+        if not inlier_trajectories:
+            print("No inlier trajectories — returning default hinge parameters.")
+            return hinge_params, {}
+
+        # ------------------------------------------------------------
+        # 1. Determine the global reference frame (earliest frame index)
+        # ------------------------------------------------------------
+        all_frames = [p.frame for traj in inlier_trajectories for p in traj.points]
+        min_global_frame = min(all_frames)
+        max_global_frame = max(all_frames)
+
+        # Gather all 3D points that exist at the earliest frame
+        global_ref_points = []
+        for traj in inlier_trajectories:
+            for p in traj.points:
+                if p.frame == min_global_frame:
+                    global_ref_points.append(np.array([p.x, p.y, p.z]))
+
+        if len(global_ref_points) == 0:
+            print("⚠️ No trajectories contain the first frame — using first trajectory start as reference.")
+            first_traj = inlier_trajectories[0]
+            global_ref_point = np.array([first_traj.points[0].x,
+                                        first_traj.points[0].y,
+                                        first_traj.points[0].z])
+        else:
+            global_ref_point = np.mean(global_ref_points, axis=0)
+
+        # ------------------------------------------------------------
+        # 2. Calculate trajectory weights for quality-aware averaging
+        # ------------------------------------------------------------
+        trajectory_weights = self._calculate_trajectory_weights(inlier_trajectories, hinge_params)
+
+        # ------------------------------------------------------------
+        # Align hinge axis direction with actual motion
+        # ------------------------------------------------------------
+        # Compute approximate net motion direction
+        net_motion_sum = 0.0
         for traj in inlier_trajectories:
             if len(traj.points) < 2:
                 continue
-            
-            # Use first point as reference (closed state) for THIS trajectory
-            reference_point = np.array([traj.points[0].x, traj.points[0].y, traj.points[0].z])
-            
+            p_start = np.array([traj.points[0].x, traj.points[0].y, traj.points[0].z])
+            p_end = np.array([traj.points[-1].x, traj.points[-1].y, traj.points[-1].z])
+            # Vector from pivot to end points
+            v_start = p_start - hinge_params.pivot
+            v_end = p_end - hinge_params.pivot
+            # Rotation direction measure (signed)
+            cross_dir = np.cross(v_start, v_end)
+            net_motion_sum += np.dot(cross_dir, hinge_params.axis)
+
+        # If the average motion is opposite to the axis direction, flip it
+        if net_motion_sum < 0:
+            print("↻ Flipping hinge axis orientation to match motion direction.")
+            hinge_params.axis = -hinge_params.axis
+
+
+        # ------------------------------------------------------------
+        # 3. Compute angles per frame (relative to global reference)
+        # ------------------------------------------------------------
+        frame_angles = {}  # {frame_idx: [(angle, weight), ...]}
+
+        for traj_idx, traj in enumerate(inlier_trajectories):
+            traj_weight = trajectory_weights[traj_idx]
             for point in traj.points:
                 current_point = np.array([point.x, point.y, point.z])
-                
-                # Calculate rotation angle relative to reference
                 angle = self._calculate_rotation_angle(
-                    reference_point, current_point, 
+                    global_ref_point, current_point,
                     hinge_params.axis, hinge_params.pivot
                 )
-                
+
                 frame_idx = point.frame
                 if frame_idx not in frame_angles:
                     frame_angles[frame_idx] = []
-                frame_angles[frame_idx].append(angle)
-        
+                frame_angles[frame_idx].append((angle, traj_weight))
+
         if len(frame_angles) == 0:
-            print("Warning: No angles calculated, using default range")
+            print("Warning: No hinge angles calculated — using default range.")
             return HingeParameters(
                 axis=hinge_params.axis,
                 pivot=hinge_params.pivot,
                 angle_min=0.0,
                 angle_max=0.0
             ), {}
-        
-        # Aggregate angles per frame using robust median
-        per_frame_angles_raw = {
-            frame_idx: np.median(angles)
-            for frame_idx, angles in frame_angles.items()
-        }
-        
-        # Zero-reference
-        angle_offset = min(per_frame_angles_raw.values())
-        
+
+        # ------------------------------------------------------------
+        # 4. Aggregate per-frame angles (IQR filtering + weighting)
+        # ------------------------------------------------------------
+        per_frame_angles_raw = {}
+        per_frame_stds = {}
+
+        for frame_idx, angle_weight_pairs in frame_angles.items():
+            angles = np.array([aw[0] for aw in angle_weight_pairs])
+            weights = np.array([aw[1] for aw in angle_weight_pairs])
+
+            # Outlier removal (IQR)
+            angles_clean, weights_clean = self._remove_angle_outliers(angles, weights)
+            if len(angles_clean) == 0:
+                continue
+
+            # Weighted mean
+            per_frame_angles_raw[frame_idx] = np.average(angles_clean, weights=weights_clean)
+            per_frame_stds[frame_idx] = np.std(angles_clean)
+
+        if len(per_frame_angles_raw) == 0:
+            print("Warning: All angles removed by filtering — using defaults.")
+            return HingeParameters(
+                axis=hinge_params.axis,
+                pivot=hinge_params.pivot,
+                angle_min=0.0,
+                angle_max=0.0
+            ), {}
+
+        # ------------------------------------------------------------
+        # 5. Temporal smoothing
+        # ------------------------------------------------------------
+        per_frame_angles_smoothed = self._apply_temporal_smoothing(per_frame_angles_raw)
+
+        # ------------------------------------------------------------
+        # 6. Re-zero based on the minimum observed angle (closed state)
+        # ------------------------------------------------------------
+        angle_offset = min(per_frame_angles_smoothed.values())
         per_frame_angles = {
-            frame_idx: angle - angle_offset
-            for frame_idx, angle in per_frame_angles_raw.items()
+            f: angle - angle_offset for f, angle in per_frame_angles_smoothed.items()
         }
-        
-        # Calculate range
-        angle_min = 0.0  # Always start at 0 (closed position)
+
+        # ------------------------------------------------------------
+        # 7. Final statistics and summary
+        # ------------------------------------------------------------
+        angle_min = 0.0
         angle_max = max(per_frame_angles.values())
-        
-        print(f"Hinge range: {np.degrees(angle_min):.1f}° to {np.degrees(angle_max):.1f}°")
-        print(f"Total range of motion: {np.degrees(angle_max):.1f}°")
-        print(f"Per-frame angles computed for {len(per_frame_angles)} frames (sparse sampling)")
-        
-        return HingeParameters(
+        avg_std = np.mean(list(per_frame_stds.values())) if per_frame_stds else 0.0
+
+        print(f"Hinge range: {np.degrees(angle_min):.1f}° → {np.degrees(angle_max):.1f}°")
+        print(f"Total motion: {np.degrees(angle_max):.1f}° over {len(per_frame_angles)} frames")
+        print(f"Avg uncertainty: ±{np.degrees(avg_std):.2f}°")
+        print(f"Global reference frame: {min_global_frame}")
+        print(f"Applied global reference alignment + IQR filtering")
+
+        # ------------------------------------------------------------
+        # 8. Return refined parameters and per-frame angle map
+        # ------------------------------------------------------------
+        refined_params = HingeParameters(
             axis=hinge_params.axis,
             pivot=hinge_params.pivot,
             angle_min=angle_min,
             angle_max=angle_max
-        ), per_frame_angles
-        
+        )
+
+        return refined_params, per_frame_angles
+
     def _calculate_rotation_angle(self, 
                                 reference_point: np.ndarray,
                                 current_point: np.ndarray,
@@ -191,17 +519,27 @@ class PostProcessor:
         Calculate translation_min, translation_max, and per-frame translations.
         Zero-referenced: translation_min = 0, values represent extension from closed state.
         
+        Improvements:
+        - Outlier rejection using IQR method
+        - Temporal smoothing for noisy data
+        - Weighted averaging by trajectory quality
+        
         Returns:
             (SliderParameters, per_frame_translations) where per_frame_translations is dict {frame_idx: translation}
         """
         print("Calculating slider range of motion...")
         
-        # Store translations per frame, keyed by ACTUAL frame number
-        frame_translations = {}  # {frame_idx: [trans1, trans2, ...]}
+        # Store translations per frame with trajectory quality weights
+        frame_translations = {}  # {frame_idx: [(trans, weight), ...]}
         
-        for traj in inlier_trajectories:
+        # Calculate trajectory weights
+        trajectory_weights = self._calculate_trajectory_weights(inlier_trajectories, slider_params)
+        
+        for traj_idx, traj in enumerate(inlier_trajectories):
             if len(traj.points) < 2:
                 continue
+            
+            traj_weight = trajectory_weights[traj_idx]
             
             # Use first point as reference (closed state)
             reference_point = np.array([traj.points[0].x, traj.points[0].y, traj.points[0].z])
@@ -217,7 +555,7 @@ class PostProcessor:
                 frame_idx = point.frame
                 if frame_idx not in frame_translations:
                     frame_translations[frame_idx] = []
-                frame_translations[frame_idx].append(distance)
+                frame_translations[frame_idx].append((distance, traj_weight))
         
         if len(frame_translations) == 0:
             print("Warning: No distances calculated, using default range")
@@ -228,28 +566,57 @@ class PostProcessor:
                 translation_max=0.0
             ), {}
         
-        # Aggregate translations per frame using robust median
-        per_frame_translations_raw = {
-            frame_idx: np.median(translations)  
-            for frame_idx, translations in frame_translations.items()
-        }
+        # Aggregate translations per frame with outlier rejection and weighting
+        per_frame_translations_raw = {}
+        per_frame_stds = {}
+        
+        for frame_idx, trans_weight_pairs in frame_translations.items():
+            translations = np.array([tw[0] for tw in trans_weight_pairs])
+            weights = np.array([tw[1] for tw in trans_weight_pairs])
+            
+            # Remove outliers using IQR method
+            translations_clean, weights_clean = self._remove_angle_outliers(translations, weights)
+            
+            if len(translations_clean) == 0:
+                continue
+            
+            # Weighted average
+            per_frame_translations_raw[frame_idx] = np.average(translations_clean, weights=weights_clean)
+            per_frame_stds[frame_idx] = np.std(translations_clean)
+        
+        if len(per_frame_translations_raw) == 0:
+            print("Warning: All translations filtered as outliers, using default range")
+            return SliderParameters(
+                direction=slider_params.direction,
+                reference_point=slider_params.reference_point,
+                translation_min=0.0,
+                translation_max=0.0
+            ), {}
+        
+        # Apply temporal smoothing
+        per_frame_translations_smoothed = self._apply_temporal_smoothing(per_frame_translations_raw)
         
         # Zero-reference: find the minimum translation (closed state) and shift
-        translation_offset = min(per_frame_translations_raw.values())
+        translation_offset = min(per_frame_translations_smoothed.values())
         
         # Shift all translations so minimum is at 0
         per_frame_translations = {
             frame_idx: trans - translation_offset
-            for frame_idx, trans in per_frame_translations_raw.items()
+            for frame_idx, trans in per_frame_translations_smoothed.items()
         }
         
         # Calculate range
         translation_min = 0.0
         translation_max = max(per_frame_translations.values())
         
+        # Calculate average uncertainty
+        avg_std = np.mean(list(per_frame_stds.values())) if per_frame_stds else 0.0
+        
         print(f"Slider range: {translation_min:.3f}m to {translation_max:.3f}m")
         print(f"Total range of motion: {translation_max:.3f}m")
+        print(f"Average translation uncertainty: ±{avg_std:.3f}m")
         print(f"Per-frame translations computed for {len(per_frame_translations)} frames (sparse sampling)")
+        print(f"Applied trajectory weighting and IQR outlier filtering")
         
         return SliderParameters(
             direction=slider_params.direction,
@@ -450,11 +817,59 @@ class PostProcessor:
         
         plt.tight_layout()
         plt.show()
+    
+    def plot_motion_over_time(self,
+                             per_frame_values: Dict[int, float],
+                             joint_type: JointType,
+                             title: str = "Joint Motion Over Time") -> None:
+        """
+        Plot joint motion (angle or translation) over time.
+        
+        Args:
+            per_frame_values: Dictionary mapping frame indices to motion values
+            joint_type: Type of joint (for axis labeling)
+            title: Plot title
+        """
+        if not per_frame_values:
+            print("No per-frame values to plot")
+            return
+        
+        # Sort by frame index
+        frames = sorted(per_frame_values.keys())
+        values = [per_frame_values[f] for f in frames]
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(frames, values, 'b-', linewidth=2, marker='o', markersize=4)
+        plt.grid(True, alpha=0.3)
+        plt.xlabel('Frame Index')
+        
+        if joint_type == JointType.HINGE:
+            # Convert to degrees for display
+            values_deg = [np.degrees(v) for v in values]
+            plt.plot(frames, values_deg, 'b-', linewidth=2, marker='o', markersize=4)
+            plt.ylabel('Angle (degrees)')
+            plt.title(f"{title}\nHinge Joint Rotation")
+        elif joint_type == JointType.SLIDER:
+            plt.ylabel('Translation (m)')
+            plt.title(f"{title}\nSlider Joint Translation")
+        
+        plt.tight_layout()
+        plt.show()
 
 
-def process_joint_result(result: JointEstimationResult) -> Tuple[JointEstimationResult, dict]:
-    """Convenience function for post-processing joint estimation results."""
-    processor = PostProcessor()
+def process_joint_result(result: JointEstimationResult, 
+                        smoothing_sigma: float = 1.0,
+                        outlier_threshold: float = 1.5) -> Tuple[JointEstimationResult, dict]:
+    """
+    Convenience function for post-processing joint estimation results.
+    
+    Args:
+        result: Raw estimation result
+        smoothing_sigma: Gaussian smoothing parameter (default: 1.0)
+        outlier_threshold: IQR multiplier for outlier detection (default: 1.5)
+    """
+    processor = PostProcessor(smoothing_sigma=smoothing_sigma, 
+                            outlier_threshold=outlier_threshold)
     return processor.process_result(result)
 
 
@@ -464,3 +879,11 @@ def visualize_joint_result(result: JointEstimationResult,
     """Convenience function for visualizing joint estimation results."""
     processor = PostProcessor()
     processor.visualize_result(result, trajectories_3d, title)
+
+
+def plot_joint_motion(per_frame_values: Dict[int, float],
+                     joint_type: JointType,
+                     title: str = "Joint Motion Over Time") -> None:
+    """Convenience function for plotting motion over time."""
+    processor = PostProcessor()
+    processor.plot_motion_over_time(per_frame_values, joint_type, title)
