@@ -67,7 +67,7 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
 
     _target: Type = field(default_factory=lambda: ArtiSplatfactoModel)
     obj_mask_file: Optional[Path] = None
-
+        
     # Joint configuration
     joint_pivot: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     joint_axis: List[float] = field(default_factory=lambda: [0.0, 0.0, 1.0])
@@ -107,8 +107,11 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
     opacity_lambda_obj: float = 0.01
     opacity_lambda_canon: float = 5e-4
 
-    training_mode: str = field(default="articulation")
     joint_correction_lambda: float = 0.01
+    active_joint_id: str = "joint_0"
+    training_mode: str = field(default="articulation")
+    """Training mode: 'articulation' or 'recovery'"""
+
 
 
 
@@ -120,14 +123,12 @@ class ArtiSplatfactoModel(SplatfactoModel):
         self.metadata = kwargs.pop("metadata", {}) or {}
         super().__init__(*args, **kwargs)
         
-        # Don't assign joint parameters here - they'll be created in populate_modules()
-        # Just store the joint_type as a simple attribute
+
         self.joint_type = self.obj_3d_seg.joint_type 
 
 
         if self.config.use_depth:
             self.depth_loss_fn = DepthLoss()
-
 
 
     def populate_modules(self):
@@ -144,25 +145,28 @@ class ArtiSplatfactoModel(SplatfactoModel):
         dim_sh = num_sh_bases(self.config.sh_degree)
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Use ParameterDict like base model
-        self.gauss_params = torch.nn.ParameterDict({
-            "means":         torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
-            "scales":        torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
-            "quats":         torch.nn.Parameter(torch.empty((0, 4), device=device, requires_grad=True)),
-            "features_dc":   torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
-            "features_rest": torch.nn.Parameter(torch.empty((0, dim_sh - 1, 3), device=device, requires_grad=True)),
-            "opacities":     torch.nn.Parameter(torch.empty((0, 1), device=device, requires_grad=True)),
-        })
+        self.all_gauss_params_obj = torch.nn.ModuleDict()
+        self.all_gauss_params_canon = torch.nn.ModuleDict()
 
-        # Canonical gaussians (trainable)
-        self.gauss_params_canonical = torch.nn.ParameterDict({
-            "means":         torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
-            "scales":        torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
-            "quats":         torch.nn.Parameter(torch.empty((0, 4), device=device, requires_grad=True)),
-            "features_dc":   torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
-            "features_rest": torch.nn.Parameter(torch.empty((0, dim_sh - 1, 3), device=device, requires_grad=True)),
-            "opacities":     torch.nn.Parameter(torch.empty((0, 1), device=device, requires_grad=True)),
-        })
+        # # Use ParameterDict like base model
+        # self.gauss_params = torch.nn.ParameterDict({
+        #     "means":         torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
+        #     "scales":        torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
+        #     "quats":         torch.nn.Parameter(torch.empty((0, 4), device=device, requires_grad=True)),
+        #     "features_dc":   torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
+        #     "features_rest": torch.nn.Parameter(torch.empty((0, dim_sh - 1, 3), device=device, requires_grad=True)),
+        #     "opacities":     torch.nn.Parameter(torch.empty((0, 1), device=device, requires_grad=True)),
+        # })
+
+        # # Canonical gaussians (trainable)
+        # self.gauss_params_canonical = torch.nn.ParameterDict({
+        #     "means":         torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
+        #     "scales":        torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
+        #     "quats":         torch.nn.Parameter(torch.empty((0, 4), device=device, requires_grad=True)),
+        #     "features_dc":   torch.nn.Parameter(torch.empty((0, 3), device=device, requires_grad=True)),
+        #     "features_rest": torch.nn.Parameter(torch.empty((0, dim_sh - 1, 3), device=device, requires_grad=True)),
+        #     "opacities":     torch.nn.Parameter(torch.empty((0, 1), device=device, requires_grad=True)),
+        # })
 
         # Fixed gaussians (non-trainable but still Parameters for saving)
         self.gauss_params_fixed = torch.nn.ParameterDict({
@@ -174,47 +178,52 @@ class ArtiSplatfactoModel(SplatfactoModel):
             "opacities":     torch.nn.Parameter(torch.empty((0, 1), device=device), requires_grad=False),
         })
 
+        self.all_joint_params = torch.nn.ModuleDict()
 
-        # Load object articulation info
         self.obj_3d_seg = Object3DSeg.load(self.config.obj_mask_file, device=device)
+        active_id = self.config.active_joint_id
+
+        # Create storage for the CURRENT active joint's parameters
+        self.all_joint_params[active_id] = torch.nn.ParameterDict()
+
         initial_pivot = self.obj_3d_seg.joint_pivot.to(device)
         initial_axis = F.normalize(self.obj_3d_seg.joint_axis.to(device), dim=0)
-
-        # Store initial pivot as buffer for regularization
-        self.register_buffer('initial_joint_pivot', initial_pivot.clone())
-        
-        # Shared articulation parameters
-        self.joint_pivot = torch.nn.Parameter(initial_pivot.clone(), requires_grad=True)
-        self.joint_axis_raw = torch.nn.Parameter(initial_axis.clone(), requires_grad=True)
-
         initial_max_angle = self.obj_3d_seg.joint_limits[1]
 
+        # Store initial pivot as a buffer associated with the active joint (optional, but cleaner)
+        self.register_buffer(f'initial_joint_pivot_{active_id}', initial_pivot.clone())
         
-        self.max_joint_angle = torch.nn.Parameter(
+        # Joint geometry parameters (will be added to the active ParameterDict)
+        self.all_joint_params[active_id]["pivot"] = torch.nn.Parameter(initial_pivot.clone(), requires_grad=True)
+        self.all_joint_params[active_id]["axis_raw"] = torch.nn.Parameter(initial_axis.clone(), requires_grad=True)
+        self.all_joint_params[active_id]["max_angle"] = torch.nn.Parameter(
             torch.tensor(initial_max_angle, device=device, dtype=torch.float32),
             requires_grad=True
         )
-
-
+        
+        # Handle per-frame joint angle corrections (must be registered on the model)
         joint_angles_meta = self.metadata.get("joint_angles", [])
         num_frames = len(joint_angles_meta)
 
         if num_frames > 0:
-            # Store prior in physical units (no modification)
-            prior_tensor = torch.tensor(joint_angles_meta, device=device, dtype=torch.float32)
-            self.register_buffer('joint_angles_prior', prior_tensor)
+            prior_tensor = torch.as_tensor(joint_angles_meta, device=device, dtype=torch.float32)
+            self.register_buffer(f'joint_angles_prior_{active_id}', prior_tensor)
             
-            # Initialize corrections to exactly zero
-            self.joint_angle_deltas = torch.nn.Parameter(torch.zeros(num_frames, device=device))
+            self.all_joint_params[active_id]["angle_deltas"] = torch.nn.Parameter(torch.zeros(num_frames, device=device))
             
-            # Store physical limits
             joint_min, joint_max = self.obj_3d_seg.joint_limits[0], self.obj_3d_seg.joint_limits[1]
-            self.register_buffer('joint_limits', torch.tensor([joint_min, joint_max], device=device))
-            
-            print(f"Initialized joint angles with Δθ correction approach:")
-            print(f"  Prior range: [{prior_tensor.min():.3f}, {prior_tensor.max():.3f}]")
-            print(f"  Physical limits: [{joint_min:.3f}, {joint_max:.3f}]") 
-            print(f"  Corrections initialized to 0.0")
+            self.register_buffer(f'joint_limits_{active_id}', torch.tensor([joint_min, joint_max], device=device))
+
+        # --- Backward Compatibility Pointers ---
+        # Create pointers to the active joint's parameters for existing methods 
+        # like get_gaussian_param_groups, get_outputs, etc.
+        self.joint_pivot = self.all_joint_params[active_id]["pivot"]
+        self.joint_axis_raw = self.all_joint_params[active_id]["axis_raw"]
+        self.max_joint_angle = self.all_joint_params[active_id]["max_angle"]
+        if num_frames > 0:
+            self.joint_angle_deltas = self.all_joint_params[active_id]["angle_deltas"]
+            self.joint_angles_prior = getattr(self, f'joint_angles_prior_{active_id}')
+            self.joint_limits = getattr(self, f'joint_limits_{active_id}')
 
         self.rgb_metrics = RGBMetrics()
         self.depth_metrics = DepthMetrics()
@@ -224,13 +233,18 @@ class ArtiSplatfactoModel(SplatfactoModel):
     @property
     def joint_axis(self):
         """Normalized joint axis"""
-        return F.normalize(self.joint_axis_raw, dim=0)
+        if hasattr(self, 'joint_axis_raw'):
+            return F.normalize(self.joint_axis_raw, dim=0)
+        return None
 
     @property
     def joint_angles(self):
         """Final angles = prior + corrections, clamped to limits"""
-        raw_angles = self.joint_angles_prior + self.joint_angle_deltas
-        return torch.clamp(raw_angles, self.joint_limits[0], self.joint_limits[1])
+        if hasattr(self, 'joint_angle_deltas'):
+            raw_angles = self.joint_angles_prior + self.joint_angle_deltas
+            return torch.clamp(raw_angles, self.joint_limits[0], self.joint_limits[1])
+        # Fallback/Eval logic
+        return torch.tensor([0.0], device=self.device)
 
     @property  
     def joint_angles_normalized(self):
@@ -239,28 +253,24 @@ class ArtiSplatfactoModel(SplatfactoModel):
         joint_min, joint_max = self.joint_limits[0], self.joint_limits[1]
         return (angles - joint_min) / (joint_max - joint_min)
 
-
-    def configure_training_stage(self):
-        """
-        Configure model parameters based on training_mode.
-        Called after loading checkpoint in recovery mode.
-        """
-        if self.config.training_mode == "recovery":
-            self.setup_recovery_stage()
-        elif self.config.training_mode == "articulation":
-            CONSOLE.print("[cyan]Articulation mode: Standard parameter configuration[/cyan]")
-        else:
-            raise ValueError(f"Unknown training_mode: {self.config.training_mode}")
-
-        
     def state_dict(self, *args, **kwargs):
         state = super().state_dict(*args, **kwargs)
+        
+        # Save all joint-specific Gaussian sets
+        for joint_id, params in self.all_gauss_params_obj.items():
+            for name, param in params.items():
+                state[f"all_gauss_params_obj.{joint_id}.{name}"] = param.data
 
-        # Save all parameter sets
-        for name, param in self.gauss_params.items():
-            state[f"gauss_params.{name}"] = param.data
-        for name, param in self.gauss_params_canonical.items():
-            state[f"gauss_params_canonical.{name}"] = param.data
+        for joint_id, params in self.all_gauss_params_canon.items():
+            for name, param in params.items():
+                state[f"all_gauss_params_canon.{joint_id}.{name}"] = param.data
+
+        # Save all joint-specific Articulation Parameters
+        for joint_id, params in self.all_joint_params.items():
+            for name, param in params.items():
+                state[f"all_joint_params.{joint_id}.{name}"] = param.data
+        
+        # Save Background Gaussians (Remains the same)
         if hasattr(self, 'gauss_params_fixed') and self.gauss_params_fixed:
             for name, param in self.gauss_params_fixed.items():
                 state[f"gauss_params_fixed.{name}"] = param.data
@@ -268,115 +278,130 @@ class ArtiSplatfactoModel(SplatfactoModel):
         return state
 
 
-    def setup_recovery_stage(self):
+
+    def configure_training_stage(self):
         """
-        Configure model for recovery stage:
-        - Freeze geometry (means, scales, quats) for object + canonical + background
-        - Enable radiance (features_dc, features_rest, opacities) for ALL including background
-        - Restore background opacity from dimmed state
-        - Freeze joint geometry (pivot, axis, max_angle)
-        - Keep joint_t_raw trainable for per-frame alignment
-        - Articulation transforms remain ACTIVE (just not optimized)
+        Configure model parameters based on training_mode and active_joint_id.
         """
+        if self.config.training_mode == "recovery":
+            self.setup_recovery_stage()
+        elif self.config.training_mode == "articulation":
+            self.setup_articulation_stage()
+        else:
+            raise ValueError(f"Unknown training_mode: {self.config.training_mode}")
+
+
+    def setup_articulation_stage(self):
+        """
+        Configure model for articulation stage (Joint N):
+        - Unfreeze geometry/radiance/joint params for the ACTIVE joint.
+        - Freeze geometry/radiance/joint params for ALL previous joints.
+        - Freeze ALL background params.
+        """
+        active_id = self.config.active_joint_id
+        GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+        
         CONSOLE.print("\n" + "="*70)
-        CONSOLE.print("[bold yellow]CONFIGURING MODEL FOR RECOVERY STAGE[/bold yellow]")
+        CONSOLE.print(f"[bold cyan]CONFIGURING MODEL FOR ARTICULATION STAGE: {active_id}[/bold cyan]")
         CONSOLE.print("="*70)
         
-        # # 1. Freeze geometric parameters
-        # geometric_params = ["means", "scales", "quats"]
-        
-        # CONSOLE.print("\n[cyan]Freezing geometric parameters...[/cyan]")
-        # for param_name in geometric_params:
-        #     if param_name in self.gauss_params:
-        #         self.gauss_params[param_name].requires_grad = False
-        #         CONSOLE.print(f"  ✓ Froze object {param_name}: {self.gauss_params[param_name].shape}")
-            
-        #     if param_name in self.gauss_params_canonical:
-        #         self.gauss_params_canonical[param_name].requires_grad = False
-        #         CONSOLE.print(f"  ✓ Froze canonical {param_name}: {self.gauss_params_canonical[param_name].shape}")
-            
-        #     if param_name in self.gauss_params_fixed:
-        #         self.gauss_params_fixed[param_name].requires_grad = False
-        #         CONSOLE.print(f"  ✓ Froze background {param_name}: {self.gauss_params_fixed[param_name].shape}")
-        
-        for param_name in ["means", "scales", "quats"]:
-            if param_name in self.gauss_params:
-                self.gauss_params[param_name].requires_grad = True
-                CONSOLE.print(f"  [green]✓ Kept object {param_name} trainable[/green]")
-            
-            if param_name in self.gauss_params_canonical:
-                self.gauss_params_canonical[param_name].requires_grad = True
-                CONSOLE.print(f"  [green]✓ Kept canonical {param_name} trainable[/green]")
-            
+        # --- 1. Configure Background Gaussians (Always Frozen in Articulation) ---
+        for param_name in GAUSS:
             if param_name in self.gauss_params_fixed:
-                self.gauss_params_fixed[param_name].requires_grad = True
-                CONSOLE.print(f"  [green]✓ Kept background {param_name} trainable[/green]")
-        
+                self.gauss_params_fixed[param_name].requires_grad = False
+        CONSOLE.print(f"  [red]✓ Frozen ALL Background Gaussians ({self.gauss_params_fixed['means'].shape[0]} pts)[/red]")
 
-        # 2. Enable radiance parameters for ALL sets
-        radiance_params = ["features_dc", "features_rest", "opacities"]
-        
-        CONSOLE.print("\n[green]Enabling radiance parameters...[/green]")
-        for param_name in radiance_params:
-            if param_name in self.gauss_params:
-                self.gauss_params[param_name].requires_grad = True
-                CONSOLE.print(f"  ✓ Enabled object {param_name}: {self.gauss_params[param_name].shape}")
+        # --- 2. Configure ALL Joint-Specific Gaussians ---
+        for joint_id in self.all_gauss_params_obj.keys():
+            is_active = (joint_id == active_id)
             
-            if param_name in self.gauss_params_canonical:
-                self.gauss_params_canonical[param_name].requires_grad = True
-                CONSOLE.print(f"  ✓ Enabled canonical {param_name}: {self.gauss_params_canonical[param_name].shape}")
+            # Articulated Object Gaussians
+            for param_name in GAUSS:
+                # Active joint: Trainable for geometry and radiance
+                # Previous joints: Frozen
+                requires_grad = is_active
+                self.all_gauss_params_obj[joint_id][param_name].requires_grad = requires_grad
+                self.all_gauss_params_canon[joint_id][param_name].requires_grad = requires_grad
             
-            if param_name in self.gauss_params_fixed:
-                # KEY: Make background trainable in recovery
-                self.gauss_params_fixed[param_name].requires_grad = True
-                CONSOLE.print(f"  [bold green]✓ Enabled background {param_name}: {self.gauss_params_fixed[param_name].shape}[/bold green]")
-        
-        # 3. Restore background opacity
-        # CONSOLE.print("\n[yellow]Restoring background opacity...[/yellow]")
-        # if "opacities" in self.gauss_params_fixed:
-        #     old_min = self.gauss_params_fixed["opacities"].data.min().item()
-        #     old_max = self.gauss_params_fixed["opacities"].data.max().item()
-            
-        #     # # Reset to 0.0 (sigmoid(0) = 0.5 opacity)
-        #     # self.gauss_params_fixed["opacities"].data.zero_()
-            
-        #     new_min = self.gauss_params_fixed["opacities"].data.min().item()
-        #     new_max = self.gauss_params_fixed["opacities"].data.max().item()
-            
-        #     CONSOLE.print(f"  ✓ Background opacity: [{old_min:.2f}, {old_max:.2f}] → [{new_min:.2f}, {new_max:.2f}]")
-        #     CONSOLE.print(f"    (sigmoid(0.0) = 0.5, background now at 50% opacity)")
-        
-        # 4. Freeze joint geometry parameters
-        CONSOLE.print("\n[cyan]Freezing joint geometry...[/cyan]")
-        if hasattr(self, 'joint_pivot'):
-            self.joint_pivot.requires_grad = False
-            CONSOLE.print(f"  ✓ Froze joint_pivot: {self.joint_pivot.data}")
-        
-        if hasattr(self, 'joint_axis_raw'):
-            self.joint_axis_raw.requires_grad = False
-            CONSOLE.print(f"  ✓ Froze joint_axis_raw: {self.joint_axis_raw.data}")
-        
-        if hasattr(self, 'max_joint_angle'):
-            self.max_joint_angle.requires_grad = False
-            CONSOLE.print(f"  ✓ Froze max_joint_angle: {self.max_joint_angle.data.item():.4f}")
-        
-        # 5. Keep per-frame articulation trainable
-        CONSOLE.print("\n[green]Keeping per-frame articulation trainable...[/green]")
-        if hasattr(self, 'joint_t_raw'):
-            self.joint_t_raw.requires_grad = True
-            CONSOLE.print(f"  ✓ joint_t_raw remains trainable: {self.joint_t_raw.shape}")
-            CONSOLE.print(f"    Current range: [{self.joint_t_values.min().item():.3f}, {self.joint_t_values.max().item():.3f}]")
-        
-        # 6. Important note about articulation
-        CONSOLE.print("\n[bold yellow]Note: Articulation transforms remain ACTIVE[/bold yellow]")
-        CONSOLE.print("  • get_joint_angle_for_camera() still works")
-        CONSOLE.print("  • apply_articulation_to_optimizer_params() still works")
-        CONSOLE.print("  • Rendering still uses articulated object Gaussians")
-        CONSOLE.print("  • Only joint parameters are frozen, not the transform itself")
+            status = "Trainable" if is_active else "Frozen"
+            color = "green" if is_active else "yellow"
+            CONSOLE.print(f"  [{color}]✓ {status} Object/Canonical Gaussians for {joint_id}[/{color}]")
+
+        # --- 3. Configure ALL Joint-Specific Parameters ---
+        JOINT_PARAMS = ["pivot", "axis_raw", "max_angle", "angle_deltas"]
+        for joint_id in self.all_joint_params.keys():
+            is_active = (joint_id == active_id)
+
+            for param_name in JOINT_PARAMS:
+                if param_name in self.all_joint_params[joint_id]:
+                    # Active joint: Trainable for geometry (pivot/axis) and corrections
+                    # Previous joints: Frozen
+                    requires_grad = is_active
+                    self.all_joint_params[joint_id][param_name].requires_grad = requires_grad
+                    
+            status = "Trainable" if is_active else "Frozen"
+            color = "green" if is_active else "yellow"
+            CONSOLE.print(f"  [{color}]✓ {status} Articulation Parameters for {joint_id}[/{color}]")
+
+        CONSOLE.print("\n[bold green]ARTICULATION STAGE CONFIGURATION COMPLETE[/bold green]")
+        CONSOLE.print(f"Active Joint: {active_id} | Others: FROZEN | Background: FROZEN")
+        CONSOLE.print("="*70 + "\n")
+
+    def setup_recovery_stage(self):
+        """
+        Configure model for recovery stage (Joint N):
+        - Freeze ALL geometry (means, scales, quats) for all joints and background.
+        - Enable ALL radiance (features_dc, features_rest, opacities) for all joints and background.
+        - Freeze ALL joint parameters (pivot, axis, deltas, etc.) for all joints.
+        """
+        GEOMETRY_PARAMS = ["means", "scales", "quats"]
+        RADIANCE_PARAMS = ["features_dc", "features_rest", "opacities"]
+        JOINT_PARAMS = ["pivot", "axis_raw", "max_angle", "angle_deltas"]
         
         CONSOLE.print("\n" + "="*70)
+        CONSOLE.print("[bold yellow]CONFIGURING MODEL FOR RECOVERY STAGE (RADIANCE OPTIMIZATION)[/bold yellow]")
+        CONSOLE.print("="*70)
+        
+        # --- 1. Configure ALL Joint-Specific Gaussians (Freeze Geo, Unfreeze Radiance) ---
+        for joint_id in self.all_gauss_params_obj.keys():
+            CONSOLE.print(f"\n[yellow]Configuring Gaussians for {joint_id}[/yellow]")
+            
+            for param_name in GEOMETRY_PARAMS:
+                # **Fix**: Freeze Geometry
+                self.all_gauss_params_obj[joint_id][param_name].requires_grad = False
+                self.all_gauss_params_canon[joint_id][param_name].requires_grad = False
+            CONSOLE.print(f"  ✓ Froze Geometry ({GEOMETRY_PARAMS}) for Object/Canonical")
+
+            for param_name in RADIANCE_PARAMS:
+                # Unfreeze Radiance
+                self.all_gauss_params_obj[joint_id][param_name].requires_grad = True
+                self.all_gauss_params_canon[joint_id][param_name].requires_grad = True
+            CONSOLE.print(f"  [green]✓ Enabled Radiance ({RADIANCE_PARAMS}) for Object/Canonical[/green]")
+        
+        # --- 2. Configure Background Gaussians (Freeze Geo, Unfreeze Radiance) ---
+        CONSOLE.print("\n[yellow]Configuring Background Gaussians[/yellow]")
+        for param_name in GEOMETRY_PARAMS:
+            if param_name in self.gauss_params_fixed:
+                self.gauss_params_fixed[param_name].requires_grad = False
+        CONSOLE.print(f"  ✓ Froze Geometry ({GEOMETRY_PARAMS}) for Background")
+        
+        for param_name in RADIANCE_PARAMS:
+            if param_name in self.gauss_params_fixed:
+                self.gauss_params_fixed[param_name].requires_grad = True
+        CONSOLE.print(f"  [bold green]✓ Enabled Radiance ({RADIANCE_PARAMS}) for Background[/bold green]")
+
+        # --- 3. Configure ALL Joint-Specific Parameters (Always Frozen) ---
+        CONSOLE.print("\n[cyan]Freezing ALL joint geometry parameters...[/cyan]")
+        for joint_id in self.all_joint_params.keys():
+            for param_name in JOINT_PARAMS:
+                if param_name in self.all_joint_params[joint_id]:
+                    self.all_joint_params[joint_id][param_name].requires_grad = False
+                    CONSOLE.print(f"  ✓ Froze {joint_id} {param_name}")
+        
+        # --- 4. Final Summary ---
+        CONSOLE.print("\n" + "="*70)
         CONSOLE.print("[bold green]RECOVERY STAGE CONFIGURATION COMPLETE[/bold green]")
-        CONSOLE.print("Geometry: FROZEN | Radiance: TRAINABLE | Articulation: ACTIVE")
+        CONSOLE.print("ALL Geometry: FROZEN | ALL Radiance: TRAINABLE | ALL Articulation: FROZEN")
         CONSOLE.print("="*70 + "\n")
 
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
@@ -387,367 +412,566 @@ class ArtiSplatfactoModel(SplatfactoModel):
         else:
             return self.get_articulation_param_groups()
     
-
     def get_articulation_param_groups(self) -> Dict[str, List[Parameter]]:
-        """Standard parameter groups for articulation training (Stage 2)"""
+        """Return parameter groups for the ACTIVE joint's articulation training."""
         groups = {}
+        active_id = self.config.active_joint_id
+        GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
         
-        # Object parameters
-        obj_param_mapping = {
-            "obj_means": "means",
-            "obj_scales": "scales", 
-            "obj_quats": "quats",
-            "obj_features_dc": "features_dc",
-            "obj_features_rest": "features_rest",
-            "obj_opacities": "opacities",
-        }
-        
-        for optimizer_name, internal_name in obj_param_mapping.items():
-            if (hasattr(self, 'gauss_params') and 
-                internal_name in self.gauss_params and 
-                self.gauss_params[internal_name].numel() > 0):
-                groups[optimizer_name] = [self.gauss_params[internal_name]]
-        
-        # Canonical parameters
-        canon_param_mapping = {
-            "canon_means": "means",
-            "canon_scales": "scales",
-            "canon_quats": "quats", 
-            "canon_features_dc": "features_dc",
-            "canon_features_rest": "features_rest",
-            "canon_opacities": "opacities",
-        }
-            
-        for optimizer_name, internal_name in canon_param_mapping.items():
-            if (hasattr(self, 'gauss_params_canonical') and 
-                internal_name in self.gauss_params_canonical and 
-                self.gauss_params_canonical[internal_name].numel() > 0):
-                groups[optimizer_name] = [self.gauss_params_canonical[internal_name]]
-        
-        # Joint parameters
-        if hasattr(self, 'joint_pivot') and self.joint_pivot is not None:
-            groups["joint_pivot"] = [self.joint_pivot]
-        
-        if hasattr(self, 'joint_axis_raw') and self.joint_axis_raw is not None:
-            groups["joint_axis"] = [self.joint_axis_raw]
-        
-        if hasattr(self, 'max_joint_angle') and self.max_joint_angle is not None:
-            groups["max_joint_angle"] = [self.max_joint_angle]
-                
-        if hasattr(self, 'joint_angle_deltas') and self.joint_angle_deltas is not None:
-            groups["joint_corrections"] = [self.joint_angle_deltas]
-            print(f"Added param group 'joint_corrections': {self.joint_angle_deltas.shape}")
+        CONSOLE.print(f"\n[cyan]Building articulation parameter groups for ACTIVE joint: {active_id}...[/cyan]")
 
+        # --- 1. Active Joint Gaussian Parameters (Object & Canonical) ---
+        if active_id in self.all_gauss_params_obj:
+            obj_params = self.all_gauss_params_obj[active_id]
+            canon_params = self.all_gauss_params_canon[active_id]
+            
+            for param_name in GAUSS:
+                # Object Gaussians
+                opt_name = f"obj_{param_name}"
+                if param_name in obj_params and obj_params[param_name].requires_grad:
+                    groups[opt_name] = [obj_params[param_name]]
+                    CONSOLE.print(f"  ✓ {opt_name}: {obj_params[param_name].shape}")
+
+                # Canonical Gaussians
+                opt_name = f"canon_{param_name}"
+                if param_name in canon_params and canon_params[param_name].requires_grad:
+                    groups[opt_name] = [canon_params[param_name]]
+                    CONSOLE.print(f"  ✓ {opt_name}: {canon_params[param_name].shape}")
+
+        # --- 2. Active Joint Articulation Parameters (Pivot, Axis, Deltas) ---
+        if active_id in self.all_joint_params:
+            joint_params = self.all_joint_params[active_id]
+            
+            # Pivot, Axis, Max Angle
+            joint_geom_params = {
+                "joint_pivot": "pivot",
+                "joint_axis": "axis_raw",
+                "max_joint_angle": "max_angle",
+            }
+            
+            for opt_name, internal_name in joint_geom_params.items():
+                if internal_name in joint_params and joint_params[internal_name].requires_grad:
+                    groups[opt_name] = [joint_params[internal_name]]
+                    CONSOLE.print(f"  ✓ {opt_name}: {joint_params[internal_name].shape}")
+
+            # Joint Corrections
+            if "angle_deltas" in joint_params and joint_params["angle_deltas"].requires_grad:
+                groups["joint_corrections"] = [joint_params["angle_deltas"]]
+                CONSOLE.print(f"  ✓ joint_corrections: {joint_params['angle_deltas'].shape}")
+
+        CONSOLE.print(f"\n[green]Total: {len(groups)} articulation parameter groups[/green]\n")
         return groups
 
     def get_recovery_param_groups(self) -> Dict[str, List[Parameter]]:
-        """Parameter groups for recovery training - radiance + means + quats"""
-        groups = {}
+            """
+            Parameter groups for recovery training (ALL radiance).
+            Groups are named using generic config keys (e.g., 'bg_features_dc') 
+            to match the optimizer configuration.
+            """
+            groups = {}
+            RADIANCE_PARAMS = ["features_dc", "features_rest", "opacities"]
+            
+            # Define the static optimizer keys we will use for grouping the radiance parameters
+            PARAM_GROUP_MAPPING = {
+                "features_dc": "bg_features_dc",
+                "features_rest": "bg_features_rest",
+                "opacities": "bg_opacities",
+            }
+            
+            CONSOLE.print("\n[cyan]Building recovery parameter groups (Radiance for ALL)...[/cyan]")
+
+            # --- 1. All Joint Gaussian Radiance Parameters ---
+            for joint_id in self.all_gauss_params_obj.keys():
+                obj_params = self.all_gauss_params_obj[joint_id]
+                canon_params = self.all_gauss_params_canon[joint_id]
+                
+                for param_name in RADIANCE_PARAMS:
+                    opt_key = PARAM_GROUP_MAPPING[param_name] # e.g., 'bg_features_dc'
+                    
+                    # Object Radiance
+                    if param_name in obj_params and obj_params[param_name].requires_grad:
+                        if opt_key not in groups: groups[opt_key] = []
+                        groups[opt_key].append(obj_params[param_name])
+                        CONSOLE.print(f"  ✓ Added {joint_id} Object {param_name} to {opt_key} group")
+
+                    # Canonical Radiance
+                    if param_name in canon_params and canon_params[param_name].requires_grad:
+                        if opt_key not in groups: groups[opt_key] = []
+                        groups[opt_key].append(canon_params[param_name])
+                        CONSOLE.print(f"  ✓ Added {joint_id} Canonical {param_name} to {opt_key} group")
+            
+            # --- 2. Background Radiance Parameters ---
+            for param_name in RADIANCE_PARAMS:
+                opt_key = PARAM_GROUP_MAPPING[param_name]
+                if param_name in self.gauss_params_fixed and self.gauss_params_fixed[param_name].requires_grad:
+                    if opt_key not in groups: groups[opt_key] = []
+                    groups[opt_key].append(self.gauss_params_fixed[param_name])
+                    CONSOLE.print(f"  [bold green]✓ Added Background {param_name} to {opt_key} group[/bold green]")
+            
+            # --- 3. Per-frame articulation (if enabled/trainable) ---
+            # If 'joint_t_values' or similar per-frame parameters are still trainable, they should 
+            # map to an existing config key, likely 'joint_t_values' or 'camera_opt'.
+            # Assuming joint_t_values is the correct key if it was used in the config.
+            # This section remains largely dependent on your specific config keys.
+
+            if hasattr(self, 'joint_t_raw') and self.joint_t_raw.requires_grad:
+                # Assumes 'joint_t_values' is a key in the config
+                groups["joint_t_values"] = [self.joint_t_raw] 
+                CONSOLE.print(f"  ✓ joint_t_values (Legacy): {self.joint_t_raw.shape}")
+            
+            CONSOLE.print(f"\n[green]Total: {len(groups)} recovery parameter groups[/green]\n")
+            return groups
         
-        CONSOLE.print("\n[cyan]Building recovery parameter groups...[/cyan]")
-        
-        # Object geometry + radiance
-        obj_params = {
-            "obj_means": "means",              # NOW INCLUDED
-            "obj_quats": "quats",              # NOW INCLUDED
-            "obj_features_dc": "features_dc",
-            "obj_features_rest": "features_rest",
-            "obj_opacities": "opacities",
-        }
-        
-        for opt_name, param_name in obj_params.items():
-            if (hasattr(self, 'gauss_params') and 
-                param_name in self.gauss_params and 
-                self.gauss_params[param_name].requires_grad):
-                groups[opt_name] = [self.gauss_params[param_name]]
-                CONSOLE.print(f"  ✓ {opt_name}: {self.gauss_params[param_name].shape}")
-        
-        # Canonical geometry + radiance
-        canon_params = {
-            "canon_means": "means",            # NOW INCLUDED
-            "canon_quats": "quats",            # NOW INCLUDED
-            "canon_features_dc": "features_dc",
-            "canon_features_rest": "features_rest",
-            "canon_opacities": "opacities",
-        }
-        
-        for opt_name, param_name in canon_params.items():
-            if (hasattr(self, 'gauss_params_canonical') and 
-                param_name in self.gauss_params_canonical and 
-                self.gauss_params_canonical[param_name].requires_grad):
-                groups[opt_name] = [self.gauss_params_canonical[param_name]]
-                CONSOLE.print(f"  ✓ {opt_name}: {self.gauss_params_canonical[param_name].shape}")
-        
-        # Background geometry + radiance
-        bg_params = {
-            "bg_means": "means",               # NOW INCLUDED
-            "bg_quats": "quats",               # NOW INCLUDED
-            "bg_features_dc": "features_dc",
-            "bg_features_rest": "features_rest",
-            "bg_opacities": "opacities",
-        }
-        
-        for opt_name, param_name in bg_params.items():
-            if (hasattr(self, 'gauss_params_fixed') and 
-                param_name in self.gauss_params_fixed and 
-                self.gauss_params_fixed[param_name].requires_grad):
-                groups[opt_name] = [self.gauss_params_fixed[param_name]]
-                CONSOLE.print(f"  [bold green]✓ {opt_name}: {self.gauss_params_fixed[param_name].shape}[/bold green]")
-        
-        # Per-frame articulation
-        if hasattr(self, 'joint_t_raw') and self.joint_t_raw.requires_grad:
-            groups["joint_t_values"] = [self.joint_t_raw]
-            CONSOLE.print(f"  ✓ joint_t_values: {self.joint_t_raw.shape}")
-        
-        CONSOLE.print(f"\n[green]Total: {len(groups)} recovery parameter groups[/green]\n")
-        return groups
-        
-    
+
     def _initialize_and_partition(self, state_dict: Dict[str, torch.Tensor]):
         """
         From a full-scene checkpoint: split into trainable object + fixed background.
-        (Canonical stays empty here; you can fill it later if you have an exposed mask.)
+        This runs only for the first joint (e.g., 'joint_0').
         """
         print("Initializing from full scene: partitioning Gaussians...")
 
-        # self.obj_3d_seg = Object3DSeg.read_from_file(self.config.obj_mask_file, device=self.device)
-        print("obj mask points:", self.obj_3d_seg)
-        # self.obj_3d_seg.refine_mask(dilate_k=4, erode_k=1)
+        active_id = self.config.active_joint_id
+        
+        print(f"obj mask points for {active_id}:", self.obj_3d_seg)
 
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+        device = self.device
 
-        all_means = state_dict["gauss_params.means"].to(self.device)
+        all_means = state_dict["gauss_params.means"].to(device)
         obj_mask = self.obj_3d_seg.query_refine(all_means, grow=3, thresh=0.01, bbox_margin=0.01).to(torch.bool).cpu()
         bg_mask  = ~obj_mask
 
+        print(f"check the mask {obj_mask.sum()} object points, {bg_mask.sum()} background points")
+        # import pdb; pdb.set_trace()
+        
+        # --- Create new ParameterDicts for the active joint ---
+        self.all_gauss_params_obj[active_id] = torch.nn.ParameterDict()
+        self.all_gauss_params_canon[active_id] = torch.nn.ParameterDict()
+
         for p in GAUSS:
-            subset = state_dict[f"gauss_params.{p}"][obj_mask].to(self.device)
-            param = torch.nn.Parameter(subset.clone().detach(), requires_grad=True)
-            self.gauss_params[p] = param
-            print(f"Object {p}: {param.shape}, requires_grad={param.requires_grad}")
+            subset_obj = state_dict[f"gauss_params.{p}"][obj_mask].to(device)
+            subset_bg = state_dict[f"gauss_params.{p}"][bg_mask].to(device)
+            
+            # Object Gaussians (trainable for active joint)
+            param_obj = torch.nn.Parameter(subset_obj.clone().detach(), requires_grad=True)
+            self.all_gauss_params_obj[active_id][p] = param_obj
+            
+            # Canonical Gaussians (trainable for active joint)
+            param_canon = torch.nn.Parameter(subset_obj.clone().detach(), requires_grad=True)
+            self.all_gauss_params_canon[active_id][p] = param_canon
+            
+            # Fixed background gaussians (non-trainable)
+            param_fixed = torch.nn.Parameter(subset_bg.clone().detach(), requires_grad=False)
+            self.gauss_params_fixed[p] = param_fixed
+            
+            # Set pointers for backward compatibility (only for the active joint)
+            if p == "means":
+                self.gauss_params = self.all_gauss_params_obj[active_id]
+                self.gauss_params_canonical = self.all_gauss_params_canon[active_id]
+            
+            print(f"[{active_id} Object] {p}: {param_obj.shape}, requires_grad={param_obj.requires_grad}")
+            print(f"[{active_id} Canon] {p}: {param_canon.shape}, requires_grad={param_canon.requires_grad}")
 
-        # Canonical gaussians (trainable)
-        for p in GAUSS:
-            subset = state_dict[f"gauss_params.{p}"][obj_mask].to(self.device)
-            # Create new Parameter with requires_grad=True
-            param = torch.nn.Parameter(subset.clone().detach(), requires_grad=True)
-            self.gauss_params_canonical[p] = param
-            print(f"Canonical {p}: {param.shape}, requires_grad={param.requires_grad}")
 
-        # Fixed background gaussians (non-trainable)
-        for p in GAUSS:
-            subset = state_dict[f"gauss_params.{p}"][bg_mask].to(self.device)
-            # Create new Parameter with requires_grad=False
-            param = torch.nn.Parameter(subset.clone().detach(), requires_grad=False)
-            self.gauss_params_fixed[p] = param
-            print(f"Background {p}: {param.shape}, requires_grad={param.requires_grad}")
-
-
-        n_obj = self.gauss_params["means"].shape[0]
-        n_canon = self.gauss_params_canonical["means"].shape[0]
+        n_obj = self.all_gauss_params_obj[active_id]["means"].shape[0]
+        n_canon = self.all_gauss_params_canon[active_id]["means"].shape[0]
         n_bg = self.gauss_params_fixed["means"].shape[0]
 
-        # if hasattr(self, 'joint_pivot'):
-        #     self.validate_joint_parameters()
+        print(f"Partitioning complete. {active_id} Obj: {n_obj}, {active_id} Canon: {n_canon}, Fixed BG: {n_bg}")
 
-        # if hasattr(self, "gauss_params_fixed") and "opacities" in self.gauss_params_fixed:
-        #     print("Dimming background Gaussians for canonical visibility...")
-        #     self.gauss_params_fixed["opacities"].data[:] = -10.0  
-        
-        print(f"Partitioning complete. Trainable: {self.gauss_params['means'].shape[0]}, Canonical: {self.gauss_params_canonical['means'].shape[0]}, Fixed: {self.gauss_params_fixed['means'].shape[0]}")
 
     def load_state_dict(self, state_dict: Dict[str, torch.Tensor], **kwargs):
         print(f"Loading state_dict (Training mode: {self.training})")
         assert self.config.obj_mask_file is not None and self.config.obj_mask_file.exists()
 
+        active_id = self.config.active_joint_id
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+        device = self.device
+        
+        # --- Helper Function: Identify Legacy Parameters ---
+        def is_legacy_single_joint_param(key: str) -> bool:
+            """Dynamically detect old single-joint parameter format."""
+            legacy_base_names = [
+                "joint_pivot", "joint_axis_raw", "max_joint_angle", "joint_angle_deltas"
+            ]
+            
+            if key in legacy_base_names:
+                return True
+            
+            if re.match(r"joint_angles_prior_joint_\d+$", key):
+                return True
+            if re.match(r"joint_limits_joint_\d+$", key):
+                return True
+            
+            return False
+        
+        # --- 1. Detect Partitioning Status ---
+        is_multi_joint_partitioned = any(k.startswith("all_gauss_params_obj.") for k in state_dict)
+        is_single_joint_partitioned = "gauss_params_fixed.means" in state_dict
+        
+        # Check if we need to partition the active joint
+        needs_active_joint_partition = (
+            self.config.training_mode == "articulation" and 
+            "gauss_params.means" in state_dict
+        )
 
-        if "means" in state_dict:
+        # Backwards compatibility for single-joint format
+        if "means" in state_dict and not is_multi_joint_partitioned:
             for p in GAUSS:
                 state_dict[f"gauss_params.{p}"] = state_dict[p]
 
-        if not self.training:
-            is_partitioned = any(k.startswith("gauss_params_fixed.") for k in state_dict)
-        else:
-            is_partitioned = "gauss_params_fixed.means" in state_dict
-
-        if is_partitioned:
-            self.gauss_params = torch.nn.ParameterDict()
-            self.gauss_params_canonical = torch.nn.ParameterDict()
-            self.gauss_params_fixed = torch.nn.ParameterDict()
+        # --- 2. Load Previously Trained Joints and Background ---
+        if is_multi_joint_partitioned or is_single_joint_partitioned:
+            print(f"Loading previously trained joints from partitioned checkpoint...")
             
-            for p in GAUSS:
-                if f"gauss_params.{p}" in state_dict:
-                    tensor = state_dict[f"gauss_params.{p}"].to(self.device)
-                    self.gauss_params[p] = torch.nn.Parameter(tensor.clone().detach(), requires_grad=True)
+            # --- Load ALL Previously Trained Gaussian Sets ---
+            for key, tensor in state_dict.items():
+                tensor = tensor.to(device)
+                
+                # Load joint-specific Gaussians
+                match = re.match(r"all_gauss_params_(obj|canon)\.(joint_\d+)\.(" + "|".join(GAUSS) + r")$", key)
+                if match:
+                    set_type, joint_id, param_name = match.groups()
                     
-                if f"gauss_params_canonical.{p}" in state_dict:
-                    tensor = state_dict[f"gauss_params_canonical.{p}"].to(self.device)
-                    self.gauss_params_canonical[p] = torch.nn.Parameter(tensor.clone().detach(), requires_grad=True)
+                    # Skip the active joint - it will be re-partitioned
+                    if joint_id == active_id and needs_active_joint_partition:
+                        continue
                     
-                if f"gauss_params_fixed.{p}" in state_dict:
-                    tensor = state_dict[f"gauss_params_fixed.{p}"].to(self.device)
-                    self.gauss_params_fixed[p] = torch.nn.Parameter(tensor.clone().detach(), requires_grad=False)
+                    target_dict = self.all_gauss_params_obj if set_type == 'obj' else self.all_gauss_params_canon
+                    
+                    if joint_id not in target_dict:
+                        target_dict[joint_id] = torch.nn.ParameterDict()
+                    
+                    # Previous joints are always frozen
+                    target_dict[joint_id][param_name] = torch.nn.Parameter(
+                        tensor.clone().detach(), 
+                        requires_grad=False
+                    )
 
+                # Load Background Gaussians
+                elif key.startswith("gauss_params_fixed."):
+                    param_name = key.split('.')[-1]
+                    requires_grad = (self.training and self.config.training_mode == "recovery")
+                    self.gauss_params_fixed[param_name] = torch.nn.Parameter(
+                        tensor.clone().detach(), 
+                        requires_grad=requires_grad
+                    )
+
+        # --- 3. Partition Active Joint ---
+        if needs_active_joint_partition:
+            print(f"{'='*70}")
+            if active_id == "joint_0":
+                print(f"INITIAL PARTITIONING for {active_id} (first joint)")
+            else:
+                print(f"SEQUENTIAL PARTITIONING for {active_id}")
+            print(f"{'='*70}")
+            
+            # CRITICAL FIX: Reconstruct the full scene for partitioning
+            if active_id != "joint_0" and is_multi_joint_partitioned:
+                # For joint_1+, reconstruct: background + all_previous_joints
+                # NOTE: We do NOT include gauss_params.means because it only contains
+                # the previous active joint's Gaussians, which we already loaded above
+                print(f"Reconstructing full scene for partitioning...")
+                
+                combined_data = {p: [] for p in GAUSS}
+                
+                # Add background
+                if hasattr(self, 'gauss_params_fixed') and 'means' in self.gauss_params_fixed:
+                    for p in GAUSS:
+                        combined_data[p].append(self.gauss_params_fixed[p].data)
+                    bg_count = self.gauss_params_fixed['means'].shape[0]
+                    print(f"  Added {bg_count:,} background Gaussians")
+                
+                # Add all previous joints (these are the complete movable body so far)
+                prev_joint_count = 0
+                for joint_id in sorted(self.all_gauss_params_obj.keys()):
+                    if joint_id != active_id:  # Skip active joint (doesn't exist yet)
+                        for p in GAUSS:
+                            combined_data[p].append(self.all_gauss_params_obj[joint_id][p].data)
+                        count = self.all_gauss_params_obj[joint_id]['means'].shape[0]
+                        prev_joint_count += count
+                        print(f"  Added {count:,} Gaussians from {joint_id}")
+                
+                # Concatenate everything
+                partition_state = {}
+                for p in GAUSS:
+                    partition_state[f"gauss_params.{p}"] = torch.cat(combined_data[p], dim=0)
+                
+                total_points = partition_state["gauss_params.means"].shape[0]
+                print(f"  Total reconstructed scene: {total_points:,} Gaussians")
+                print(f"  (Background: {bg_count:,} + Previous joints: {prev_joint_count:,})")
+                
+            else:
+                # For joint_0, use the original full scene directly
+                partition_state = {}
+                for p in GAUSS:
+                    key = f"gauss_params.{p}"
+                    if key in state_dict:
+                        partition_state[key] = state_dict[key]
+                
+                if "gauss_params.means" in partition_state:
+                    print(f"  Using full scene: {partition_state['gauss_params.means'].shape[0]:,} Gaussians")
+            
+            # Now partition the active joint from the reconstructed full scene
+            print(f"Querying 3D segmentation for {active_id}...")
+            self._initialize_and_partition(partition_state)
+            
+            print(f"✓ Partitioned {self.gauss_params['means'].shape[0]:,} Gaussians for {active_id}")
+            print(f"{'='*70}\n")
+
+        # --- 4. Load Joint Articulation Parameters ---
+        
+        FRAME_DEPENDENT_PARAMS = {"angle_deltas"}
+        
+        for key, tensor in state_dict.items():
+            if key.startswith("all_joint_params."):
+                parts = key.split('.')
+                if len(parts) < 3:
+                    continue
+                    
+                joint_id = parts[1]
+                param_name = parts[2]
+                
+                # Ensure joint entry exists
+                if joint_id not in self.all_joint_params:
+                    self.all_joint_params[joint_id] = torch.nn.ParameterDict()
+                
+                # Skip frame-dependent parameters if shape mismatch
+                if param_name in FRAME_DEPENDENT_PARAMS:
+                    if param_name in self.all_joint_params[joint_id]:
+                        current_shape = self.all_joint_params[joint_id][param_name].shape
+                        checkpoint_shape = tensor.shape
+                        
+                        if current_shape != checkpoint_shape:
+                            print(f"⚠️  Skipping {key}: shape mismatch "
+                                f"(checkpoint: {checkpoint_shape}, current: {current_shape}). "
+                                f"Using freshly initialized values.")
+                            continue
+                
+                # Determine trainability: only active joint in articulation mode
+                requires_grad = (
+                    joint_id == active_id and 
+                    self.training and 
+                    self.config.training_mode == "articulation"
+                )
+                
+                if param_name not in self.all_joint_params[joint_id]:
+                    self.all_joint_params[joint_id][param_name] = torch.nn.Parameter(
+                        tensor.to(device), 
+                        requires_grad=requires_grad
+                    )
+                else:
+                    self.all_joint_params[joint_id][param_name].data.copy_(tensor.to(device))
+                    self.all_joint_params[joint_id][param_name].requires_grad = requires_grad
+        
+        # --- 5. Set Active Joint Pointers ---
+        
+        if active_id in self.all_gauss_params_obj:
+            self.gauss_params = self.all_gauss_params_obj[active_id]
+            self.gauss_params_canonical = self.all_gauss_params_canon[active_id]
         else:
-            print("Partitioning full scene into obj/canonical/bg...")
-            self._initialize_and_partition(state_dict)
-
-        # Load non-gaussian parameters
+            print(f"⚠️  Warning: Active joint {active_id} not found. Using empty placeholders.")
+            self.gauss_params = torch.nn.ParameterDict({
+                p: torch.nn.Parameter(
+                    torch.empty((0, 3 if p not in ["quats", "opacities"] else (4 if p == "quats" else 1)), device=device), 
+                    requires_grad=False
+                ) for p in GAUSS
+            })
+            self.gauss_params_canonical = self.gauss_params
+        
+        if active_id in self.all_joint_params:
+            self.joint_pivot = self.all_joint_params[active_id]["pivot"]
+            self.joint_axis_raw = self.all_joint_params[active_id]["axis_raw"]
+            self.max_joint_angle = self.all_joint_params[active_id]["max_angle"]
+            
+            if "angle_deltas" in self.all_joint_params[active_id]:
+                self.joint_angle_deltas = self.all_joint_params[active_id]["angle_deltas"]
+                self.joint_angles_prior = getattr(self, f'joint_angles_prior_{active_id}', None)
+                self.joint_limits = getattr(self, f'joint_limits_{active_id}', None)
+        
+        # --- 6. Load General Non-Gaussian State ---
+        
         non_gauss_state = {
-            k: v for k, v in state_dict.items()
+            k: v for k, v in state_dict.items() 
             if not (
-                k.startswith("gauss_params.") or
-                k.startswith("gauss_params_canonical.") or
-                k.startswith("gauss_params_fixed.")
+                k.startswith("gauss_params.") or 
+                k.startswith("gauss_params_canonical.") or 
+                k.startswith("gauss_params_fixed.") or 
+                k.startswith("all_gauss_params_") or
+                k.startswith("all_joint_params.") or
+                is_legacy_single_joint_param(k)
             )
         }
-        if "joint_pivot" in state_dict:
-            self.joint_pivot.data.copy_(state_dict["joint_pivot"].to(self.device))
-            print(f"Loaded joint_pivot from checkpoint: {self.joint_pivot.data}")
-            
-
-        if "joint_angle_deltas" in state_dict:
-            self.joint_angle_deltas.data.copy_(state_dict["joint_angle_deltas"].to(self.device))
-            print(f"Loaded joint_angle_deltas: range=[{self.joint_angle_deltas.min():.4f}, {self.joint_angle_deltas.max():.4f}]")
-            
-        if "joint_angles" in state_dict:
-            self.joint_angles.data.copy_(state_dict["joint_angles"].to(self.device))
-            print(f"Loaded joint_angles from checkpoint: shape={self.joint_angles.shape}, range=[{self.joint_angles.min():.3f}, {self.joint_angles.max():.3f}]")
-
-        # Also load the buffer if it was saved
-        if "initial_joint_pivot" in state_dict:
-            self.initial_joint_pivot.copy_(state_dict["initial_joint_pivot"].to(self.device))
-            print(f"Loaded initial_joint_pivot buffer from checkpoint")
-
+        
         super().load_state_dict(non_gauss_state, strict=False)
+        
         self.step = 0
         self.configure_training_stage()
         
-        print(f"Load complete — obj={self.gauss_params['means'].shape[0]}, "
-            f"canon={self.gauss_params_canonical['means'].shape[0]}, "
-            f"bg={self.gauss_params_fixed['means'].shape[0] if self.gauss_params_fixed else 0}")
+        # --- 7. Status Report ---
+        print(f"\n{'='*60}")
+        print(f"✓ Checkpoint Load Complete")
+        print(f"{'='*60}")
+        print(f"Active Joint: {active_id}")
+        print(f"Training Mode: {self.config.training_mode}")
+        print(f"Active Gaussians: {self.gauss_params['means'].shape[0]:,}")
         
+        all_joint_ids = sorted(set(self.all_gauss_params_obj.keys()) | set(self.all_joint_params.keys()))
+        print(f"\nLoaded Joints ({len(all_joint_ids)}):")
+        print(f"{'-'*60}")
+        
+        for joint_id in all_joint_ids:
+            if joint_id in self.all_gauss_params_obj:
+                n_gaussians = self.all_gauss_params_obj[joint_id]["means"].shape[0]
+                is_frozen = not self.all_gauss_params_obj[joint_id]["means"].requires_grad
+                gauss_status = f"{n_gaussians:,} Gaussians ({'FROZEN' if is_frozen else 'TRAINABLE'})"
+            else:
+                gauss_status = "No Gaussians"
+            
+            if joint_id in self.all_joint_params:
+                param_names = list(self.all_joint_params[joint_id].keys())
+                params_frozen = not self.all_joint_params[joint_id][param_names[0]].requires_grad
+                param_status = f"{len(param_names)} params ({'FROZEN' if params_frozen else 'TRAINABLE'})"
+            else:
+                param_status = "No params"
+            
+            marker = "→" if joint_id == active_id else " "
+            print(f"{marker} {joint_id:12s} | {gauss_status:30s} | {param_status}")
+        
+        if hasattr(self, 'gauss_params_fixed') and 'means' in self.gauss_params_fixed:
+            n_bg = self.gauss_params_fixed['means'].shape[0]
+            bg_frozen = not self.gauss_params_fixed['means'].requires_grad
+            print(f"\n  Background     | {n_bg:,} Gaussians ({'FROZEN' if bg_frozen else 'TRAINABLE'})")
+        
+        print(f"{'='*60}\n")
 
+        
     def step_cb(self, optimizers: Optimizers, step):
         self.step = step
         self.optimizers = optimizers.optimizers
         self.schedulers = optimizers.schedulers
 
     def step_post_backward(self, step):
-        """Apply strategy to both object and canonical parameters separately"""
+        """
+        Apply densification strategy only to the ACTIVE joint's object and canonical parameters,
+        relying on the prioritized render order.
+        """
         assert step == self.step
-        
+
         # === RECOVERY MODE: Skip all geometric refinement ===
         if self.config.training_mode == "recovery":
             if step % 500 == 0:
                 CONSOLE.print(f"[yellow]Step {step}: Recovery mode - skipping densification[/yellow]")
                 CONSOLE.print("  • Geometry frozen (no splits/clones/prunes)")
                 CONSOLE.print("  • Radiance optimization only")
-                
+
                 # Debug: check if background is getting gradients
-                if hasattr(self, 'gauss_params_fixed'):
-                    bg_features_grad = self.gauss_params_fixed['features_dc'].grad
+                if hasattr(self, "gauss_params_fixed"):
+                    bg_features_grad = self.gauss_params_fixed["features_dc"].grad
                     if bg_features_grad is not None:
                         CONSOLE.print(f"  ✓ Background getting gradients: {bg_features_grad.norm():.6e}")
                     else:
                         CONSOLE.print("  [red]✗ Background NOT getting gradients![/red]")
-            
             return
-        
-        # === ARTICULATION MODE: Normal densification ===
+
+        # === ARTICULATION MODE: Densification for ACTIVE Joint Only ===
         if not isinstance(self.strategy, DefaultStrategy):
             raise ValueError(f"Only DefaultStrategy supported, got {self.strategy}")
 
+        # --- Local vars ---
+        n_active_obj = self.n_active_obj
+        n_obj_total = self.n_obj_total
+        n_active_canon = self.gauss_params_canonical["means"].shape[0]
+
+        # --- Helper: empty info dict ---
         def create_empty_info_with_absgrad():
-            """Create empty info dict with proper absgrad tensor"""
             empty_ids = torch.empty(0, dtype=torch.long, device=self.device)
-            
-            # Create empty tensor for the gradient key with absgrad
-            key = self.strategy.key_for_gradient  # Usually "means2d"
-            if hasattr(self, 'combined_info') and self.combined_info and key in self.combined_info:
+            key = self.strategy.key_for_gradient
+            if hasattr(self, "combined_info") and self.combined_info and key in self.combined_info:
                 ref_tensor = self.combined_info[key]
-                empty_tensor = torch.empty((0,) + ref_tensor.shape[1:], 
-                                        device=self.device, dtype=ref_tensor.dtype)
+                empty_tensor = torch.empty((0,) + ref_tensor.shape[1:], device=self.device, dtype=ref_tensor.dtype)
             else:
-                # Fallback - means2d is typically (N, 2)
                 empty_tensor = torch.empty((0, 2), device=self.device, dtype=torch.float32)
-            
             empty_tensor.absgrad = torch.empty_like(empty_tensor)
-            
             return {"gaussian_ids": empty_ids, key: empty_tensor}
-        
-        if hasattr(self, 'combined_info') and self.combined_info and self.combined_info.get("gaussian_ids") is not None:
+
+        obj_info = create_empty_info_with_absgrad()
+        canon_info = create_empty_info_with_absgrad()
+
+        # --- Process combined info from last render ---
+        if hasattr(self, "combined_info") and self.combined_info and self.combined_info.get("gaussian_ids") is not None:
             visible_ids = self.combined_info["gaussian_ids"]
-            n_obj = self.n_obj_rendered
-            
-            # Split IDs: first n_obj belong to object, rest to canonical
-            obj_mask = visible_ids < n_obj
-            canon_mask = visible_ids >= n_obj
-            
-            # Create object info with proper absgrad handling
+
+            # ===============================================================
+            # 1. ACTIVE OBJECT GAUSSIANS
+            # ===============================================================
+            obj_mask = visible_ids < n_active_obj
             if obj_mask.any():
                 obj_visible_ids = visible_ids[obj_mask]
                 obj_info = {"gaussian_ids": obj_visible_ids}
-                
+
+                # Copy matching tensors (and absgrad where available)
                 for k, v in self.combined_info.items():
                     if k == "gaussian_ids":
                         continue
-                        
                     if isinstance(v, torch.Tensor) and v.shape[0] == len(visible_ids):
-                        # Extract object portion
                         obj_tensor = v[obj_mask].contiguous()
-                        
-                        # Handle absgrad if present
-                        if hasattr(v, 'absgrad') and v.absgrad is not None:
+                        if hasattr(v, "absgrad") and v.absgrad is not None:
                             obj_tensor.absgrad = v.absgrad[obj_mask].contiguous()
-                        
                         obj_info[k] = obj_tensor
                     else:
                         obj_info[k] = v
-            else:
-                obj_info = create_empty_info_with_absgrad()
-            
-            # Create canonical info with proper absgrad handling
+
+                # --- Inject required fields for gsplat ---
+                size_tensor_ref = obj_info["radii"] if "radii" in obj_info else obj_info[self.strategy.key_for_gradient]
+
+                if "width" not in obj_info:
+                    obj_info["width"] = torch.zeros_like(size_tensor_ref)
+                    obj_info["height"] = torch.zeros_like(size_tensor_ref)
+
+                if "n_cameras" not in obj_info:
+                    obj_info["n_cameras"] = torch.tensor(1, device=self.device)
+
+            # ===============================================================
+            # 2. ACTIVE CANONICAL GAUSSIANS
+            # ===============================================================
+            canon_start_id = n_obj_total
+            canon_mask = (visible_ids >= canon_start_id) & (visible_ids < canon_start_id + n_active_canon)
             if canon_mask.any():
-                canon_visible_ids = visible_ids[canon_mask] - n_obj  # Adjust IDs to 0-based
+                canon_visible_ids = visible_ids[canon_mask] - canon_start_id
                 canon_info = {"gaussian_ids": canon_visible_ids}
-                
+
                 for k, v in self.combined_info.items():
                     if k == "gaussian_ids":
                         continue
-                        
                     if isinstance(v, torch.Tensor) and v.shape[0] == len(visible_ids):
                         canon_tensor = v[canon_mask].contiguous()
-                        
-
-                        if hasattr(v, 'absgrad') and v.absgrad is not None:
+                        if hasattr(v, "absgrad") and v.absgrad is not None:
                             canon_tensor.absgrad = v.absgrad[canon_mask].contiguous()
-                        
                         canon_info[k] = canon_tensor
                     else:
                         canon_info[k] = v
-            else:
-                canon_info = create_empty_info_with_absgrad()
-        else:
-            obj_info = create_empty_info_with_absgrad()
-            canon_info = create_empty_info_with_absgrad()
-        
-        # Verify absgrad is present before calling strategy
-        gradient_key = self.strategy.key_for_gradient
-        if gradient_key in obj_info and not hasattr(obj_info[gradient_key], 'absgrad'):
-            print(f"WARNING: Object info missing absgrad for {gradient_key}")
-            obj_info[gradient_key].absgrad = torch.empty_like(obj_info[gradient_key])
-        
-        if gradient_key in canon_info and not hasattr(canon_info[gradient_key], 'absgrad'):
-            print(f"WARNING: Canonical info missing absgrad for {gradient_key}")
-            canon_info[gradient_key].absgrad = torch.empty_like(canon_info[gradient_key])
-        
-        obj_optimizers = {name.replace('obj_', ''): opt for name, opt in self.optimizers.items() if name.startswith('obj_')}
-        
-        print(f"Object: {len(obj_info['gaussian_ids'])} visible Gaussians")
-        n_obj_before = self.gauss_params['means'].shape[0]
-        
+
+                size_tensor_ref = canon_info["radii"] if "radii" in canon_info else canon_info[self.strategy.key_for_gradient]
+
+                if "width" not in canon_info:
+                    canon_info["width"] = torch.zeros_like(size_tensor_ref)
+                    canon_info["height"] = torch.zeros_like(size_tensor_ref)
+
+                if "n_cameras" not in canon_info:
+                    canon_info["n_cameras"] = torch.tensor(1, device=self.device)
+
+        # ===============================================================
+        # 3. APPLY STRATEGY TO ACTIVE JOINT'S PARAMETERS
+        # ===============================================================
+        obj_optimizers = {name.replace("obj_", ""): opt for name, opt in self.optimizers.items() if name.startswith("obj_")}
+        canon_optimizers = {name.replace("canon_", ""): opt for name, opt in self.optimizers.items() if name.startswith("canon_")}
+
+        active_id = self.config.active_joint_id
+
+        # --- Object densification ---
+        # print("obj_info keys:", list(obj_info.keys()))
+        n_obj_before = self.gauss_params["means"].shape[0]
         if obj_info["gaussian_ids"].numel() > 0:
             self.strategy.step_post_backward(
                 params=self.gauss_params,
@@ -757,21 +981,11 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 info=obj_info,
                 packed=True,
             )
-        else:
-            print(f"[Debug] Step {step}: Skipping object strategy (0 visible object Gaussians)")
+        n_obj_after = self.gauss_params["means"].shape[0]
 
-        
-        n_obj_after = self.gauss_params['means'].shape[0]
-        print(f"   Object strategy complete: {n_obj_before} → {n_obj_after} Gaussians")
-        
-        # 2. Apply strategy to CANONICAL parameters
-        canon_optimizers = {name.replace('canon_', ''): opt for name, opt in self.optimizers.items() if name.startswith('canon_')}
-        
-        print(f"Canonical: {len(canon_info['gaussian_ids'])} visible Gaussians")
-        n_canon_before = self.gauss_params_canonical['means'].shape[0]
-        
-        # Initialize canonical strategy state if needed
-        if not hasattr(self, 'strategy_state_canonical'):
+        # --- Canonical densification ---
+        n_canon_before = self.gauss_params_canonical["means"].shape[0]
+        if not hasattr(self, "strategy_state_canonical"):
             self.strategy_state_canonical = self.strategy.initialize_state(scene_scale=0.1)
 
         if canon_info["gaussian_ids"].numel() > 0:
@@ -783,11 +997,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 info=canon_info,
                 packed=True,
             )
-        else:
-            print(f"⚠️ Step {step}: Skipping canonical strategy (0 visible canonical Gaussians)")
-
-
-
+        n_canon_after = self.gauss_params_canonical["means"].shape[0]
 
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
@@ -863,10 +1073,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
         return loss_dict
 
 
-
-
-
-
     def get_loss_dict_articulation(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         gt_img = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
         pred_img = outputs["rgb"]
@@ -891,6 +1097,9 @@ class ArtiSplatfactoModel(SplatfactoModel):
         loss_dict = {
             "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
         }
+
+        active_scales = torch.cat([self.gauss_params["scales"], self.gauss_params_canonical["scales"]], dim=0)
+        active_opacities = torch.cat([self.gauss_params["opacities"], self.gauss_params_canonical["opacities"]], dim=0)
         
         # === Background accumulation penalty ===
         if mask is not None and "accumulation" in outputs:
@@ -901,7 +1110,8 @@ class ArtiSplatfactoModel(SplatfactoModel):
         
         # === Scale regularization ===
         if self.config.use_scale_regularization and self.step % 10 == 0:
-            scales = torch.exp(self.gauss_params["scales"])
+            # Use combined active scales
+            scales = torch.exp(active_scales)
             scale_ratios = scales.max(dim=-1)[0] / (scales.min(dim=-1)[0] + 1e-8)
             ratio_penalty = torch.clamp(scale_ratios - self.config.max_gauss_ratio, min=0.0)
             size_penalty = torch.clamp(scales.max(dim=-1)[0] - 0.15, min=0.0)
@@ -1096,17 +1306,400 @@ class ArtiSplatfactoModel(SplatfactoModel):
                     print(f"[Normal - Step {self.step}] Warning: No valid normals for loss computation")
             
         
-        if self.step % 500 == 0 and not getattr(self, '_debug_saved_this_step', False):
-            self._debug_saved_this_step = True
-            save_debug_id_maps(self, batch)
+        # if self.step % 500 == 0 and not getattr(self, '_debug_saved_this_step', False):
+        #     self._debug_saved_this_step = True
+        #     save_debug_id_maps(self, batch)
 
-        elif self.step % 100 != 0:
-            self._debug_saved_this_step = False
+        # elif self.step % 100 != 0:
+        #     self._debug_saved_this_step = False
 
 
         
         return loss_dict
 
+
+
+
+    
+    def get_joint_angle_for_camera(self, camera: Cameras):
+        """Return a differentiable joint angle tensor."""
+        if hasattr(camera, "metadata") and camera.metadata is not None:
+            angle_val = camera.metadata.get("joint_angles", None)
+            if angle_val is not None:
+                if torch.is_tensor(angle_val):
+                    return angle_val.to(self.device).float()
+                else:
+                    return torch.tensor([float(angle_val)], device=self.device)
+
+        # --- Case 2: time-based interpolation (training / sequences) ---
+        if hasattr(camera, "times") and camera.times is not None:
+            time_val = camera.times.flatten()[0]
+            num_frames = len(self.joint_angles)
+            idx_f = time_val * (num_frames - 1)
+            idx0 = torch.floor(idx_f).long().clamp(0, num_frames - 2)
+            idx1 = idx0 + 1
+            w = idx_f - idx0.float()
+            angle0 = self.joint_angles[idx0]
+            angle1 = self.joint_angles[idx1]
+            angle = (1.0 - w) * angle0 + w * angle1
+            return angle
+
+        # --- Default ---
+        return torch.tensor([0.0], device=self.device, dtype=torch.float32)
+    
+    def get_gaussians_for_render(self, camera: Cameras) -> Dict[str, torch.Tensor]:
+        """
+        Prepares Gaussians for rendering by applying articulation transforms and 
+        filtering parameters based on the current training mode.
+        
+        Render Order (Articulation Mode): [Active Obj, Active Canon]
+        Render Order (Recovery/Eval Mode): [Active Obj, Other Objs, Active Canon, Other Canons, BG]
+        """
+        GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+        active_id = self.config.active_joint_id
+        
+        # --- 1. Get Transform for Active Joint ---
+        # The angle is calculated using the active joint's parameter structure
+        joint_angle_active = self.get_joint_angle_for_camera(camera)
+        
+        # Articulate the active joint's Object Gaussians (using the pointers)
+        articulated_obj_active = apply_articulation_to_optimizer_params(self, joint_angle_active)
+        
+        # Get the active joint's Canonical Gaussians
+        canon_active = {k: self.gauss_params_canonical[k].data if not self.training else self.gauss_params_canonical[k] for k in self.gauss_params_canonical.keys()}
+
+        # --- 2. Determine Sets to Render ---
+        is_articulation_training = (self.training and self.config.training_mode == "articulation")
+        
+        # Lists to hold the final groups to be combined
+        obj_sets_to_combine = [articulated_obj_active]
+        canon_sets_to_combine = [canon_active]
+        
+        # Collect ALL Other Articulated Object and Canonical Gaussians (FROZEN/PASSIVE)
+        if not is_articulation_training:
+            # Only include frozen sets during Recovery/Eval
+            for joint_id in sorted(self.all_gauss_params_obj.keys()):
+                if joint_id == active_id:
+                    continue
+
+                obj_params = self.all_gauss_params_obj[joint_id]
+                canon_params = self.all_gauss_params_canon[joint_id]
+                
+                # Render the frozen articulated state for previous joints
+                obj_sets_to_combine.append({k: obj_params[k].data if not self.training else obj_params[k] for k in obj_params.keys()})
+                
+                # Render the frozen canonical state for previous joints
+                canon_sets_to_combine.append({k: canon_params[k].data if not self.training else canon_params[k] for k in canon_params.keys()})
+            
+        # --- 3. Combine in Render Order: [All Objs] then [All Canons] ---
+        
+        # Combine all articulated object groups (Active Obj is always first)
+        combined_obj_params = {p: torch.cat([d[p] for d in obj_sets_to_combine], dim=0) for p in GAUSS}
+        
+        # Combine all canonical groups (Active Canon is always first)
+        combined_canon_params = {p: torch.cat([d[p] for d in canon_sets_to_combine], dim=0) for p in GAUSS}
+
+        # Final combination: All Articulated Objects + All Canonicals
+        combined_params = {p: torch.cat([combined_obj_params[p], combined_canon_params[p]], dim=0) for p in GAUSS}
+        
+        # --- 4. Store Counts for step_post_backward & Debugging (CRITICAL) ---
+        self.n_active_obj = articulated_obj_active['means'].shape[0]
+        self.n_obj_total = combined_obj_params['means'].shape[0]
+        self.n_canon_total = combined_canon_params['means'].shape[0]
+
+        # --- 5. Add Background (Only in Recovery/Eval) ---
+        include_background = (not self.training or self.config.training_mode == "recovery")
+        
+        if include_background:
+            if (hasattr(self, "gauss_params_fixed") and self.gauss_params_fixed and self.gauss_params_fixed["means"].shape[0] > 0):
+                full_scene_params = {}
+                for name in combined_params.keys():
+                    combined_tensor = combined_params[name]
+                    bg_tensor = self.gauss_params_fixed[name]
+                    
+                    if not self.training:
+                        bg_tensor = bg_tensor.data
+                    if combined_tensor.device != bg_tensor.device:
+                        bg_tensor = bg_tensor.to(combined_tensor.device)
+                    
+                    full_scene_params[name] = torch.cat([combined_tensor, bg_tensor], dim=0)
+                
+                return full_scene_params
+            
+        # Return only the combined articulated/canonical sets (either filtered or full)
+        return combined_params
+
+    # def forward(self, camera: Cameras) -> Dict[str, torch.Tensor]:
+    #     """Override to accept Cameras instead of RayBundles."""
+    #     # import pdb; pdb.set_trace()
+    #     return self.get_outputs(camera)
+
+    def get_outputs(self, camera: Cameras, render_id_map: bool = False) -> Dict[str, Union[torch.Tensor, List]]:
+        """Takes in a camera and returns a dictionary of outputs with articulation."""
+        if not isinstance(camera, Cameras):
+            return {}
+        gaussians_to_render = self.get_gaussians_for_render(camera)
+        self._current_camera = camera 
+
+
+        n_obj_total = self.n_obj_total if hasattr(self, 'n_obj_total') else self.gauss_params['means'].shape[0]
+        n_canon_total = self.n_canon_total if hasattr(self, 'n_canon_total') else self.gauss_params_canonical['means'].shape[0]
+        actual_count = gaussians_to_render['means'].shape[0]
+        
+        if self.training:
+            expected_count = n_obj_total + n_canon_total  # All object + all canonical
+            print(f"Training render check (Multi-Joint):")
+            print(f"   Expected (All Obj + All Canon): {expected_count} ({n_obj_total} + {n_canon_total})")
+            print(f"   Actually rendering: {actual_count}")
+        else:
+            bg_count = self.gauss_params_fixed['means'].shape[0] if hasattr(self, 'gauss_params_fixed') else 0
+            print(f" Eval render check (Multi-Joint):")
+            print(f"   All Obj: {n_obj_total}, All Canon: {n_canon_total}, Background: {bg_count}, Total: {actual_count}")
+        optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera) if self.training else camera.camera_to_worlds
+        colors_crop = torch.cat(
+            (gaussians_to_render["features_dc"][:, None, :], gaussians_to_render["features_rest"]), dim=1
+        )
+        
+        camera_scale_fac = self._get_downscale_factor()
+        camera.rescale_output_resolution(1 / camera_scale_fac)
+        viewmat = get_viewmat(optimized_camera_to_world)
+        K = camera.get_intrinsics_matrices().cuda()
+        W, H = int(camera.width.item()), int(camera.height.item())
+        self.last_size = (H, W)
+        camera.rescale_output_resolution(camera_scale_fac)
+
+        if render_id_map:
+            # Object: ID 0-255 (red channel) - applies to ALL articulated objects
+            # Canonical: ID 256-511 (green channel) - applies to ALL canonical objects
+            # Background: ID 512+ (blue channel)
+            
+            id_colors = torch.zeros((actual_count, 3), device=gaussians_to_render["means"].device)
+            
+            # Use total counts: n_obj_total and n_canon_total
+            
+            # All Object Gaussians (0 to n_obj_total-1): encode in red channel
+            if n_obj_total > 0:
+                obj_ids = torch.arange(n_obj_total, device=id_colors.device, dtype=torch.float32)
+                id_colors[:n_obj_total, 0] = (obj_ids % 256) / 255.0  # Red channel
+                id_colors[:n_obj_total, 1] = 0.0  # Green = 0
+                id_colors[:n_obj_total, 2] = 0.0  # Blue = 0
+            
+            # All Canonical Gaussians (n_obj_total to n_obj_total + n_canon_total - 1): encode in green channel
+            if n_canon_total > 0:
+                canon_start = n_obj_total
+                canon_end = n_obj_total + n_canon_total
+                canon_ids = torch.arange(n_canon_total, device=id_colors.device, dtype=torch.float32)
+                id_colors[canon_start:canon_end, 0] = 0.0  # Red = 0
+                id_colors[canon_start:canon_end, 1] = (canon_ids % 256) / 255.0  # Green channel
+                id_colors[canon_start:canon_end, 2] = 0.0  # Blue = 0
+            
+            # Background Gaussians (remaining): encode in blue channel
+            if actual_count > n_obj_total + n_canon_total:
+                bg_start = n_obj_total + n_canon_total
+                bg_count = actual_count - bg_start
+                bg_ids = torch.arange(bg_count, device=id_colors.device, dtype=torch.float32)
+                id_colors[bg_start:, 0] = 0.0  # Red = 0
+                id_colors[bg_start:, 1] = 0.0  # Green = 0
+                id_colors[bg_start:, 2] = (bg_ids % 256) / 255.0  # Blue channel
+            
+            colors_for_render = id_colors
+            render_mode = "RGB"
+            sh_degree_to_use = None  # No SH for ID maps
+            if actual_count > n_obj_total + n_canon_total:
+                print(f"   Background: {n_obj_total+n_canon_total}-{actual_count-1} (blue channel)")
+        else:
+            # Normal RGB rendering
+            render_mode = "RGB+ED" if self.config.output_depth_during_training or not self.training else "RGB"
+            if self.config.sh_degree > 0:
+                sh_degree_to_use = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
+                colors_for_render = colors_crop
+            else:
+                colors_for_render = torch.sigmoid(colors_crop).squeeze(1)
+                sh_degree_to_use = None
+
+        render, alpha, self.info = rasterization(
+            means=gaussians_to_render["means"],
+            quats=gaussians_to_render["quats"],
+            scales=torch.exp(gaussians_to_render["scales"]),
+            opacities=torch.sigmoid(gaussians_to_render["opacities"]).squeeze(-1),
+            colors=colors_for_render,
+            viewmats=viewmat,
+            Ks=K,
+            width=W,
+            height=H,
+            packed=True,
+            near_plane=0.01,
+            far_plane=1e10,
+            render_mode=render_mode,
+            sh_degree=sh_degree_to_use,
+            sparse_grad=False,
+            absgrad=self.strategy.absgrad if isinstance(self.strategy, DefaultStrategy) else False,
+            rasterize_mode=self.config.rasterize_mode,
+        )
+        
+        
+        if self.training and self.config.training_mode == "articulation":
+            self.strategy.step_pre_backward(
+                params=self.gauss_params, 
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                step=self.step,
+                info=self.info  
+            )
+
+        # Debug info
+        n_rendered = gaussians_to_render["means"].shape[0]
+        print(f"Rendering {n_rendered} Gaussians")
+        if self.info.get("gaussian_ids") is not None:
+            # print(f"Gaussian IDs shape: {self.info['gaussian_ids'].shape}")
+            # print(f"ID range: {self.info['gaussian_ids'].min()} to {self.info['gaussian_ids'].max()}")
+            
+            # Store info for strategy processing (will be split in step_post_backward)
+            self.combined_info = self.info
+            self.n_obj_rendered = n_obj_total
+        else:
+            print("gaussian_ids is None - NO VISIBLE GAUSSIANS!")
+            self.combined_info = None
+            self.n_obj_rendered = n_obj_total
+
+        if render_id_map:
+            # For ID maps, return raw render 
+            background = self._get_background_color() 
+            outputs = {
+                "rgb": torch.clamp(render[..., :3], 0.0, 1.0).squeeze(0),
+                "depth": None,
+                "accumulation": alpha.squeeze(0),
+                "background": background,
+                "id_map": render[..., :3].squeeze(0),  # Raw ID colors
+            }
+            
+            # Also decode the ID information for debugging
+            id_debug = decode_id_map(render[..., :3].squeeze(0), n_obj_total, n_canon_total)
+            outputs.update(id_debug)
+            
+            return outputs
+        else:
+            # Normal RGB rendering with background
+            background = self._get_background_color()
+            rgb = render[..., :3] + (1 - alpha) * background
+            rgb = torch.clamp(rgb, 0.0, 1.0)
+            depth_im = render[..., 3:4] if render_mode == "RGB+ED" else None
+
+            return {
+                "rgb": rgb.squeeze(0),
+                "depth": depth_im.squeeze(0) if depth_im is not None else None,
+                "accumulation": alpha.squeeze(0),
+                "background": background,
+            }
+
+
+    def get_image_metrics_and_images(
+        self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
+    ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
+        """Writes the test image outputs.
+
+        Args:
+            image_idx: Index of the image.
+            step: Current step.
+            batch: Batch of data.
+            outputs: Outputs of the model.
+
+        Returns:
+            A dictionary of metrics.
+        """
+        gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
+        predicted_rgb = outputs["rgb"]
+        cc_rgb = None
+
+        combined_rgb = torch.cat([gt_rgb, predicted_rgb], dim=1)
+
+        if self.config.color_corrected_metrics:
+            cc_rgb = color_correct(predicted_rgb, gt_rgb)
+            cc_rgb = torch.moveaxis(cc_rgb, -1, 0)[None, ...]
+
+        # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
+        gt_rgb = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
+        predicted_rgb = torch.moveaxis(predicted_rgb, -1, 0)[None, ...]
+
+        psnr = self.psnr(gt_rgb, predicted_rgb)
+        ssim = self.ssim(gt_rgb, predicted_rgb)
+        lpips = self.lpips(gt_rgb, predicted_rgb)
+
+        # all of these metrics will be logged as scalars
+        metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim)}  # type: ignore
+        metrics_dict["lpips"] = float(lpips)
+
+        if self.config.color_corrected_metrics:
+            assert cc_rgb is not None
+            cc_psnr = self.psnr(gt_rgb, cc_rgb)
+            cc_ssim = self.ssim(gt_rgb, cc_rgb)
+            cc_lpips = self.lpips(gt_rgb, cc_rgb)
+            metrics_dict["cc_psnr"] = float(cc_psnr.item())
+            metrics_dict["cc_ssim"] = float(cc_ssim)
+            metrics_dict["cc_lpips"] = float(cc_lpips)
+
+        time_val = float(batch["time"])
+        mask_pre = batch.get("mask_pre", None)
+        mask_post = batch.get("mask_post", None)
+
+        if mask_pre is not None:
+            mask_pre = self._downscale_if_required(mask_pre.to(self.device))
+        if mask_post is not None:
+            mask_post = self._downscale_if_required(mask_post.to(self.device))
+
+        # --- Mask selection logic (same as training) ---
+        if time_val <= 0.25 and mask_post is not None:
+            mask = mask_post
+        elif time_val >= 0.25 and mask_pre is not None and mask_post is not None:
+            mask = torch.clamp(mask_pre + mask_post, 0.0, 1.0)
+        else:
+            mask = None 
+
+        # print(f"mask shape: {mask.shape if mask is not None else None}")
+        # print(f"gt_rgb shape: {gt_rgb.shape}")
+        # print(f"predicted_rgb shape: {predicted_rgb.shape}")
+        # print(mask.shape, mask.dtype)
+
+        import os
+        import torchvision.utils as vutils
+
+        if mask is not None:
+            if mask.ndim == 3 and mask.shape[-1] == 1:
+                mask = mask.permute(2, 0, 1).unsqueeze(0).bool()  # [H,W,1] -> [1,1,H,W]
+            elif mask.ndim == 2:
+                mask = mask.unsqueeze(0).unsqueeze(0).bool()      # [H,W] -> [1,1,H,W]
+
+            # Expand for RGB masking
+            mask_expanded = mask.expand(-1, 3, -1, -1)
+            debug_gt_masked = gt_rgb * mask_expanded
+            debug_pred_masked = predicted_rgb * mask_expanded
+
+            debug = False  # Set to True to enable debug saving
+            
+            # === Save only every 1000 steps ===
+            if self.step % 1000 == 0 and debug:
+                debug_dir = os.path.join("/local/home/pmishra/cvg/arti-splatfacto", "debug")
+                os.makedirs(debug_dir, exist_ok=True)
+                img_idx = int(batch["image_idx"])
+                vutils.save_image(debug_gt_masked, f"{debug_dir}/step{self.step:06d}_gt_masked_idx{img_idx}.png")
+                vutils.save_image(debug_pred_masked, f"{debug_dir}/step{self.step:06d}_pred_masked_idx{img_idx}.png")
+                vutils.save_image(mask.float(), f"{debug_dir}/step{self.step:06d}_mask_idx{img_idx}.png")
+            
+
+            # Metrics
+            psnr_masked = self.psnr_masked(gt_rgb, predicted_rgb, mask)
+            metrics_dict["psnr_masked"] = float(psnr_masked.item())
+
+            gt_rgb_crop = crop_imgs_w_masks(gt_rgb, mask)
+            pred_rgb_crop = crop_imgs_w_masks(predicted_rgb, mask)
+
+            metrics_dict["ssim_masked"] = float(self.ssim(gt_rgb_crop, pred_rgb_crop))
+            metrics_dict["lpips_masked"] = float(self.lpips(gt_rgb_crop, pred_rgb_crop))
+
+        # Save combined RGB for visualization (optional)
+        images_dict = {"img": combined_rgb}
+
+        return metrics_dict, images_dict
 
 
     def check_joint_gradients(self):
@@ -1372,396 +1965,3 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 metrics_dict.update(coverage_metrics)
 
         return metrics_dict
-    
-    def get_joint_angle_for_camera(self, camera: Cameras):
-        """Return a differentiable joint angle tensor."""
-        if hasattr(camera, "metadata") and camera.metadata is not None:
-            angle_val = camera.metadata.get("joint_angles", None)
-            if angle_val is not None:
-                if torch.is_tensor(angle_val):
-                    return angle_val.to(self.device).float()
-                else:
-                    return torch.tensor([float(angle_val)], device=self.device)
-
-        # --- Case 2: time-based interpolation (training / sequences) ---
-        if hasattr(camera, "times") and camera.times is not None:
-            time_val = camera.times.flatten()[0]
-            num_frames = len(self.joint_angles)
-            idx_f = time_val * (num_frames - 1)
-            idx0 = torch.floor(idx_f).long().clamp(0, num_frames - 2)
-            idx1 = idx0 + 1
-            w = idx_f - idx0.float()
-            angle0 = self.joint_angles[idx0]
-            angle1 = self.joint_angles[idx1]
-            angle = (1.0 - w) * angle0 + w * angle1
-            return angle
-
-        # --- Default ---
-        return torch.tensor([0.0], device=self.device, dtype=torch.float32)
-
-        
-
-    def get_gaussians_for_render(self, camera: Cameras) -> Dict[str, torch.Tensor]:
-        """
-        Prepare Gaussians for rendering with per-frame articulation.
-        
-        Articulation mode: object (articulated) + canonical (identity)
-        Recovery mode: object (articulated) + canonical (identity) + background
-        Eval mode: object (articulated) + canonical (identity) + background
-        """
-        joint_angle = self.get_joint_angle_for_camera(camera)
-        articulated_obj_params = apply_articulation_to_optimizer_params(self, joint_angle)
-        
-        # Decide whether to include background
-        include_background = (
-            not self.training or  # Eval mode: always include
-            self.config.training_mode == "recovery"  # Recovery training: include
-        )
-        # Articulation training: exclude background (it's frozen and dimmed)
-        
-        # Start with object + canonical
-        combined_params = {}
-        for name in articulated_obj_params.keys():
-            obj_tensor = articulated_obj_params[name]
-            canon_tensor = self.gauss_params_canonical[name]
-            combined_params[name] = torch.cat([obj_tensor, canon_tensor], dim=0)
-        
-        n_obj = articulated_obj_params['means'].shape[0]
-        n_canon = self.gauss_params_canonical['means'].shape[0]
-        
-        # Add background if needed
-        if include_background:
-            if (hasattr(self, "gauss_params_fixed") and 
-                self.gauss_params_fixed is not None and 
-                len(self.gauss_params_fixed) > 0 and
-                self.gauss_params_fixed["means"].shape[0] > 0):
-                
-                full_scene_params = {}
-                for name in combined_params.keys():
-                    combined_tensor = combined_params[name]
-                    bg_tensor = self.gauss_params_fixed[name]
-                    
-                    # In training, keep gradients; in eval, use .data
-                    if not self.training:
-                        bg_tensor = bg_tensor.data
-                    
-                    if combined_tensor.device != bg_tensor.device:
-                        bg_tensor = bg_tensor.to(combined_tensor.device)
-                    
-                    full_scene_params[name] = torch.cat([combined_tensor, bg_tensor], dim=0)
-                
-                n_bg = self.gauss_params_fixed['means'].shape[0]
-                total = full_scene_params['means'].shape[0]
-                
-                if self.step % 100 == 0:
-                    mode = "Recovery" if self.config.training_mode == "recovery" else "Eval"
-                    CONSOLE.print(f"[{mode}] Rendering: Obj({n_obj}) + Canon({n_canon}) + BG({n_bg}) = {total}")
-                
-                return full_scene_params
-            else:
-                if self.step % 100 == 0:
-                    CONSOLE.print("[yellow]Warning: Background requested but not found[/yellow]")
-        
-        # No background: obj + canon only
-        if self.step % 100 == 0:
-            mode = "Articulation Training" if self.training else "Eval (no BG)"
-            CONSOLE.print(f"[{mode}] Rendering: Obj({n_obj}) + Canon({n_canon}) = {n_obj + n_canon}")
-        
-        return combined_params
-
-
-
-
-    def forward(self, camera: Cameras) -> Dict[str, torch.Tensor]:
-        """Override to accept Cameras instead of RayBundles."""
-        # import pdb; pdb.set_trace()
-        return self.get_outputs(camera)
-
-    def get_outputs(self, camera: Cameras, render_id_map: bool = False) -> Dict[str, Union[torch.Tensor, List]]:
-        """Takes in a camera and returns a dictionary of outputs with articulation."""
-        if not isinstance(camera, Cameras):
-            return {}
-
-        gaussians_to_render = self.get_gaussians_for_render(camera)
-        self._current_camera = camera 
-
-        joint_angle = self.get_joint_angle_for_camera(camera)
-        
-        if self.training and self.step % 100 == 0:
-            all_angles = self.joint_angles
-            print(f"\n=== Joint Angle Stats (all frames) === step {self.step} ===")
-            print(f"Min: {all_angles.min().item():.4f}, Max: {all_angles.max().item():.4f}")
-            print(f"Mean: {all_angles.mean().item():.4f}, Std: {all_angles.std().item():.4f}")
-            print(f"Current frame angle: {joint_angle.item():.4f}")
-            
-            # Check if angles are too similar
-            angle_range = all_angles.max() - all_angles.min()
-            if angle_range < 0.1:
-                print(f"⚠️ WARNING: Angle range is very small ({angle_range.item():.4f})")
-
-            print(f" ==== [GET_OUTPUTS] joint gradient check:  {self.step} ====")
-            self.check_joint_gradients()
-            # import pdb; pdb.set_trace()
-
-        
-
-        # DEBUG: Verify what we're actually rendering
-        n_obj = self.gauss_params['means'].shape[0]
-        n_canon = self.gauss_params_canonical['means'].shape[0]
-        actual_count = gaussians_to_render['means'].shape[0]
-        
-        if self.training:
-            expected_count = n_obj + n_canon  # Both object and canonical
-            print(f"Training render check:")
-            print(f"   Expected (obj + canon): {expected_count} ({n_obj} + {n_canon})")
-            print(f"   Actually rendering: {actual_count}")
-        else:
-            bg_count = self.gauss_params_fixed['means'].shape[0] if hasattr(self, 'gauss_params_fixed') else 0
-            print(f" Eval render check:")
-            print(f"   Object: {n_obj}, Canonical: {n_canon}, Background: {bg_count}, Total: {actual_count}")
-        
-        optimized_camera_to_world = self.camera_optimizer.apply_to_camera(camera) if self.training else camera.camera_to_worlds
-        colors_crop = torch.cat(
-            (gaussians_to_render["features_dc"][:, None, :], gaussians_to_render["features_rest"]), dim=1
-        )
-        
-        camera_scale_fac = self._get_downscale_factor()
-        camera.rescale_output_resolution(1 / camera_scale_fac)
-        viewmat = get_viewmat(optimized_camera_to_world)
-        K = camera.get_intrinsics_matrices().cuda()
-        W, H = int(camera.width.item()), int(camera.height.item())
-        self.last_size = (H, W)
-        camera.rescale_output_resolution(camera_scale_fac)
-
-        # Determine render mode
-        if render_id_map:
-            # Object: ID 0-255 (red channel)
-            # Canonical: ID 256-511 (green channel) 
-            # Background: ID 512+ (blue channel)
-            
-            id_colors = torch.zeros((actual_count, 3), device=gaussians_to_render["means"].device)
-            
-            # Object Gaussians (0 to n_obj-1): encode in red channel
-            if n_obj > 0:
-                obj_ids = torch.arange(n_obj, device=id_colors.device, dtype=torch.float32)
-                id_colors[:n_obj, 0] = (obj_ids % 256) / 255.0  # Red channel
-                id_colors[:n_obj, 1] = 0.0  # Green = 0
-                id_colors[:n_obj, 2] = 0.0  # Blue = 0
-            
-            # Canonical Gaussians (n_obj to n_obj+n_canon-1): encode in green channel
-            if n_canon > 0:
-                canon_start = n_obj
-                canon_end = n_obj + n_canon
-                canon_ids = torch.arange(n_canon, device=id_colors.device, dtype=torch.float32)
-                id_colors[canon_start:canon_end, 0] = 0.0  # Red = 0
-                id_colors[canon_start:canon_end, 1] = (canon_ids % 256) / 255.0  # Green channel
-                id_colors[canon_start:canon_end, 2] = 0.0  # Blue = 0
-            
-            # Background Gaussians (remaining): encode in blue channel
-            if actual_count > n_obj + n_canon:
-                bg_start = n_obj + n_canon
-                bg_count = actual_count - bg_start
-                bg_ids = torch.arange(bg_count, device=id_colors.device, dtype=torch.float32)
-                id_colors[bg_start:, 0] = 0.0  # Red = 0
-                id_colors[bg_start:, 1] = 0.0  # Green = 0
-                id_colors[bg_start:, 2] = (bg_ids % 256) / 255.0  # Blue channel
-            
-            colors_for_render = id_colors
-            render_mode = "RGB"
-            sh_degree_to_use = None  # No SH for ID maps
-            
-            if actual_count > n_obj + n_canon:
-                print(f"   Background: {n_obj+n_canon}-{actual_count-1} (blue channel)")
-        else:
-            # Normal RGB rendering
-            render_mode = "RGB+ED" if self.config.output_depth_during_training or not self.training else "RGB"
-            if self.config.sh_degree > 0:
-                sh_degree_to_use = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
-                colors_for_render = colors_crop
-            else:
-                colors_for_render = torch.sigmoid(colors_crop).squeeze(1)
-                sh_degree_to_use = None
-
-        render, alpha, self.info = rasterization(
-            means=gaussians_to_render["means"],
-            quats=gaussians_to_render["quats"],
-            scales=torch.exp(gaussians_to_render["scales"]),
-            opacities=torch.sigmoid(gaussians_to_render["opacities"]).squeeze(-1),
-            colors=colors_for_render,
-            viewmats=viewmat,
-            Ks=K,
-            width=W,
-            height=H,
-            packed=True,
-            near_plane=0.01,
-            far_plane=1e10,
-            render_mode=render_mode,
-            sh_degree=sh_degree_to_use,
-            sparse_grad=False,
-            absgrad=self.strategy.absgrad if isinstance(self.strategy, DefaultStrategy) else False,
-            rasterize_mode=self.config.rasterize_mode,
-        )
-        
-        
-        if self.training:
-            self.strategy.step_pre_backward(
-                params=self.gauss_params, 
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=self.step,
-                info=self.info  
-            )
-
-        # Debug info
-        n_rendered = gaussians_to_render["means"].shape[0]
-        print(f"Rendering {n_rendered} Gaussians")
-        if self.info.get("gaussian_ids") is not None:
-            # print(f"Gaussian IDs shape: {self.info['gaussian_ids'].shape}")
-            # print(f"ID range: {self.info['gaussian_ids'].min()} to {self.info['gaussian_ids'].max()}")
-            
-            # Store info for strategy processing (will be split in step_post_backward)
-            self.combined_info = self.info
-            self.n_obj_rendered = n_obj
-        else:
-            print("gaussian_ids is None - NO VISIBLE GAUSSIANS!")
-            self.combined_info = None
-            self.n_obj_rendered = n_obj
-
-        if render_id_map:
-            # For ID maps, return raw render 
-            background = self._get_background_color() 
-            outputs = {
-                "rgb": torch.clamp(render[..., :3], 0.0, 1.0).squeeze(0),
-                "depth": None,
-                "accumulation": alpha.squeeze(0),
-                "background": background,
-                "id_map": render[..., :3].squeeze(0),  # Raw ID colors
-            }
-            
-            # Also decode the ID information for debugging
-            id_debug = decode_id_map(render[..., :3].squeeze(0), n_obj, n_canon)
-            outputs.update(id_debug)
-            
-            return outputs
-        else:
-            # Normal RGB rendering with background
-            background = self._get_background_color()
-            rgb = render[..., :3] + (1 - alpha) * background
-            rgb = torch.clamp(rgb, 0.0, 1.0)
-            depth_im = render[..., 3:4] if render_mode == "RGB+ED" else None
-
-            return {
-                "rgb": rgb.squeeze(0),
-                "depth": depth_im.squeeze(0) if depth_im is not None else None,
-                "accumulation": alpha.squeeze(0),
-                "background": background,
-            }
-
-
-    def get_image_metrics_and_images(
-        self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
-    ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
-        """Writes the test image outputs.
-
-        Args:
-            image_idx: Index of the image.
-            step: Current step.
-            batch: Batch of data.
-            outputs: Outputs of the model.
-
-        Returns:
-            A dictionary of metrics.
-        """
-        gt_rgb = self.composite_with_background(self.get_gt_img(batch["image"]), outputs["background"])
-        predicted_rgb = outputs["rgb"]
-        cc_rgb = None
-
-        combined_rgb = torch.cat([gt_rgb, predicted_rgb], dim=1)
-
-        if self.config.color_corrected_metrics:
-            cc_rgb = color_correct(predicted_rgb, gt_rgb)
-            cc_rgb = torch.moveaxis(cc_rgb, -1, 0)[None, ...]
-
-        # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
-        gt_rgb = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
-        predicted_rgb = torch.moveaxis(predicted_rgb, -1, 0)[None, ...]
-
-        psnr = self.psnr(gt_rgb, predicted_rgb)
-        ssim = self.ssim(gt_rgb, predicted_rgb)
-        lpips = self.lpips(gt_rgb, predicted_rgb)
-
-        # all of these metrics will be logged as scalars
-        metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim)}  # type: ignore
-        metrics_dict["lpips"] = float(lpips)
-
-        if self.config.color_corrected_metrics:
-            assert cc_rgb is not None
-            cc_psnr = self.psnr(gt_rgb, cc_rgb)
-            cc_ssim = self.ssim(gt_rgb, cc_rgb)
-            cc_lpips = self.lpips(gt_rgb, cc_rgb)
-            metrics_dict["cc_psnr"] = float(cc_psnr.item())
-            metrics_dict["cc_ssim"] = float(cc_ssim)
-            metrics_dict["cc_lpips"] = float(cc_lpips)
-
-        time_val = float(batch["time"])
-        mask_pre = batch.get("mask_pre", None)
-        mask_post = batch.get("mask_post", None)
-
-        if mask_pre is not None:
-            mask_pre = self._downscale_if_required(mask_pre.to(self.device))
-        if mask_post is not None:
-            mask_post = self._downscale_if_required(mask_post.to(self.device))
-
-        # --- Mask selection logic (same as training) ---
-        if time_val <= 0.25 and mask_post is not None:
-            mask = mask_post
-        elif time_val >= 0.25 and mask_pre is not None and mask_post is not None:
-            mask = torch.clamp(mask_pre + mask_post, 0.0, 1.0)
-        else:
-            mask = None 
-
-        # print(f"mask shape: {mask.shape if mask is not None else None}")
-        # print(f"gt_rgb shape: {gt_rgb.shape}")
-        # print(f"predicted_rgb shape: {predicted_rgb.shape}")
-        # print(mask.shape, mask.dtype)
-
-        import os
-        import torchvision.utils as vutils
-
-        if mask is not None:
-            if mask.ndim == 3 and mask.shape[-1] == 1:
-                mask = mask.permute(2, 0, 1).unsqueeze(0).bool()  # [H,W,1] -> [1,1,H,W]
-            elif mask.ndim == 2:
-                mask = mask.unsqueeze(0).unsqueeze(0).bool()      # [H,W] -> [1,1,H,W]
-
-            # Expand for RGB masking
-            mask_expanded = mask.expand(-1, 3, -1, -1)
-            debug_gt_masked = gt_rgb * mask_expanded
-            debug_pred_masked = predicted_rgb * mask_expanded
-
-            debug = False  # Set to True to enable debug saving
-            
-            # === Save only every 1000 steps ===
-            if self.step % 1000 == 0 and debug:
-                debug_dir = os.path.join("/local/home/pmishra/cvg/arti-splatfacto", "debug")
-                os.makedirs(debug_dir, exist_ok=True)
-                img_idx = int(batch["image_idx"])
-                vutils.save_image(debug_gt_masked, f"{debug_dir}/step{self.step:06d}_gt_masked_idx{img_idx}.png")
-                vutils.save_image(debug_pred_masked, f"{debug_dir}/step{self.step:06d}_pred_masked_idx{img_idx}.png")
-                vutils.save_image(mask.float(), f"{debug_dir}/step{self.step:06d}_mask_idx{img_idx}.png")
-            
-
-            # Metrics
-            psnr_masked = self.psnr_masked(gt_rgb, predicted_rgb, mask)
-            metrics_dict["psnr_masked"] = float(psnr_masked.item())
-
-            gt_rgb_crop = crop_imgs_w_masks(gt_rgb, mask)
-            pred_rgb_crop = crop_imgs_w_masks(predicted_rgb, mask)
-
-            metrics_dict["ssim_masked"] = float(self.ssim(gt_rgb_crop, pred_rgb_crop))
-            metrics_dict["lpips_masked"] = float(self.lpips(gt_rgb_crop, pred_rgb_crop))
-
-        # Save combined RGB for visualization (optional)
-        images_dict = {"img": combined_rgb}
-
-        return metrics_dict, images_dict
