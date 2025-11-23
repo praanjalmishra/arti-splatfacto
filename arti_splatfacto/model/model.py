@@ -522,63 +522,162 @@ class ArtiSplatfactoModel(SplatfactoModel):
             CONSOLE.print(f"\n[green]Total: {len(groups)} recovery parameter groups[/green]\n")
             return groups
         
-
     def _initialize_and_partition(self, state_dict: Dict[str, torch.Tensor]):
         """
-        From a full-scene checkpoint: split into trainable object + fixed background.
-        This runs only for the first joint (e.g., 'joint_0').
+        Partition Gaussians for the active joint.
+        
+        - For joint_0: Splits full scene into object + background
+        - For joint_1+: Splits ONLY from background (preserves previous joints)
         """
         print("Initializing from full scene: partitioning Gaussians...")
-
         active_id = self.config.active_joint_id
-        
         print(f"obj mask points for {active_id}:", self.obj_3d_seg)
-
+        
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
         device = self.device
-
-        all_means = state_dict["gauss_params.means"].to(device)
-        obj_mask = self.obj_3d_seg.query_refine(all_means, grow=3, thresh=0.01, bbox_margin=0.01).to(torch.bool).cpu()
-        bg_mask  = ~obj_mask
-
-        print(f"check the mask {obj_mask.sum()} object points, {bg_mask.sum()} background points")
-        # import pdb; pdb.set_trace()
         
-        # --- Create new ParameterDicts for the active joint ---
-        self.all_gauss_params_obj[active_id] = torch.nn.ParameterDict()
-        self.all_gauss_params_canon[active_id] = torch.nn.ParameterDict()
-
-        for p in GAUSS:
-            subset_obj = state_dict[f"gauss_params.{p}"][obj_mask].to(device)
-            subset_bg = state_dict[f"gauss_params.{p}"][bg_mask].to(device)
+        # Check if this is the first joint or a subsequent one
+        is_first_joint = (active_id == "joint_0" or len(self.all_gauss_params_obj) == 0)
+        
+        if is_first_joint:
+            # --- Case 1: First Joint - Partition from Full Scene ---
+            print(f"  First joint: partitioning from full scene")
             
-            # Object Gaussians (trainable for active joint)
-            param_obj = torch.nn.Parameter(subset_obj.clone().detach(), requires_grad=True)
-            self.all_gauss_params_obj[active_id][p] = param_obj
+            all_means = state_dict["gauss_params.means"].to(device)
+            obj_mask = self.obj_3d_seg.query_refine(
+                all_means, grow=3, thresh=0.01, bbox_margin=0.01
+            ).to(torch.bool).cpu()
+            bg_mask = ~obj_mask
             
-            # Canonical Gaussians (trainable for active joint)
-            param_canon = torch.nn.Parameter(subset_obj.clone().detach(), requires_grad=True)
-            self.all_gauss_params_canon[active_id][p] = param_canon
+            print(f"  Mask: {obj_mask.sum()} object points, {bg_mask.sum()} background points")
             
-            # Fixed background gaussians (non-trainable)
-            param_fixed = torch.nn.Parameter(subset_bg.clone().detach(), requires_grad=False)
-            self.gauss_params_fixed[p] = param_fixed
+            # Create new ParameterDicts for the active joint
+            self.all_gauss_params_obj[active_id] = torch.nn.ParameterDict()
+            self.all_gauss_params_canon[active_id] = torch.nn.ParameterDict()
             
-            # Set pointers for backward compatibility (only for the active joint)
-            if p == "means":
-                self.gauss_params = self.all_gauss_params_obj[active_id]
-                self.gauss_params_canonical = self.all_gauss_params_canon[active_id]
+            for p in GAUSS:
+                subset_obj = state_dict[f"gauss_params.{p}"][obj_mask].to(device)
+                subset_bg = state_dict[f"gauss_params.{p}"][bg_mask].to(device)
+                
+                # Object Gaussians (trainable)
+                self.all_gauss_params_obj[active_id][p] = torch.nn.Parameter(
+                    subset_obj.clone().detach(), requires_grad=True
+                )
+                
+                # Canonical Gaussians (trainable)
+                self.all_gauss_params_canon[active_id][p] = torch.nn.Parameter(
+                    subset_obj.clone().detach(), requires_grad=True
+                )
+                
+                # Fixed background
+                self.gauss_params_fixed[p] = torch.nn.Parameter(
+                    subset_bg.clone().detach(), requires_grad=False
+                )
+                
+                if p == "means":
+                    print(f"  [{active_id} Object] {p}: {subset_obj.shape}")
+                    print(f"  [{active_id} Canon] {p}: {subset_obj.shape}")
+                    print(f"  [Background] {p}: {subset_bg.shape}")
+        
+        else:
+            # --- Case 2: Subsequent Joint - Partition from Background Only ---
+            print(f"  Sequential joint: partitioning from background only")
+            print(f"  Existing joints: {list(self.all_gauss_params_obj.keys())}")
             
-            print(f"[{active_id} Object] {p}: {param_obj.shape}, requires_grad={param_obj.requires_grad}")
-            print(f"[{active_id} Canon] {p}: {param_canon.shape}, requires_grad={param_canon.requires_grad}")
-
-
+            # The input state_dict contains: [background + all_previous_joints]
+            # We need to:
+            # 1. Identify which Gaussians in the input belong to the background (vs previous joints)
+            # 2. Query the mask only on background Gaussians
+            # 3. Extract new joint from background
+            # 4. Update background to exclude new joint
+            
+            all_means = state_dict["gauss_params.means"].to(device)
+            total_input = all_means.shape[0]
+            
+            # Calculate how many Gaussians belong to previous joints
+            prev_joints_count = sum(
+                self.all_gauss_params_obj[jid]["means"].shape[0] 
+                for jid in self.all_gauss_params_obj.keys() 
+                if jid != active_id
+            )
+            
+            # The background Gaussians are at the beginning of the input
+            # (since we concatenated [background + previous_joints] during reconstruction)
+            bg_start_idx = 0
+            bg_end_idx = total_input - prev_joints_count
+            
+            if bg_end_idx <= 0:
+                raise ValueError(
+                    f"Invalid partition: total_input={total_input}, "
+                    f"prev_joints_count={prev_joints_count}. "
+                    f"Background should be positive!"
+                )
+            
+            print(f"  Total input: {total_input:,} Gaussians")
+            print(f"  Previous joints: {prev_joints_count:,} Gaussians")
+            print(f"  Background range: [0:{bg_end_idx:,}]")
+            
+            # Extract only background means for mask query
+            bg_means_only = all_means[bg_start_idx:bg_end_idx]
+            
+            # Query mask on background only
+            obj_mask_in_bg = self.obj_3d_seg.query_refine(
+                bg_means_only, grow=3, thresh=0.01, bbox_margin=0.01
+            ).to(torch.bool).cpu()
+            
+            remaining_bg_mask = ~obj_mask_in_bg
+            
+            print(f"  Mask query on background: {obj_mask_in_bg.sum()} new object points, "
+                f"{remaining_bg_mask.sum()} remaining background points")
+            
+            # Create new ParameterDicts for the active joint
+            self.all_gauss_params_obj[active_id] = torch.nn.ParameterDict()
+            self.all_gauss_params_canon[active_id] = torch.nn.ParameterDict()
+            
+            for p in GAUSS:
+                # Extract background portion only
+                bg_data = state_dict[f"gauss_params.{p}"][bg_start_idx:bg_end_idx].to(device)
+                
+                # Split background into new joint + remaining background
+                new_joint_data = bg_data[obj_mask_in_bg]
+                remaining_bg_data = bg_data[remaining_bg_mask]
+                
+                # Object Gaussians (trainable)
+                self.all_gauss_params_obj[active_id][p] = torch.nn.Parameter(
+                    new_joint_data.clone().detach(), requires_grad=True
+                )
+                
+                # Canonical Gaussians (trainable)
+                self.all_gauss_params_canon[active_id][p] = torch.nn.Parameter(
+                    new_joint_data.clone().detach(), requires_grad=True
+                )
+                
+                # Update background (CRITICAL: Only update, don't overwrite)
+                self.gauss_params_fixed[p] = torch.nn.Parameter(
+                    remaining_bg_data.clone().detach(), requires_grad=False
+                )
+                
+                if p == "means":
+                    print(f"  [{active_id} Object] {p}: {new_joint_data.shape}")
+                    print(f"  [{active_id} Canon] {p}: {new_joint_data.shape}")
+                    print(f"  [Updated Background] {p}: {remaining_bg_data.shape}")
+        
+        # Set pointers for the active joint
+        self.gauss_params = self.all_gauss_params_obj[active_id]
+        self.gauss_params_canonical = self.all_gauss_params_canon[active_id]
+        
+        # Summary
         n_obj = self.all_gauss_params_obj[active_id]["means"].shape[0]
         n_canon = self.all_gauss_params_canon[active_id]["means"].shape[0]
         n_bg = self.gauss_params_fixed["means"].shape[0]
-
-        print(f"Partitioning complete. {active_id} Obj: {n_obj}, {active_id} Canon: {n_canon}, Fixed BG: {n_bg}")
-
+        
+        print(f"\n{'='*70}")
+        print(f"Partitioning complete for {active_id}")
+        print(f"  Object: {n_obj:,} Gaussians")
+        print(f"  Canonical: {n_canon:,} Gaussians")
+        print(f"  Background: {n_bg:,} Gaussians")
+        print(f"  All joints: {list(self.all_gauss_params_obj.keys())}")
+        print(f"{'='*70}\n")
 
     def load_state_dict(self, state_dict: Dict[str, torch.Tensor], **kwargs):
         print(f"Loading state_dict (Training mode: {self.training})")
@@ -1318,92 +1417,134 @@ class ArtiSplatfactoModel(SplatfactoModel):
         return loss_dict
 
 
-
-
-    
-    def get_joint_angle_for_camera(self, camera: Cameras):
-        """Return a differentiable joint angle tensor."""
+    def get_joint_angle_for_camera(self, camera: Cameras, joint_id: str = None):
+        """
+        Return a differentiable joint angle tensor for a specific joint.
+        
+        Args:
+            camera: Camera object with metadata
+            joint_id: Specific joint ID (e.g., 'joint_0', 'joint_1'). 
+                    If None, uses active_joint_id for backward compatibility.
+        """
+        # Use active joint if not specified (backward compatibility)
+        if joint_id is None:
+            joint_id = self.config.active_joint_id
+        
+        # --- Case 1: Per-joint metadata (NEW multi-joint format) ---
         if hasattr(camera, "metadata") and camera.metadata is not None:
-            angle_val = camera.metadata.get("joint_angles", None)
+            # Try per-joint key first (e.g., "joint_angles_joint_0")
+            angle_key = f"joint_angles_{joint_id}"
+            angle_val = camera.metadata.get(angle_key, None)
+            
             if angle_val is not None:
                 if torch.is_tensor(angle_val):
                     return angle_val.to(self.device).float()
                 else:
                     return torch.tensor([float(angle_val)], device=self.device)
+            
+            # Fallback: Try legacy "joint_angles" key (for single-joint models)
+            if joint_id == self.config.active_joint_id:
+                angle_val = camera.metadata.get("joint_angles", None)
+                if angle_val is not None:
+                    if torch.is_tensor(angle_val):
+                        return angle_val.to(self.device).float()
+                    else:
+                        return torch.tensor([float(angle_val)], device=self.device)
 
         # --- Case 2: time-based interpolation (training / sequences) ---
-        if hasattr(camera, "times") and camera.times is not None:
-            time_val = camera.times.flatten()[0]
-            num_frames = len(self.joint_angles)
-            idx_f = time_val * (num_frames - 1)
-            idx0 = torch.floor(idx_f).long().clamp(0, num_frames - 2)
-            idx1 = idx0 + 1
-            w = idx_f - idx0.float()
-            angle0 = self.joint_angles[idx0]
-            angle1 = self.joint_angles[idx1]
-            angle = (1.0 - w) * angle0 + w * angle1
-            return angle
+        # This only works for the active joint in training
+        if joint_id == self.config.active_joint_id:
+            if hasattr(camera, "times") and camera.times is not None:
+                time_val = camera.times.flatten()[0]
+                num_frames = len(self.joint_angles)
+                idx_f = time_val * (num_frames - 1)
+                idx0 = torch.floor(idx_f).long().clamp(0, num_frames - 2)
+                idx1 = idx0 + 1
+                w = idx_f - idx0.float()
+                angle0 = self.joint_angles[idx0]
+                angle1 = self.joint_angles[idx1]
+                angle = (1.0 - w) * angle0 + w * angle1
+                return angle
 
-        # --- Default ---
+        # --- Default: Use mid-point of joint's range ---
+        # This is safer than 0.0 for joints with non-zero ranges
+        if hasattr(self, 'all_joint_params') and joint_id in self.all_joint_params:
+            if hasattr(self, f'joint_limits_{joint_id}'):
+                limits = getattr(self, f'joint_limits_{joint_id}')
+                mid_val = (limits[0] + limits[1]) / 2.0
+                return torch.tensor([mid_val], device=self.device, dtype=torch.float32)
+        
         return torch.tensor([0.0], device=self.device, dtype=torch.float32)
-    
+
+
     def get_gaussians_for_render(self, camera: Cameras) -> Dict[str, torch.Tensor]:
         """
         Prepares Gaussians for rendering by applying articulation transforms and 
         filtering parameters based on the current training mode.
         
         Render Order (Articulation Mode): [Active Obj, Active Canon]
-        Render Order (Recovery/Eval Mode): [Active Obj, Other Objs, Active Canon, Other Canons, BG]
+        Render Order (Recovery/Eval Mode): [All Objs (articulated), All Canons, BG]
         """
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
         active_id = self.config.active_joint_id
         
-        # --- 1. Get Transform for Active Joint ---
-        # The angle is calculated using the active joint's parameter structure
-        joint_angle_active = self.get_joint_angle_for_camera(camera)
-        
-        # Articulate the active joint's Object Gaussians (using the pointers)
-        articulated_obj_active = apply_articulation_to_optimizer_params(self, joint_angle_active)
-        
-        # Get the active joint's Canonical Gaussians
-        canon_active = {k: self.gauss_params_canonical[k].data if not self.training else self.gauss_params_canonical[k] for k in self.gauss_params_canonical.keys()}
-
-        # --- 2. Determine Sets to Render ---
         is_articulation_training = (self.training and self.config.training_mode == "articulation")
         
         # Lists to hold the final groups to be combined
-        obj_sets_to_combine = [articulated_obj_active]
-        canon_sets_to_combine = [canon_active]
+        obj_sets_to_combine = []
+        canon_sets_to_combine = []
         
-        # Collect ALL Other Articulated Object and Canonical Gaussians (FROZEN/PASSIVE)
-        if not is_articulation_training:
-            # Only include frozen sets during Recovery/Eval
-            for joint_id in sorted(self.all_gauss_params_obj.keys()):
-                if joint_id == active_id:
-                    continue
-
-                obj_params = self.all_gauss_params_obj[joint_id]
-                canon_params = self.all_gauss_params_canon[joint_id]
-                
-                # Render the frozen articulated state for previous joints
-                obj_sets_to_combine.append({k: obj_params[k].data if not self.training else obj_params[k] for k in obj_params.keys()})
-                
-                # Render the frozen canonical state for previous joints
-                canon_sets_to_combine.append({k: canon_params[k].data if not self.training else canon_params[k] for k in canon_params.keys()})
+        # --- Process ALL Joints ---
+        for joint_id in sorted(self.all_gauss_params_obj.keys()):
+            # Get joint angle for this specific joint
+            joint_angle = self.get_joint_angle_for_camera(camera, joint_id=joint_id)
             
+            # Get joint parameters
+            obj_params_raw = self.all_gauss_params_obj[joint_id]
+            canon_params = self.all_gauss_params_canon[joint_id]
+            
+            # Apply articulation transform to this joint's Object Gaussians
+            if joint_id == active_id:
+                # Active joint: use trainable parameters with articulation
+                articulated_obj = apply_articulation_to_optimizer_params(self, joint_angle)
+                obj_sets_to_combine.append(articulated_obj)
+                
+                # Active joint's canonical (trainable in articulation mode)
+                canon_active = {
+                    k: self.gauss_params_canonical[k].data if not self.training else self.gauss_params_canonical[k] 
+                    for k in self.gauss_params_canonical.keys()
+                }
+                canon_sets_to_combine.append(canon_active)
+            else:
+                # Non-active joints: apply articulation to frozen parameters
+                # We need to temporarily point to this joint's parameters
+                if not is_articulation_training:
+                    # In eval/recovery mode, render all joints
+                    articulated_obj = self._apply_articulation_to_joint(
+                        obj_params_raw, 
+                        joint_id, 
+                        joint_angle
+                    )
+                    obj_sets_to_combine.append(articulated_obj)
+                    
+                    # Add this joint's canonical
+                    canon_other = {k: canon_params[k].data if not self.training else canon_params[k] for k in canon_params.keys()}
+                    canon_sets_to_combine.append(canon_other)
+                # else: In articulation training, skip non-active joints
+        
         # --- 3. Combine in Render Order: [All Objs] then [All Canons] ---
         
-        # Combine all articulated object groups (Active Obj is always first)
+        # Combine all articulated object groups
         combined_obj_params = {p: torch.cat([d[p] for d in obj_sets_to_combine], dim=0) for p in GAUSS}
         
-        # Combine all canonical groups (Active Canon is always first)
+        # Combine all canonical groups
         combined_canon_params = {p: torch.cat([d[p] for d in canon_sets_to_combine], dim=0) for p in GAUSS}
 
         # Final combination: All Articulated Objects + All Canonicals
         combined_params = {p: torch.cat([combined_obj_params[p], combined_canon_params[p]], dim=0) for p in GAUSS}
         
         # --- 4. Store Counts for step_post_backward & Debugging (CRITICAL) ---
-        self.n_active_obj = articulated_obj_active['means'].shape[0]
+        self.n_active_obj = self.gauss_params['means'].shape[0]  # Active joint's obj count
         self.n_obj_total = combined_obj_params['means'].shape[0]
         self.n_canon_total = combined_canon_params['means'].shape[0]
 
@@ -1411,7 +1552,8 @@ class ArtiSplatfactoModel(SplatfactoModel):
         include_background = (not self.training or self.config.training_mode == "recovery")
         
         if include_background:
-            if (hasattr(self, "gauss_params_fixed") and self.gauss_params_fixed and self.gauss_params_fixed["means"].shape[0] > 0):
+            if (hasattr(self, "gauss_params_fixed") and self.gauss_params_fixed and 
+                self.gauss_params_fixed["means"].shape[0] > 0):
                 full_scene_params = {}
                 for name in combined_params.keys():
                     combined_tensor = combined_params[name]
@@ -1425,9 +1567,66 @@ class ArtiSplatfactoModel(SplatfactoModel):
                     full_scene_params[name] = torch.cat([combined_tensor, bg_tensor], dim=0)
                 
                 return full_scene_params
-            
-        # Return only the combined articulated/canonical sets (either filtered or full)
+        
+        # Return only the combined articulated/canonical sets
         return combined_params
+
+
+    def _apply_articulation_to_joint(self, obj_params: Dict, joint_id: str, joint_angle: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Apply articulation transform to a specific joint's parameters.
+        This is a helper for rendering non-active joints.
+        """
+        # Get joint-specific parameters
+        joint_params = self.all_joint_params[joint_id]
+        pivot = joint_params["pivot"]
+        axis_raw = joint_params["axis_raw"]
+        
+        # Normalize axis
+        axis = axis_raw / (torch.norm(axis_raw) + 1e-8)
+        
+        # Get joint type
+        joint_type_attr = f'joint_type_{joint_id}'
+        joint_type = getattr(self, joint_type_attr, 'revolute')
+        
+        # Extract means
+        means = obj_params["means"]
+        
+        # Apply transform
+        if joint_type == "revolute":
+            # Rotation matrix from axis-angle
+            angle_scalar = joint_angle.squeeze()
+            K = torch.tensor([
+                [0, -axis[2], axis[1]],
+                [axis[2], 0, -axis[0]],
+                [-axis[1], axis[0], 0]
+            ], device=means.device, dtype=means.dtype)
+            
+            R = torch.eye(3, device=means.device, dtype=means.dtype) + \
+                torch.sin(angle_scalar) * K + \
+                (1 - torch.cos(angle_scalar)) * (K @ K)
+            
+            # Transform means
+            centered = means - pivot.unsqueeze(0)
+            rotated = centered @ R.T
+            transformed_means = rotated + pivot.unsqueeze(0)
+            
+        elif joint_type == "prismatic":
+            # Translation along axis
+            translation = joint_angle.squeeze() * axis
+            transformed_means = means + translation.unsqueeze(0)
+        else:
+            transformed_means = means
+        
+        # Return articulated parameters
+        return {
+            "means": transformed_means,
+            "scales": obj_params["scales"],
+            "quats": obj_params["quats"],
+            "features_dc": obj_params["features_dc"],
+            "features_rest": obj_params["features_rest"],
+            "opacities": obj_params["opacities"],
+        }
 
     # def forward(self, camera: Cameras) -> Dict[str, torch.Tensor]:
     #     """Override to accept Cameras instead of RayBundles."""
