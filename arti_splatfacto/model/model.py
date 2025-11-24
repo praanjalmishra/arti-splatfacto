@@ -188,6 +188,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         initial_pivot = self.obj_3d_seg.joint_pivot.to(device)
         initial_axis = F.normalize(self.obj_3d_seg.joint_axis.to(device), dim=0)
+        initial_min_angle = self.obj_3d_seg.joint_limits[0]
         initial_max_angle = self.obj_3d_seg.joint_limits[1]
 
         # Store initial pivot as a buffer associated with the active joint (optional, but cleaner)
@@ -196,6 +197,10 @@ class ArtiSplatfactoModel(SplatfactoModel):
         # Joint geometry parameters (will be added to the active ParameterDict)
         self.all_joint_params[active_id]["pivot"] = torch.nn.Parameter(initial_pivot.clone(), requires_grad=True)
         self.all_joint_params[active_id]["axis_raw"] = torch.nn.Parameter(initial_axis.clone(), requires_grad=True)
+        self.all_joint_params[active_id]["min_angle"] = torch.nn.Parameter(
+            torch.tensor(initial_min_angle, device=device, dtype=torch.float32),
+            requires_grad=True
+        )
         self.all_joint_params[active_id]["max_angle"] = torch.nn.Parameter(
             torch.tensor(initial_max_angle, device=device, dtype=torch.float32),
             requires_grad=True
@@ -212,7 +217,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             self.all_joint_params[active_id]["angle_deltas"] = torch.nn.Parameter(torch.zeros(num_frames, device=device))
             
             joint_min, joint_max = self.obj_3d_seg.joint_limits[0], self.obj_3d_seg.joint_limits[1]
-            self.register_buffer(f'joint_limits_{active_id}', torch.tensor([joint_min, joint_max], device=device))
+            # self.register_buffer(f'joint_limits_{active_id}', torch.tensor([joint_min, joint_max], device=device))
 
         # --- Backward Compatibility Pointers ---
         # Create pointers to the active joint's parameters for existing methods 
@@ -220,10 +225,11 @@ class ArtiSplatfactoModel(SplatfactoModel):
         self.joint_pivot = self.all_joint_params[active_id]["pivot"]
         self.joint_axis_raw = self.all_joint_params[active_id]["axis_raw"]
         self.max_joint_angle = self.all_joint_params[active_id]["max_angle"]
+        self.min_joint_angle = self.all_joint_params[active_id]["min_angle"]
+
         if num_frames > 0:
             self.joint_angle_deltas = self.all_joint_params[active_id]["angle_deltas"]
             self.joint_angles_prior = getattr(self, f'joint_angles_prior_{active_id}')
-            self.joint_limits = getattr(self, f'joint_limits_{active_id}')
 
         self.rgb_metrics = RGBMetrics()
         self.depth_metrics = DepthMetrics()
@@ -239,12 +245,13 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
     @property
     def joint_angles(self):
-        """Final angles = prior + corrections, clamped to limits"""
+        """Final angles = prior + corrections, clamped to learned limits."""
         if hasattr(self, 'joint_angle_deltas'):
             raw_angles = self.joint_angles_prior + self.joint_angle_deltas
-            return torch.clamp(raw_angles, self.joint_limits[0], self.joint_limits[1])
-        # Fallback/Eval logic
+            joint_min, joint_max = self.joint_limits
+            return torch.clamp(raw_angles, joint_min, joint_max)
         return torch.tensor([0.0], device=self.device)
+
 
     @property  
     def joint_angles_normalized(self):
@@ -252,6 +259,21 @@ class ArtiSplatfactoModel(SplatfactoModel):
         angles = self.joint_angles
         joint_min, joint_max = self.joint_limits[0], self.joint_limits[1]
         return (angles - joint_min) / (joint_max - joint_min)
+
+    @property
+    def joint_limits(self):
+        """Return current learnable [min, max] joint limits."""
+        joint_params = self.all_joint_params[self.config.active_joint_id]
+        if "min_angle" in joint_params and "max_angle" in joint_params:
+            min_a = joint_params["min_angle"]
+            max_a = joint_params["max_angle"]
+            return torch.stack([torch.min(min_a, max_a), torch.max(min_a, max_a)])
+        attr_name = f'joint_limits_{self.config.active_joint_id}'
+        if hasattr(self, attr_name):
+            return getattr(self, attr_name)
+        raise AttributeError("No joint limits found for active joint.")
+
+
 
     def state_dict(self, *args, **kwargs):
         state = super().state_dict(*args, **kwargs)
@@ -274,6 +296,19 @@ class ArtiSplatfactoModel(SplatfactoModel):
         if hasattr(self, 'gauss_params_fixed') and self.gauss_params_fixed:
             for name, param in self.gauss_params_fixed.items():
                 state[f"gauss_params_fixed.{name}"] = param.data
+
+        joint_meta = {}
+        for joint_id in self.all_joint_params.keys():
+            joint_meta[joint_id] = {}
+            # Save limits if defined
+            limits_attr = f"joint_limits_{joint_id}"
+            if hasattr(self, limits_attr):
+                joint_meta[joint_id]["limits"] = getattr(self, limits_attr).detach().cpu()
+            # Save type if defined (usually string)
+            type_attr = f"joint_type_{joint_id}"
+            if hasattr(self, type_attr):
+                joint_meta[joint_id]["type"] = getattr(self, type_attr)
+        state["joint_metadata_absolute"] = joint_meta
 
         return state
 
@@ -351,34 +386,41 @@ class ArtiSplatfactoModel(SplatfactoModel):
         """
         Configure model for recovery stage (Joint N):
         - Freeze ALL geometry (means, scales, quats) for all joints and background.
-        - Enable ALL radiance (features_dc, features_rest, opacities) for all joints and background.
+        - Enable ONLY ACTIVE JOINT radiance (features_dc, features_rest, opacities) and background.
         - Freeze ALL joint parameters (pivot, axis, deltas, etc.) for all joints.
         """
         GEOMETRY_PARAMS = ["means", "scales", "quats"]
         RADIANCE_PARAMS = ["features_dc", "features_rest", "opacities"]
         JOINT_PARAMS = ["pivot", "axis_raw", "max_angle", "angle_deltas"]
+        active_id = getattr(self.config, "active_joint_id", None)
         
         CONSOLE.print("\n" + "="*70)
         CONSOLE.print("[bold yellow]CONFIGURING MODEL FOR RECOVERY STAGE (RADIANCE OPTIMIZATION)[/bold yellow]")
         CONSOLE.print("="*70)
-        
-        # --- 1. Configure ALL Joint-Specific Gaussians (Freeze Geo, Unfreeze Radiance) ---
+
+        # --- 1. Configure ALL Joint-Specific Gaussians ---
         for joint_id in self.all_gauss_params_obj.keys():
-            CONSOLE.print(f"\n[yellow]Configuring Gaussians for {joint_id}[/yellow]")
-            
+            is_active = (joint_id == active_id)
+            color = "green" if is_active else "yellow"
+            CONSOLE.print(f"\n[{color}]Configuring Gaussians for {joint_id}[/{color}]")
+
+            # Freeze geometry for all joints
             for param_name in GEOMETRY_PARAMS:
-                # **Fix**: Freeze Geometry
                 self.all_gauss_params_obj[joint_id][param_name].requires_grad = False
                 self.all_gauss_params_canon[joint_id][param_name].requires_grad = False
             CONSOLE.print(f"  ✓ Froze Geometry ({GEOMETRY_PARAMS}) for Object/Canonical")
 
+            # Enable radiance only for active joint
             for param_name in RADIANCE_PARAMS:
-                # Unfreeze Radiance
+                requires_grad = is_active
                 self.all_gauss_params_obj[joint_id][param_name].requires_grad = True
                 self.all_gauss_params_canon[joint_id][param_name].requires_grad = True
-            CONSOLE.print(f"  [green]✓ Enabled Radiance ({RADIANCE_PARAMS}) for Object/Canonical[/green]")
-        
-        # --- 2. Configure Background Gaussians (Freeze Geo, Unfreeze Radiance) ---
+            if is_active:
+                CONSOLE.print(f"  [green]✓ Enabled Radiance ({RADIANCE_PARAMS}) for ACTIVE joint {joint_id}[/green]")
+            else:
+                CONSOLE.print(f"  [yellow]✗ Frozen Radiance ({RADIANCE_PARAMS}) for previous joint {joint_id}[/yellow]")
+
+        # --- 2. Configure Background Gaussians ---
         CONSOLE.print("\n[yellow]Configuring Background Gaussians[/yellow]")
         for param_name in GEOMETRY_PARAMS:
             if param_name in self.gauss_params_fixed:
@@ -390,18 +432,19 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 self.gauss_params_fixed[param_name].requires_grad = True
         CONSOLE.print(f"  [bold green]✓ Enabled Radiance ({RADIANCE_PARAMS}) for Background[/bold green]")
 
-        # --- 3. Configure ALL Joint-Specific Parameters (Always Frozen) ---
-        CONSOLE.print("\n[cyan]Freezing ALL joint geometry parameters...[/cyan]")
+        # --- 3. Configure Joint Parameters (Always Frozen) ---
+        CONSOLE.print("\n[cyan]Freezing ALL articulation parameters...[/cyan]")
         for joint_id in self.all_joint_params.keys():
             for param_name in JOINT_PARAMS:
                 if param_name in self.all_joint_params[joint_id]:
                     self.all_joint_params[joint_id][param_name].requires_grad = False
                     CONSOLE.print(f"  ✓ Froze {joint_id} {param_name}")
-        
+
         # --- 4. Final Summary ---
         CONSOLE.print("\n" + "="*70)
-        CONSOLE.print("[bold green]RECOVERY STAGE CONFIGURATION COMPLETE[/bold green]")
-        CONSOLE.print("ALL Geometry: FROZEN | ALL Radiance: TRAINABLE | ALL Articulation: FROZEN")
+        CONSOLE.print(f"[bold green]RECOVERY STAGE CONFIGURATION COMPLETE[/bold green]")
+        CONSOLE.print(f"Active Joint: [bold]{active_id}[/bold] Radiance = Trainable")
+        CONSOLE.print("All Geometry: FROZEN | Other Joints: FROZEN | Background: Radiance Trainable")
         CONSOLE.print("="*70 + "\n")
 
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
@@ -447,6 +490,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 "joint_pivot": "pivot",
                 "joint_axis": "axis_raw",
                 "max_joint_angle": "max_angle",
+                "min_joint_angle": "min_angle",
             }
             
             for opt_name, internal_name in joint_geom_params.items():
@@ -521,7 +565,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             
             CONSOLE.print(f"\n[green]Total: {len(groups)} recovery parameter groups[/green]\n")
             return groups
-        
+    
     def _initialize_and_partition(self, state_dict: Dict[str, torch.Tensor]):
         """
         Partition Gaussians for the active joint.
@@ -544,8 +588,8 @@ class ArtiSplatfactoModel(SplatfactoModel):
             print(f"  First joint: partitioning from full scene")
             
             all_means = state_dict["gauss_params.means"].to(device)
-            obj_mask = self.obj_3d_seg.query_refine(
-                all_means, grow=3, thresh=0.01, bbox_margin=0.01
+            obj_mask = self.obj_3d_seg.query_refine_ellipsoid(
+                all_means, grow=2, thresh=0.01, bbox_margin=0.00
             ).to(torch.bool).cpu()
             bg_mask = ~obj_mask
             
@@ -584,13 +628,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
             print(f"  Sequential joint: partitioning from background only")
             print(f"  Existing joints: {list(self.all_gauss_params_obj.keys())}")
             
-            # The input state_dict contains: [background + all_previous_joints]
-            # We need to:
-            # 1. Identify which Gaussians in the input belong to the background (vs previous joints)
-            # 2. Query the mask only on background Gaussians
-            # 3. Extract new joint from background
-            # 4. Update background to exclude new joint
-            
             all_means = state_dict["gauss_params.means"].to(device)
             total_input = all_means.shape[0]
             
@@ -602,7 +639,6 @@ class ArtiSplatfactoModel(SplatfactoModel):
             )
             
             # The background Gaussians are at the beginning of the input
-            # (since we concatenated [background + previous_joints] during reconstruction)
             bg_start_idx = 0
             bg_end_idx = total_input - prev_joints_count
             
@@ -621,8 +657,8 @@ class ArtiSplatfactoModel(SplatfactoModel):
             bg_means_only = all_means[bg_start_idx:bg_end_idx]
             
             # Query mask on background only
-            obj_mask_in_bg = self.obj_3d_seg.query_refine(
-                bg_means_only, grow=3, thresh=0.01, bbox_margin=0.01
+            obj_mask_in_bg = self.obj_3d_seg.query_refine_ellipsoid(
+                bg_means_only, grow=3, thresh=0.01, bbox_margin=0.0
             ).to(torch.bool).cpu()
             
             remaining_bg_mask = ~obj_mask_in_bg
@@ -652,7 +688,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
                     new_joint_data.clone().detach(), requires_grad=True
                 )
                 
-                # Update background (CRITICAL: Only update, don't overwrite)
+                # Update background
                 self.gauss_params_fixed[p] = torch.nn.Parameter(
                     remaining_bg_data.clone().detach(), requires_grad=False
                 )
@@ -679,10 +715,12 @@ class ArtiSplatfactoModel(SplatfactoModel):
         print(f"  All joints: {list(self.all_gauss_params_obj.keys())}")
         print(f"{'='*70}\n")
 
-    def load_state_dict(self, state_dict: Dict[str, torch.Tensor], **kwargs):
-        print(f"Loading state_dict (Training mode: {self.training})")
-        assert self.config.obj_mask_file is not None and self.config.obj_mask_file.exists()
 
+    def load_state_dict(self, state_dict: Dict[str, torch.Tensor], **kwargs):
+
+        if hasattr(self, '_skip_load_state_dict') and self._skip_load_state_dict:
+            return  # Silent skip - no log needed
+        
         active_id = self.config.active_joint_id
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
         device = self.device
@@ -691,7 +729,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         def is_legacy_single_joint_param(key: str) -> bool:
             """Dynamically detect old single-joint parameter format."""
             legacy_base_names = [
-                "joint_pivot", "joint_axis_raw", "max_joint_angle", "joint_angle_deltas"
+                "joint_pivot", "joint_axis_raw", "max_joint_angle", "min_joint_angle", "joint_angle_deltas"
             ]
             
             if key in legacy_base_names:
@@ -725,7 +763,11 @@ class ArtiSplatfactoModel(SplatfactoModel):
             
             # --- Load ALL Previously Trained Gaussian Sets ---
             for key, tensor in state_dict.items():
+                # Skip non-tensor entries (e.g., joint_metadata_absolute dict)
+                if not torch.is_tensor(tensor):
+                    continue
                 tensor = tensor.to(device)
+
                 
                 # Load joint-specific Gaussians
                 match = re.match(r"all_gauss_params_(obj|canon)\.(joint_\d+)\.(" + "|".join(GAUSS) + r")$", key)
@@ -882,11 +924,12 @@ class ArtiSplatfactoModel(SplatfactoModel):
             self.joint_pivot = self.all_joint_params[active_id]["pivot"]
             self.joint_axis_raw = self.all_joint_params[active_id]["axis_raw"]
             self.max_joint_angle = self.all_joint_params[active_id]["max_angle"]
+            self.min_joint_angle = self.all_joint_params[active_id]["min_angle"]
             
             if "angle_deltas" in self.all_joint_params[active_id]:
                 self.joint_angle_deltas = self.all_joint_params[active_id]["angle_deltas"]
                 self.joint_angles_prior = getattr(self, f'joint_angles_prior_{active_id}', None)
-                self.joint_limits = getattr(self, f'joint_limits_{active_id}', None)
+                # self.joint_limits = getattr(self, f'joint_limits_{active_id}', None)
         
         # --- 6. Load General Non-Gaussian State ---
         
@@ -907,6 +950,15 @@ class ArtiSplatfactoModel(SplatfactoModel):
         self.step = 0
         self.configure_training_stage()
         
+
+        if "joint_metadata_absolute" in state_dict:
+            joint_meta = state_dict.pop("joint_metadata_absolute")
+            for joint_id, meta in joint_meta.items():
+                if "limits" in meta:
+                    setattr(self, f"joint_limits_{joint_id}", meta["limits"].to(self.device))
+                if "type" in meta:
+                    setattr(self, f"joint_type_{joint_id}", meta["type"])
+                    
         # --- 7. Status Report ---
         print(f"\n{'='*60}")
         print(f"✓ Checkpoint Load Complete")
@@ -1273,35 +1325,54 @@ class ArtiSplatfactoModel(SplatfactoModel):
             frame_idx = int(time_val * (num_frames - 1))
             frame_idx = max(0, min(frame_idx, num_frames - 1))
             
-            # Soft regularization on corrections (spring back to prior)
+            # --- 1. Correction regularization ---
             delta_regularization = torch.mean(self.joint_angle_deltas**2)
             loss_dict["joint_correction_reg"] = self.config.joint_correction_lambda * delta_regularization
-            
-            # Optional: Temporal smoothness between adjacent frame corrections
+
+            # --- 2. Temporal smoothness between adjacent frame corrections ---
             smooth_penalty = torch.tensor(0.0, device=self.device)
             if frame_idx > 0:
                 prev_delta = self.joint_angle_deltas[frame_idx - 1]
                 current_delta = self.joint_angle_deltas[frame_idx]
                 smooth_penalty = (current_delta - prev_delta) ** 2
-            
-            # Very light temporal smoothness (corrections should change gradually)
             temporal_reg = 0.01 * smooth_penalty
             loss_dict["joint_temporal_reg"] = temporal_reg
-            
-            # Debug logging
+
+            # --- 3. Joint limit consistency regularization (NEW) ---
+            # Ensure learned limits remain well-ordered and within reasonable physical range
+            joint_min = self.all_joint_params[self.config.active_joint_id]["min_angle"]
+            joint_max = self.all_joint_params[self.config.active_joint_id]["max_angle"]
+            joint_type = self.obj_3d_seg.joint_type
+
+            # Type-specific margin
+            margin = 0.5 if joint_type == "revolute" else 0.01
+            limit_gap = joint_max - joint_min
+            limit_gap_reg = torch.relu(margin - limit_gap) ** 2
+            loss_dict["joint_limit_gap_reg"] = 0.05 * limit_gap_reg
+
+
+
+            # Add to total loss
+            total_joint_reg = (
+                loss_dict["joint_correction_reg"]
+                + loss_dict["joint_temporal_reg"]
+                + loss_dict["joint_limit_gap_reg"]
+            )
+            loss_dict["joint_regularization"] = total_joint_reg
+
+            # --- 4. Debug logging ---
             if self.step % 100 == 0:
                 current_correction = self.joint_angle_deltas[frame_idx].item()
                 max_correction = torch.abs(self.joint_angle_deltas).max().item()
                 mean_correction = torch.abs(self.joint_angle_deltas).mean().item()
-                
-                # Current physical angle
                 current_angle = self.joint_angles[frame_idx].item()
                 prior_angle = self.joint_angles_prior[frame_idx].item()
-                
-                print(f"[Joint Corrections - Step {self.step}]")
+
+                print(f"[Joint Regularization - Step {self.step}]")
                 print(f"  Frame {frame_idx}: Prior={prior_angle:.3f}, Final={current_angle:.3f}, Δ={current_correction:.4f}")
                 print(f"  Correction stats: Max={max_correction:.4f}, Mean={mean_correction:.4f}")
-            
+                print(f"  Limits: min={joint_min.item():.3f}, max={joint_max.item():.3f}, gap={limit_gap.item():.3f}")
+
         if self.config.use_opacity_regularization and self.training:
 
             obj_opacity = torch.sigmoid(self.gauss_params["opacities"])
@@ -1479,56 +1550,71 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
     def get_gaussians_for_render(self, camera: Cameras) -> Dict[str, torch.Tensor]:
         """
-        Prepares Gaussians for rendering by applying articulation transforms and 
-        filtering parameters based on the current training mode.
+        Prepares Gaussians for rendering with selective gradient flow.
         
-        Render Order (Articulation Mode): [Active Obj, Active Canon]
-        Render Order (Recovery/Eval Mode): [All Objs (articulated), All Canons, BG]
+        During Recovery:
+        - Detach frozen joints' ARTICULATED Gaussians (geometry frozen at rest)
+        - Keep frozen joints' CANONICAL Gaussians trainable (always visible, can improve)
+        - Keep active joint fully trainable
+        - Keep background trainable
         """
         GAUSS = ["means", "scales", "quats", "features_dc", "features_rest", "opacities"]
+        GEOMETRY = ["means", "scales", "quats"]
+        RADIANCE = ["features_dc", "features_rest", "opacities"]
+        
         active_id = self.config.active_joint_id
-        
         is_articulation_training = (self.training and self.config.training_mode == "articulation")
+        is_recovery_training = (self.training and self.config.training_mode == "recovery")
         
-        # Lists to hold the final groups to be combined
         obj_sets_to_combine = []
         canon_sets_to_combine = []
         
         # --- Process ALL Joints ---
         for joint_id in sorted(self.all_gauss_params_obj.keys()):
-            # Get joint angle for this specific joint
             joint_angle = self.get_joint_angle_for_camera(camera, joint_id=joint_id)
             
-            # Get joint parameters
             obj_params_raw = self.all_gauss_params_obj[joint_id]
             canon_params = self.all_gauss_params_canon[joint_id]
             
-            # Apply articulation transform to this joint's Object Gaussians
+            is_active = (joint_id == active_id)
+            
             if joint_id == active_id:
-                # Active joint: use trainable parameters with articulation
+                # Active joint: fully trainable
                 articulated_obj = apply_articulation_to_optimizer_params(self, joint_angle)
                 obj_sets_to_combine.append(articulated_obj)
                 
-                # Active joint's canonical (trainable in articulation mode)
-                canon_active = {
-                    k: self.gauss_params_canonical[k].data if not self.training else self.gauss_params_canonical[k] 
-                    for k in self.gauss_params_canonical.keys()
-                }
+                canon_active = {k: self.gauss_params_canonical[k] for k in self.gauss_params_canonical.keys()}
                 canon_sets_to_combine.append(canon_active)
+                
             else:
-                # Non-active joints: apply articulation to frozen parameters
-                # We need to temporarily point to this joint's parameters
+                # Non-active joints
                 if not is_articulation_training:
-                    # In eval/recovery mode, render all joints
+                    # Prepare articulated object Gaussians
+                    # CRITICAL: Detach GEOMETRY always, but keep RADIANCE trainable in recovery
+                    if is_recovery_training:
+                        # Recovery: Detach geometry, keep radiance trainable
+                        obj_params_mixed = {}
+                        for k in GAUSS:
+                            if k in GEOMETRY:
+                                obj_params_mixed[k] = obj_params_raw[k].detach()  # Freeze geometry
+                            else:  # Radiance
+                                obj_params_mixed[k] = obj_params_raw[k]  # Keep trainable
+                    else:
+                        # Eval: Detach everything
+                        obj_params_mixed = {k: obj_params_raw[k].detach() for k in GAUSS}
+                    
                     articulated_obj = self._apply_articulation_to_joint(
-                        obj_params_raw, 
+                        obj_params_mixed,
                         joint_id, 
-                        joint_angle
+                        joint_angle.detach()
                     )
                     obj_sets_to_combine.append(articulated_obj)
                     
-                    # Add this joint's canonical
-                    canon_other = {k: canon_params[k].data if not self.training else canon_params[k] for k in canon_params.keys()}
+                    # Canonical Gaussians: ALWAYS trainable in recovery (they're visible!)
+                    if is_recovery_training:
+                        canon_other = {k: canon_params[k] for k in canon_params.keys()}
+                    else:
+                        canon_other = {k: canon_params[k].detach() for k in canon_params.keys()}
                     canon_sets_to_combine.append(canon_other)
                 # else: In articulation training, skip non-active joints
         
@@ -1922,6 +2008,12 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 f"grad={'exists' if self.max_joint_angle.grad is not None else 'None'}")
             if self.max_joint_angle.grad is not None:
                 print(f"  grad value: {self.max_joint_angle.grad.item():.6e}")
+
+        if hasattr(self, 'min_joint_angle'):
+            print(f"min_joint_angle: requires_grad={self.min_joint_angle.requires_grad}, "
+                f"grad={'exists' if self.min_joint_angle.grad is not None else 'None'}")
+            if self.min_joint_angle.grad is not None:
+                print(f"  grad value: {self.min_joint_angle.grad.item():.6e}")
         
         if hasattr(self, 'joint_t_raw'):
             print(f"joint_t_raw: requires_grad={self.joint_t_raw.requires_grad}, "
@@ -2037,6 +2129,10 @@ class ArtiSplatfactoModel(SplatfactoModel):
                     metrics_dict["joint/max_angle_param"] = float(self.max_joint_angle.item())
                     metrics_dict["joint/max_angle_param_degrees"] = float(self.max_joint_angle.item() * 180 / 3.14159)
                 
+                # Min angle parameter
+                if hasattr(self, 'min_joint_angle'):
+                    metrics_dict["joint/min_angle_param"] = float(self.min_joint_angle.item())
+                    metrics_dict["joint/min_angle_param_degrees"] = float(self.min_joint_angle.item() * 180 / 3.14159)
                 # T-values statistics (progress from closed to open)
                 if hasattr(self, 'joint_t_values'):
                     t_vals = self.joint_t_values
@@ -2107,6 +2203,10 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 grad_metrics["gradients/max_angle_value"] = float(self.max_joint_angle.grad.item())
                 grad_metrics["gradients/max_angle_abs"] = float(abs(self.max_joint_angle.grad.item()))
             
+            if hasattr(self, 'min_joint_angle') and self.min_joint_angle.grad is not None:
+                grad_metrics["gradients/min_angle_value"] = float(self.min_joint_angle.grad.item())
+                grad_metrics["gradients/min_angle_abs"] = float(abs(self.min_joint_angle.grad.item()))
+
             if hasattr(self, 'joint_t_raw') and self.joint_t_raw.grad is not None:
                 t_grad = self.joint_t_raw.grad
                 grad_metrics["gradients/t_raw_norm"] = float(t_grad.norm().item())

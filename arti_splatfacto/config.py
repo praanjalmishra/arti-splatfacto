@@ -12,6 +12,7 @@ from nerfstudio.plugins.types import MethodSpecification
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from arti_splatfacto.data.datamanager import ArtiSplatfactoManagerConfig, ArtiSplatfactoDataManager
 from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig, FullImageDatamanager
+from arti_splatfacto.pipeline import ArtiSplatfactoPipeline, ArtiSplatfactoPipelineConfig
 
 arti_splatfacto_config = MethodSpecification(
     config=ArtiSplatfactoTrainerConfig(
@@ -20,7 +21,7 @@ arti_splatfacto_config = MethodSpecification(
         steps_per_save=2000,
         max_num_iterations=30000,
         mixed_precision=False,
-        pipeline=VanillaPipelineConfig(
+        pipeline=ArtiSplatfactoPipelineConfig(
             datamanager=FullImageDatamanagerConfig(
                 _target=FullImageDatamanager[DepthArtiDataset],
                 dataparser=ArtiSplatfactoDataParserConfig(load_dynamic_objects=True),
@@ -33,7 +34,7 @@ arti_splatfacto_config = MethodSpecification(
                 densify_size_thresh=0.01,    # Split smaller Gaussians (was 0.01)
                 split_screen_size=0.05,       # Larger screen size threshold (was 0.05)
                 warmup_length=500,            
-                stop_split_at=1800,          # Extend densification period (was 25000)
+                # stop_split_at=1800,         
                 reset_alpha_every=15,         # More frequent alpha reset (was 20)
                 use_scale_regularization=True,
                 use_depth = True,
@@ -148,7 +149,14 @@ arti_splatfacto_config = MethodSpecification(
                     lr_final=1e-5,
                     max_steps=30000,
                 ),
-            },      
+            },
+            "min_joint_angle": {
+                "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
+                "scheduler": ExponentialDecaySchedulerConfig(
+                    lr_final=1e-5,
+                    max_steps=30000,
+                ),
+            },
         },
             viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
             vis="viewer",

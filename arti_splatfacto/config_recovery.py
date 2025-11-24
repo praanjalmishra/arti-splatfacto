@@ -12,6 +12,7 @@ from nerfstudio.plugins.types import MethodSpecification
 from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from arti_splatfacto.data.datamanager import ArtiSplatfactoManagerConfig, ArtiSplatfactoDataManager
 from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig, FullImageDatamanager
+from arti_splatfacto.pipeline import ArtiSplatfactoPipeline, ArtiSplatfactoPipelineConfig
 
 arti_splatfacto_recovery_config = MethodSpecification(
     config=ArtiSplatfactoTrainerConfig(
@@ -20,7 +21,7 @@ arti_splatfacto_recovery_config = MethodSpecification(
         steps_per_save=1000,
         max_num_iterations=10000, 
         mixed_precision=False,
-        pipeline=VanillaPipelineConfig(
+        pipeline=ArtiSplatfactoPipelineConfig(
             datamanager=FullImageDatamanagerConfig(
                 _target=FullImageDatamanager[DepthArtiDataset],
                 dataparser=ArtiSplatfactoDataParserConfig(load_dynamic_objects=True),
@@ -34,7 +35,7 @@ arti_splatfacto_recovery_config = MethodSpecification(
                 use_scale_regularization=False,  
                 output_depth_during_training=True,
                 use_depth=True,
-                depth_lambda=0.2,  
+                depth_lambda=1.0,   
             )
         ),
         optimizers={
@@ -101,7 +102,7 @@ arti_splatfacto_recovery_config = MethodSpecification(
             },
 
             "bg_means": {
-                "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=5e-3, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(lr_final=1e-6, max_steps=10000),
             },
             "bg_quats": {
