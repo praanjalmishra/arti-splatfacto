@@ -9,7 +9,7 @@ Exports a trained articulated Gaussian Splatting model to URDF-compatible format
 - Joint metadata JSON (pivot points, axes, limits, types)
 
 Usage:
-    python urdf_export.py <config_path> --output_dir ./urdf_export
+python arti_splatfacto/export/export_artisplat.py --load-config data_real/day8/post_3/joint_0_recovery/arti_splatfacto_recovery/2025-11-24_190813/config.yml --load-config-splatfacto data_real/day8/pre/splatfacto/qed-splatter/2025-11-14_131705/config.yml --output_dir ./urdf_tsdf
 """
 
 import json
@@ -465,7 +465,7 @@ class URDFExporter:
                 "max": joint_max,
                 "unit": "radians" if metadata["joint_type"] == "revolute" else "meters"
             },
-            "pivot_point": pivot,
+            "pivot_pivot": pivot,
             "axis": joint_axis,
             "canonical_angle": self.get_canonical_angle(model),
             "object_angle": self.get_object_angle(model),
@@ -615,20 +615,48 @@ class URDFExporter:
             CONSOLE.print("[yellow]⚠ Warning: Model does not have joint_angle_deltas.[/yellow]")
             CONSOLE.print("[yellow]  This may not be a joint-conditioned model![/yellow]")
         
-        # Get cameras
+
+
+
+        # Assume both camera sets are from Nerfstudio and share intrinsics
         cameras_pre: Cameras = splatfacto_pipeline.datamanager.train_dataset.cameras
         cameras_post: Cameras = pipeline.datamanager.train_dataset.cameras
 
+        # Concatenate poses
+        camera_to_worlds_all = torch.cat(
+            [cameras_pre.camera_to_worlds, cameras_post.camera_to_worlds], dim=0
+        )
 
-        num_available_pre = len(cameras_pre)
-        num_available_post = len(cameras_post)
-        self.num_cameras = min(self.num_cameras, num_available_pre, num_available_post)
+        # Get number of total cameras
+        num_all = camera_to_worlds_all.shape[0]
 
-        camera_indices_pre = np.linspace(0, num_available_pre - 1, self.num_cameras, dtype=int).tolist()
-        camera_indices_post = np.linspace(0, num_available_post - 1, self.num_cameras, dtype=int).tolist()
+        # Create new Cameras instance reusing shared intrinsics and types
+        cameras_all = Cameras(
+            camera_to_worlds=camera_to_worlds_all,
+            fx=cameras_pre.fx[0],  
+            fy=cameras_pre.fy[0],
+            cx=cameras_pre.cx[0],
+            cy=cameras_pre.cy[0],
+            width=cameras_pre.width[0].item(),
+            height=cameras_pre.height[0].item(),
+            distortion_params=(
+                cameras_pre.distortion_params[0]
+                if cameras_pre.distortion_params is not None
+                else None
+            ),
+            camera_type=cameras_pre.camera_type[0].item(),
+        )
 
-        CONSOLE.print(f"Using {len(camera_indices_pre)} pre cameras out of {num_available_pre}")
-        CONSOLE.print(f"Using {len(camera_indices_post)} post cameras out of {num_available_post}")
+
+        num_cameras_all = len(cameras_all)
+        self.num_cameras = min(self.num_cameras, num_cameras_all)
+        camera_indices_all = np.linspace(0, num_cameras_all - 1, self.num_cameras, dtype=int).tolist()
+
+        CONSOLE.print(f"\n[bold cyan]Camera Selection:[/bold cyan]")
+        CONSOLE.print(f"  Combined (pre + post) poses: {len(camera_indices_all)} / {num_cameras_all} cameras")
+
+
+
 
         # Extract joint metadata
         CONSOLE.print("\n[2/5] Extracting joint metadata...")
@@ -645,7 +673,7 @@ class URDFExporter:
         # Export background mesh
         CONSOLE.print("\n[3/5] Exporting background mesh...")
         if not self.background_only:
-            background_mesh = self.export_background_mesh(model, cameras_pre, camera_indices_pre)
+            background_mesh = self.export_background_mesh(model, cameras_all, camera_indices_all)
         
 
             del background_mesh
@@ -657,7 +685,7 @@ class URDFExporter:
             
             for joint_id in range(num_joints):
                 canonical_mesh, object_mesh = self.export_joint_meshes(
-                    model, cameras_post, camera_indices_post, joint_id
+                    model, cameras_all, camera_indices_all, joint_id
                 )
         
         # Generate URDF

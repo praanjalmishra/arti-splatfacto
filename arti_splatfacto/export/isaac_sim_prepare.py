@@ -9,7 +9,7 @@ Takes URDF-exported meshes and prepares them for Isaac Sim:
 - Validates and imports into Isaac Sim (optional)
 
 Usage:
-    python isaac_sim_prepare.py --input_dir ./urdf_export --output_dir ./isaac_sim_ready
+python arti_splatfacto/export/isaac_sim_prepare.py --input-dir urdf_tsdf/ --output-dir urdf_tsdf/
 """
 
 import json
@@ -418,79 +418,158 @@ class IsaacSimPreparer:
         background_inertial: Dict,
         joint_inertials: List[Tuple[Dict, Dict]]
     ) -> str:
-        """Generate a complete URDF with inertial properties."""
+        """Generate a complete URDF with proper separation of static and moving parts."""
         print("\n[3/3] Generating URDF...")
 
         urdf_lines = ['<?xml version="1.0"?>']
         urdf_lines.append('<robot name="articulated_object">')
         urdf_lines.append('')
 
-        # Helper function to format inertia matrix
         def format_inertia(inertia_matrix):
             i = inertia_matrix
             return (f'ixx="{i[0][0]:.6e}" ixy="{i[0][1]:.6e}" ixz="{i[0][2]:.6e}" '
                     f'iyy="{i[1][1]:.6e}" iyz="{i[1][2]:.6e}" izz="{i[2][2]:.6e}"')
 
-        # Background link (base_link)
-        urdf_lines.append('  <!-- Base link (static environment) -->')
+        def mesh_exists(mesh_name: str, mesh_type: str = "visual") -> bool:
+            """Check if a mesh file exists."""
+            mesh_path = self.output_dir / "meshes" / mesh_type / f"{mesh_name}.{self.export_format}"
+            return mesh_path.exists()
+
+        # ----------------------------------------------------------------------
+        # Base link (static environment + canonical parts with proper positioning)
+        # ----------------------------------------------------------------------
+        urdf_lines.append('  <!-- Base link (bg + canonical) -->')
         urdf_lines.append('  <link name="base_link">')
+        
+        # Compute combined inertial properties (background + all canonical parts)
+        total_mass = background_inertial["mass"]
+        weighted_com = np.array(background_inertial["com"]) * background_inertial["mass"]
+        combined_inertia = np.array(background_inertial["inertia"])
+        
+        for canonical_inertial, _ in joint_inertials:
+            total_mass += canonical_inertial["mass"]
+            weighted_com += np.array(canonical_inertial["com"]) * canonical_inertial["mass"]
+            combined_inertia += np.array(canonical_inertial["inertia"])
+        
+        combined_com = weighted_com / total_mass if total_mass > 0 else weighted_com
+        
+        # Inertial properties
         urdf_lines.append('    <inertial>')
-        urdf_lines.append(f'      <origin xyz="{background_inertial["com"][0]:.6f} {background_inertial["com"][1]:.6f} {background_inertial["com"][2]:.6f}" rpy="0 0 0"/>')
-        urdf_lines.append(f'      <mass value="{background_inertial["mass"]:.6f}"/>')
-        urdf_lines.append(f'      <inertia {format_inertia(background_inertial["inertia"])}/>')
+        urdf_lines.append(f'      <origin xyz="{combined_com[0]:.6f} {combined_com[1]:.6f} {combined_com[2]:.6f}" rpy="0 0 0"/>')
+        urdf_lines.append(f'      <mass value="{total_mass:.6f}"/>')
+        urdf_lines.append(f'      <inertia {format_inertia(combined_inertia.tolist())}/>')
         urdf_lines.append('    </inertial>')
-        urdf_lines.append('    <visual>')
-        urdf_lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
-        urdf_lines.append('      <geometry>')
-        urdf_lines.append(f'        <mesh filename="meshes/visual/background.{self.export_format}" scale="{self.mesh_scale} {self.mesh_scale} {self.mesh_scale}"/>')
-        urdf_lines.append('      </geometry>')
-        urdf_lines.append('    </visual>')
-        urdf_lines.append('    <collision>')
-        urdf_lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
-        urdf_lines.append('      <geometry>')
-        urdf_lines.append(f'        <mesh filename="meshes/collision/background.{self.export_format}" scale="{self.mesh_scale} {self.mesh_scale} {self.mesh_scale}"/>')
-        urdf_lines.append('      </geometry>')
-        urdf_lines.append('    </collision>')
+        
+        print(f"  Base link combined mass: {total_mass:.4f} kg")
+        print(f"  Base link combined COM: [{combined_com[0]:.4f}, {combined_com[1]:.4f}, {combined_com[2]:.4f}]")
+        
+        # Visual: background mesh (already at world origin)
+        if mesh_exists("background", "visual"):
+            urdf_lines.append('    <visual name="background_visual">')
+            urdf_lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
+            urdf_lines.append('      <geometry>')
+            urdf_lines.append(f'        <mesh filename="meshes/visual/background.{self.export_format}" scale="{self.mesh_scale} {self.mesh_scale} {self.mesh_scale}"/>')
+            urdf_lines.append('      </geometry>')
+            urdf_lines.append('    </visual>')
+        else:
+            print(f"  [Warning] Background visual mesh not found")
+        
+        # Visual: all canonical meshes with proper positioning
+        # Each canonical mesh is centered at its pivot point, so we need to place it there
+        for joint_id in range(len(joint_inertials)):
+            joint_info = metadata["joints"][joint_id]
+            pivot = joint_info.get("pivot_point_relative", joint_info["pivot_point"])
+            
+            canonical_name = f"joint_{joint_id}_canonical"
+            if mesh_exists(canonical_name, "visual"):
+                urdf_lines.append(f'    <visual name="{canonical_name}_visual">')
+                # Position the canonical mesh at the pivot point
+                urdf_lines.append(f'      <origin xyz="{pivot[0]:.6f} {pivot[1]:.6f} {pivot[2]:.6f}" rpy="0 0 0"/>')
+                urdf_lines.append('      <geometry>')
+                urdf_lines.append(f'        <mesh filename="meshes/visual/{canonical_name}.{self.export_format}" '
+                                f'scale="{self.mesh_scale} {self.mesh_scale} {self.mesh_scale}"/>')
+                urdf_lines.append('      </geometry>')
+                urdf_lines.append('    </visual>')
+                print(f"  Added canonical mesh {joint_id} to base_link at pivot [{pivot[0]:.4f}, {pivot[1]:.4f}, {pivot[2]:.4f}]")
+            else:
+                print(f"  [Warning] Canonical visual mesh for joint {joint_id} not found")
+        
+        # Collision: background mesh
+        if mesh_exists("background", "collision"):
+            urdf_lines.append('    <collision name="background_collision">')
+            urdf_lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
+            urdf_lines.append('      <geometry>')
+            urdf_lines.append(f'        <mesh filename="meshes/collision/background.{self.export_format}" scale="{self.mesh_scale} {self.mesh_scale} {self.mesh_scale}"/>')
+            urdf_lines.append('      </geometry>')
+            urdf_lines.append('    </collision>')
+        
+        # Collision: all canonical meshes with proper positioning
+        for joint_id in range(len(joint_inertials)):
+            joint_info = metadata["joints"][joint_id]
+            pivot = joint_info.get("pivot_point_relative", joint_info["pivot_point"])
+            
+            canonical_name = f"joint_{joint_id}_canonical"
+            if mesh_exists(canonical_name, "collision"):
+                urdf_lines.append(f'    <collision name="{canonical_name}_collision">')
+                # Position the canonical collision mesh at the pivot point
+                urdf_lines.append(f'      <origin xyz="{pivot[0]:.6f} {pivot[1]:.6f} {pivot[2]:.6f}" rpy="0 0 0"/>')
+                urdf_lines.append('      <geometry>')
+                urdf_lines.append(f'        <mesh filename="meshes/collision/{canonical_name}.{self.export_format}" '
+                                f'scale="{self.mesh_scale} {self.mesh_scale} {self.mesh_scale}"/>')
+                urdf_lines.append('      </geometry>')
+                urdf_lines.append('    </collision>')
+        
         urdf_lines.append('  </link>')
         urdf_lines.append('')
 
-        # Articulated links and joints
+        # ----------------------------------------------------------------------
+        # Articulated links (ONLY moving parts - object meshes)
+        # ----------------------------------------------------------------------
         for joint_id, (canonical_inertial, object_inertial) in enumerate(joint_inertials):
             joint_info = metadata["joints"][joint_id]
             joint_type = joint_info["type"]
             axis = joint_info["axis"]
+            pivot = joint_info.get("pivot_point_relative", joint_info["pivot_point"])
 
-            # Use relative pivot point if available, otherwise use original
-            if "pivot_point_relative" in joint_info:
-                pivot = joint_info["pivot_point_relative"]
-            else:
-                pivot = joint_info["pivot_point"]
-
-            # Articulated link
-            urdf_lines.append(f'  <!-- Articulated link {joint_id} -->')
+            urdf_lines.append(f'  <!-- Movable part for joint {joint_id} (e.g., door, drawer) -->')
             urdf_lines.append(f'  <link name="joint_{joint_id}_link">')
+            
+            # Inertial: only the moving part
             urdf_lines.append('    <inertial>')
             urdf_lines.append(f'      <origin xyz="{object_inertial["com"][0]:.6f} {object_inertial["com"][1]:.6f} {object_inertial["com"][2]:.6f}" rpy="0 0 0"/>')
             urdf_lines.append(f'      <mass value="{object_inertial["mass"]:.6f}"/>')
             urdf_lines.append(f'      <inertia {format_inertia(object_inertial["inertia"])}/>')
             urdf_lines.append('    </inertial>')
-            urdf_lines.append('    <visual>')
-            urdf_lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
-            urdf_lines.append('      <geometry>')
-            urdf_lines.append(f'        <mesh filename="meshes/visual/joint_{joint_id}_obj.{self.export_format}" scale="{self.mesh_scale} {self.mesh_scale} {self.mesh_scale}"/>')
-            urdf_lines.append('      </geometry>')
-            urdf_lines.append('    </visual>')
-            urdf_lines.append('    <collision>')
-            urdf_lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
-            urdf_lines.append('      <geometry>')
-            urdf_lines.append(f'        <mesh filename="meshes/collision/joint_{joint_id}_obj.{self.export_format}" scale="{self.mesh_scale} {self.mesh_scale} {self.mesh_scale}"/>')
-            urdf_lines.append('      </geometry>')
-            urdf_lines.append('    </collision>')
+
+            # Visual: ONLY object mesh (the moving part)
+            # Object mesh is already centered at pivot point (recentered in process_joint_meshes)
+            object_name = f"joint_{joint_id}_obj"
+            if mesh_exists(object_name, "visual"):
+                urdf_lines.append('    <visual name="object_visual">')
+                urdf_lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
+                urdf_lines.append('      <geometry>')
+                urdf_lines.append(f'        <mesh filename="meshes/visual/{object_name}.{self.export_format}" '
+                                f'scale="{self.mesh_scale} {self.mesh_scale} {self.mesh_scale}"/>')
+                urdf_lines.append('      </geometry>')
+                urdf_lines.append('    </visual>')
+            else:
+                print(f"  [Warning] Object visual mesh for joint {joint_id} not found")
+
+            # Collision: ONLY object mesh
+            if mesh_exists(object_name, "collision"):
+                urdf_lines.append('    <collision name="object_collision">')
+                urdf_lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
+                urdf_lines.append('      <geometry>')
+                urdf_lines.append(f'        <mesh filename="meshes/collision/{object_name}.{self.export_format}" '
+                                f'scale="{self.mesh_scale} {self.mesh_scale} {self.mesh_scale}"/>')
+                urdf_lines.append('      </geometry>')
+                urdf_lines.append('    </collision>')
+            
             urdf_lines.append('  </link>')
             urdf_lines.append('')
 
-            # Joint
-            urdf_lines.append(f'  <!-- Joint {joint_id} -->')
+            # Joint definition
+            urdf_lines.append(f'  <!-- Joint {joint_id} (connects moving part to base) -->')
             urdf_lines.append(f'  <joint name="joint_{joint_id}" type="{joint_type}">')
             urdf_lines.append('    <parent link="base_link"/>')
             urdf_lines.append(f'    <child link="joint_{joint_id}_link"/>')
@@ -499,20 +578,17 @@ class IsaacSimPreparer:
 
             limits = joint_info["limits"]
             urdf_lines.append(f'    <limit lower="{limits["min"]:.6f}" upper="{limits["max"]:.6f}" effort="100.0" velocity="1.0"/>')
-
-            # Add dynamics for better simulation
             urdf_lines.append('    <dynamics damping="0.1" friction="0.1"/>')
             urdf_lines.append('  </joint>')
             urdf_lines.append('')
 
         urdf_lines.append('</robot>')
+        return '\n'.join(urdf_lines)
 
-        urdf_content = '\n'.join(urdf_lines)
-        return urdf_content
 
     def save_urdf(self, urdf_content: str):
         """Save URDF file."""
-        urdf_path = self.output_dir / "robot.urdf"
+        urdf_path = self.output_dir / "kallax.urdf"
         urdf_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(urdf_path, 'w') as f:
