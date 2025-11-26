@@ -80,7 +80,7 @@ class URDFExporter:
     depth_trunc: float = 20.0
     """Maximum depth for TSDF integration."""
     
-    num_cameras: int = 20
+    num_cameras: int = 200
     """Number of cameras to use for mesh reconstruction."""
     
     background_only: bool = False
@@ -406,7 +406,7 @@ class URDFExporter:
             return self.canonical_angle
         
         joint_min, joint_max = model.joint_limits[0].item(), model.joint_limits[1].item()
-        return (joint_min + joint_max) / 2.0
+        return (joint_min + joint_max) / 3.0
 
     def get_object_angle(self, model: SplatfactoModel) -> float:
         """Get the object mesh joint angle (max of range by default)."""
@@ -423,13 +423,13 @@ class URDFExporter:
         Returns a dictionary containing:
         - joint_type: 'revolute' or 'prismatic'
         - joint_limits: [min, max] in radians or meters
-        - pivot_point: [x, y, z] (for revolute joints)
+        - pivot: [x, y, z] (for revolute joints)
         - joint_axis: [x, y, z] unit vector
         - num_joints: Number of articulated joints
         """
         metadata = {
             "joint_type": model.joint_type if hasattr(model, "joint_type") else "unknown",
-            "num_joints": 1,  # TODO: Support multi-joint models
+            "num_joints": 1, 
             "joints": []
         }
         
@@ -440,11 +440,12 @@ class URDFExporter:
         else:
             joint_min, joint_max = 0.0, 1.0
         
+
         # Extract pivot point and axis (for revolute joints)
-        if hasattr(model, "pivot_point"):
-            pivot_point = model.pivot_point.cpu().numpy().tolist()
+        if hasattr(model, "joint_pivot"):
+            pivot = model.joint_pivot.cpu().numpy().tolist()
         else:
-            pivot_point = [0.0, 0.0, 0.0]
+            pivot = [0.0, 0.0, 0.0]
         
         if hasattr(model, "joint_axis"):
             joint_axis = model.joint_axis.cpu().numpy().tolist()
@@ -464,7 +465,7 @@ class URDFExporter:
                 "max": joint_max,
                 "unit": "radians" if metadata["joint_type"] == "revolute" else "meters"
             },
-            "pivot_point": pivot_point,
+            "pivot_point": pivot,
             "axis": joint_axis,
             "canonical_angle": self.get_canonical_angle(model),
             "object_angle": self.get_object_angle(model),
@@ -489,7 +490,7 @@ class URDFExporter:
         
         if joint_type == "revolute":
             axis = " ".join(map(str, joint_info["axis"]))
-            origin_xyz = " ".join(map(str, joint_info["pivot_point"]))
+            origin_xyz = " ".join(map(str, joint_info["pivot"]))
             
             urdf = f"""<?xml version="1.0"?>
 <robot name="articulated_object">
@@ -538,7 +539,7 @@ class URDFExporter:
 """
         else:  # prismatic
             axis = " ".join(map(str, joint_info["axis"]))
-            origin_xyz = " ".join(map(str, joint_info["pivot_point"]))
+            origin_xyz = " ".join(map(str, joint_info["pivot"]))
             
             urdf = f"""<?xml version="1.0"?>
 <robot name="articulated_object">
@@ -615,17 +616,20 @@ class URDFExporter:
             CONSOLE.print("[yellow]  This may not be a joint-conditioned model![/yellow]")
         
         # Get cameras
-        cameras: Cameras = splatfacto_pipeline.datamanager.train_dataset.cameras
-        num_available = len(cameras)
-        
-        # Select camera indices for mesh reconstruction
-        if self.num_cameras >= num_available:
-            camera_indices = list(range(num_available))
-        else:
-            camera_indices = np.linspace(0, num_available - 1, self.num_cameras, dtype=int).tolist()
-        
-        CONSOLE.print(f"Using {len(camera_indices)} cameras out of {num_available} available")
-        
+        cameras_pre: Cameras = splatfacto_pipeline.datamanager.train_dataset.cameras
+        cameras_post: Cameras = pipeline.datamanager.train_dataset.cameras
+
+
+        num_available_pre = len(cameras_pre)
+        num_available_post = len(cameras_post)
+        self.num_cameras = min(self.num_cameras, num_available_pre, num_available_post)
+
+        camera_indices_pre = np.linspace(0, num_available_pre - 1, self.num_cameras, dtype=int).tolist()
+        camera_indices_post = np.linspace(0, num_available_post - 1, self.num_cameras, dtype=int).tolist()
+
+        CONSOLE.print(f"Using {len(camera_indices_pre)} pre cameras out of {num_available_pre}")
+        CONSOLE.print(f"Using {len(camera_indices_post)} post cameras out of {num_available_post}")
+
         # Extract joint metadata
         CONSOLE.print("\n[2/5] Extracting joint metadata...")
         metadata = self.extract_joint_metadata(model)
@@ -641,8 +645,11 @@ class URDFExporter:
         # Export background mesh
         CONSOLE.print("\n[3/5] Exporting background mesh...")
         if not self.background_only:
-            background_mesh = self.export_background_mesh(model, cameras, camera_indices)
+            background_mesh = self.export_background_mesh(model, cameras_pre, camera_indices_pre)
         
+
+            del background_mesh
+            torch.cuda.empty_cache()
         # Export joint meshes
         if not self.background_only:
             CONSOLE.print("\n[4/5] Exporting articulated joint meshes...")
@@ -650,7 +657,7 @@ class URDFExporter:
             
             for joint_id in range(num_joints):
                 canonical_mesh, object_mesh = self.export_joint_meshes(
-                    model, cameras, camera_indices, joint_id
+                    model, cameras_post, camera_indices_post, joint_id
                 )
         
         # Generate URDF
