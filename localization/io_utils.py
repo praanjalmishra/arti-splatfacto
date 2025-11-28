@@ -11,11 +11,6 @@ from typing import Dict, List, Tuple, Optional
 from hloc.utils.read_write_model import Camera, Image, Point3D, write_model, read_model
 from .pose_utils import arkit_to_colmap_pose, colmap_to_arkit_pose, matrix_to_qvec_tvec
 
-
-# ============================================================================
-# ARKit Transforms I/O
-# ============================================================================
-
 def load_arkit_transforms(transforms_path: Path) -> Dict:
     """
     Load ARKit transforms.json file.
@@ -58,6 +53,7 @@ def save_transforms(
         'h': camera_params['h'],
         'camera_angle_x': 2 * np.arctan(camera_params['w'] / (2 * camera_params['fl_x'])),
         'camera_angle_y': 2 * np.arctan(camera_params['h'] / (2 * camera_params['fl_y'])),
+        'ply_file_path': "fused_pc.ply",
         'frames': frames
     }
     
@@ -70,10 +66,6 @@ def save_transforms(
     
     print(f"✓ Saved transforms: {output_path}")
 
-
-# ============================================================================
-# COLMAP Model I/O
-# ============================================================================
 
 def arkit_to_colmap_model(
     arkit_data: Dict,
@@ -234,11 +226,6 @@ def colmap_model_to_transforms(
     
     return output_path
 
-
-# ============================================================================
-# Camera Intrinsics
-# ============================================================================
-
 def get_camera_intrinsics(arkit_data: Dict) -> Tuple[float, float, float, float, int, int]:
     """
     Extract camera intrinsics from ARKit transforms.
@@ -287,10 +274,6 @@ def create_pycolmap_camera(
         params=[fx, fy, cx, cy]
     )
 
-
-# ============================================================================
-# Utilities
-# ============================================================================
 
 def get_image_name_to_id(reconstruction: pycolmap.Reconstruction) -> Dict[str, int]:
     """
