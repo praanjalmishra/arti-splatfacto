@@ -105,7 +105,7 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
 
     ### opacity regularization
     use_opacity_regularization: bool = False
-    opacity_lambda_obj: float = 0.01
+    opacity_lambda_canonical: float = 0.001
     opacity_lambda_fixed: float = 0.01
 
     joint_correction_lambda: float = 0.01
@@ -644,8 +644,15 @@ class ArtiSplatfactoModel(SplatfactoModel):
             print(f"  First joint: partitioning from full scene")
             
             all_means = state_dict["gauss_params.means"].to(device)
-            obj_mask = self.obj_3d_seg.query_refine(
-                all_means, grow=6, thresh=0.01, bbox_margin=0.00
+            all_scales = torch.exp(state_dict["gauss_params.scales"].to(device)) 
+            obj_mask = self.obj_3d_seg.query_refine_ellipsoid(
+                all_means, 
+                scales=all_scales,  # Pass scale information
+                grow=4,             # Reduced from 6 since we have overlap_safety
+                thresh=0.01, 
+                bbox_margin=0.0,   # Small margin for safety
+                overlap_safety=0.0, # Buffer to reduce edge loss
+                adaptive_samples=True
             ).to(torch.bool).cpu()
             bg_mask = ~obj_mask
             
@@ -713,7 +720,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             bg_means_only = all_means[bg_start_idx:bg_end_idx]
             
             # Query mask on background only
-            obj_mask_in_bg = self.obj_3d_seg.query_refine(
+            obj_mask_in_bg = self.obj_3d_seg.query_refine_ellipsoid(
                 bg_means_only, grow=6, thresh=0.01, bbox_margin=0.0
             ).to(torch.bool).cpu()
             
@@ -779,64 +786,52 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
     def step_post_backward(self, step):
         """
-        Apply densification strategy only to the ACTIVE joint's object and canonical parameters,
-        relying on the prioritized render order.
+        Apply densification with controlled boosting for canonical Gaussians.
+        Let pruning happen naturally to maintain healthy Gaussian counts.
         """
         assert step == self.step
 
-        # === RECOVERY MODE: Skip all geometric refinement ===
         if self.config.training_mode == "recovery":
             if step % 500 == 0:
                 CONSOLE.print(f"[yellow]Step {step}: Recovery mode - skipping densification[/yellow]")
-                CONSOLE.print("  • Geometry frozen (no splits/clones/prunes)")
-                CONSOLE.print("  • Radiance optimization only")
-
-                # Debug: check if background is getting gradients
-                if hasattr(self, "gauss_params_fixed"):
-                    bg_features_grad = self.gauss_params_fixed["features_dc"].grad
-                    if bg_features_grad is not None:
-                        CONSOLE.print(f"  ✓ Background getting gradients: {bg_features_grad.norm():.6e}")
-                    else:
-                        CONSOLE.print("  [red]✗ Background NOT getting gradients![/red]")
             return
 
-        # === ARTICULATION MODE: Densification for ACTIVE Joint Only ===
         if not isinstance(self.strategy, DefaultStrategy):
             raise ValueError(f"Only DefaultStrategy supported, got {self.strategy}")
 
-        # --- Local vars ---
         n_active_obj = self.n_active_obj
         n_obj_total = self.n_obj_total
         n_active_canon = self.gauss_params_canonical["means"].shape[0]
-
-        # --- Helper: empty info dict ---
+        
         def create_empty_info_with_absgrad():
             empty_ids = torch.empty(0, dtype=torch.long, device=self.device)
             key = self.strategy.key_for_gradient
-            if hasattr(self, "combined_info") and self.combined_info and key in self.combined_info:
+            
+            if hasattr(self, 'combined_info') and self.combined_info and key in self.combined_info:
                 ref_tensor = self.combined_info[key]
-                empty_tensor = torch.empty((0,) + ref_tensor.shape[1:], device=self.device, dtype=ref_tensor.dtype)
+                empty_tensor = torch.empty((0,) + ref_tensor.shape[1:], 
+                                        device=self.device, dtype=ref_tensor.dtype)
             else:
                 empty_tensor = torch.empty((0, 2), device=self.device, dtype=torch.float32)
+            
             empty_tensor.absgrad = torch.empty_like(empty_tensor)
             return {"gaussian_ids": empty_ids, key: empty_tensor}
 
-        obj_info = create_empty_info_with_absgrad()
-        canon_info = create_empty_info_with_absgrad()
-
-        # --- Process combined info from last render ---
-        if hasattr(self, "combined_info") and self.combined_info and self.combined_info.get("gaussian_ids") is not None:
+        if not hasattr(self, "combined_info") or not self.combined_info or self.combined_info.get("gaussian_ids") is None:
+            obj_info = create_empty_info_with_absgrad()
+            canon_info = create_empty_info_with_absgrad()
+        else:
             visible_ids = self.combined_info["gaussian_ids"]
+            gradient_key = self.strategy.key_for_gradient
 
             # ===============================================================
-            # 1. ACTIVE OBJECT GAUSSIANS
+            # 1. OBJECT GAUSSIANS (NORMAL)
             # ===============================================================
             obj_mask = visible_ids < n_active_obj
             if obj_mask.any():
                 obj_visible_ids = visible_ids[obj_mask]
                 obj_info = {"gaussian_ids": obj_visible_ids}
 
-                # Copy matching tensors (and absgrad where available)
                 for k, v in self.combined_info.items():
                     if k == "gaussian_ids":
                         continue
@@ -847,22 +842,15 @@ class ArtiSplatfactoModel(SplatfactoModel):
                         obj_info[k] = obj_tensor
                     else:
                         obj_info[k] = v
-
-                # --- Inject required fields for gsplat ---
-                size_tensor_ref = obj_info["radii"] if "radii" in obj_info else obj_info[self.strategy.key_for_gradient]
-
-                if "width" not in obj_info:
-                    obj_info["width"] = torch.zeros_like(size_tensor_ref)
-                    obj_info["height"] = torch.zeros_like(size_tensor_ref)
-
-                if "n_cameras" not in obj_info:
-                    obj_info["n_cameras"] = torch.tensor(1, device=self.device)
+            else:
+                obj_info = create_empty_info_with_absgrad()
 
             # ===============================================================
-            # 2. ACTIVE CANONICAL GAUSSIANS
+            # 2. CANONICAL GAUSSIANS (MODERATE GRADIENT BOOST)
             # ===============================================================
             canon_start_id = n_obj_total
             canon_mask = (visible_ids >= canon_start_id) & (visible_ids < canon_start_id + n_active_canon)
+            
             if canon_mask.any():
                 canon_visible_ids = visible_ids[canon_mask] - canon_start_id
                 canon_info = {"gaussian_ids": canon_visible_ids}
@@ -872,32 +860,40 @@ class ArtiSplatfactoModel(SplatfactoModel):
                         continue
                     if isinstance(v, torch.Tensor) and v.shape[0] == len(visible_ids):
                         canon_tensor = v[canon_mask].contiguous()
+                        
+                        # Moderate gradient boost for densification
                         if hasattr(v, "absgrad") and v.absgrad is not None:
-                            canon_tensor.absgrad = v.absgrad[canon_mask].contiguous()
+                            canon_absgrad = v.absgrad[canon_mask].contiguous()
+                            # CANONICAL_GRAD_BOOST = 2.5
+                            # canon_absgrad = canon_absgrad * CANONICAL_GRAD_BOOST
+                            canon_tensor.absgrad = canon_absgrad
+                        
                         canon_info[k] = canon_tensor
                     else:
                         canon_info[k] = v
-
-                size_tensor_ref = canon_info["radii"] if "radii" in canon_info else canon_info[self.strategy.key_for_gradient]
-
-                if "width" not in canon_info:
-                    canon_info["width"] = torch.zeros_like(size_tensor_ref)
-                    canon_info["height"] = torch.zeros_like(size_tensor_ref)
-
-                if "n_cameras" not in canon_info:
-                    canon_info["n_cameras"] = torch.tensor(1, device=self.device)
+            else:
+                canon_info = create_empty_info_with_absgrad()
 
         # ===============================================================
-        # 3. APPLY STRATEGY TO ACTIVE JOINT'S PARAMETERS
+        # SAFETY CHECK
         # ===============================================================
-        obj_optimizers = {name.replace("obj_", ""): opt for name, opt in self.optimizers.items() if name.startswith("obj_")}
-        canon_optimizers = {name.replace("canon_", ""): opt for name, opt in self.optimizers.items() if name.startswith("canon_")}
+        gradient_key = self.strategy.key_for_gradient
+        
+        if gradient_key in obj_info and not hasattr(obj_info[gradient_key], 'absgrad'):
+            obj_info[gradient_key].absgrad = torch.empty_like(obj_info[gradient_key])
+        
+        if gradient_key in canon_info and not hasattr(canon_info[gradient_key], 'absgrad'):
+            canon_info[gradient_key].absgrad = torch.empty_like(canon_info[gradient_key])
 
-        active_id = self.config.active_joint_id
-
-        # --- Object densification ---
-        # print("obj_info keys:", list(obj_info.keys()))
+        # ===============================================================
+        # 3. APPLY STRATEGY TO OBJECT (NORMAL)
+        # ===============================================================
+        obj_optimizers = {name.replace("obj_", ""): opt 
+                        for name, opt in self.optimizers.items() 
+                        if name.startswith("obj_")}
+        
         n_obj_before = self.gauss_params["means"].shape[0]
+        
         if obj_info["gaussian_ids"].numel() > 0:
             self.strategy.step_post_backward(
                 params=self.gauss_params,
@@ -907,15 +903,20 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 info=obj_info,
                 packed=True,
             )
+        
         n_obj_after = self.gauss_params["means"].shape[0]
 
-        # --- Canonical densification ---
+        # ===============================================================
+        # 4. APPLY STRATEGY TO CANONICAL
+        # ===============================================================
+        canon_optimizers = {name.replace("canon_", ""): opt 
+                        for name, opt in self.optimizers.items() 
+                        if name.startswith("canon_")}
+        
         n_canon_before = self.gauss_params_canonical["means"].shape[0]
-        if not hasattr(self, "strategy_state_canonical"):
-            self.strategy_state_canonical = self.strategy.initialize_state(scene_scale=0.1)
-
+        
         if canon_info["gaussian_ids"].numel() > 0:
-            self.strategy.step_post_backward(
+            self.strategy_canonical.step_post_backward(
                 params=self.gauss_params_canonical,
                 optimizers=canon_optimizers,
                 state=self.strategy_state_canonical,
@@ -923,8 +924,25 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 info=canon_info,
                 packed=True,
             )
+        
         n_canon_after = self.gauss_params_canonical["means"].shape[0]
-
+        
+        # Enhanced logging
+        if step % 100 == 0:
+            CONSOLE.print(f"\n[cyan]Densification Summary (Step {step}):[/cyan]")
+            CONSOLE.print(f"  Object: {n_obj_before} → {n_obj_after} ({n_obj_after - n_obj_before:+d})")
+            CONSOLE.print(f"  Canon:  {n_canon_before} → {n_canon_after} ({n_canon_after - n_canon_before:+d})")
+            
+            # Debug canonical strategy state
+            if hasattr(self, 'strategy_state_canonical') and self.strategy_state_canonical.get("grad2d") is not None:
+                canon_grads = self.strategy_state_canonical["grad2d"]
+                canon_count = self.strategy_state_canonical["count"]
+                if len(canon_grads) > 0:
+                    avg_grads = canon_grads / canon_count.clamp_min(1)
+                    high_grad_count = (avg_grads > self.strategy_canonical.grow_grad2d).sum().item()
+                    CONSOLE.print(f"  Canon Strategy - High grad: {high_grad_count}/{len(avg_grads)} "
+                                f"(thresh: {self.strategy_canonical.grow_grad2d:.6f})")
+                    CONSOLE.print(f"  Canon Strategy - Avg grad: {avg_grads.mean():.6f}, Max: {avg_grads.max():.6f}")
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         """Route to appropriate loss function based on training mode"""
@@ -949,18 +967,34 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
         Ll1 = torch.abs(gt_img - pred_img).mean()
         simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
+
         if self.config.use_scale_regularization and self.step % 10 == 0:
-            scale_exp = torch.exp(self.scales)
-            scale_reg = (
-                torch.maximum(
-                    scale_exp.amax(dim=-1) / scale_exp.amin(dim=-1),
-                    torch.tensor(self.config.max_gauss_ratio),
-                )
-                - self.config.max_gauss_ratio
-            )
-            scale_reg = 0.1 * scale_reg.mean()
+            # Gather all geometry scales being used in recovery
+            scales_list = []
+
+            # Per-joint scales (geometry is frozen, but this collects correct tensors)
+            for joint_id in self.all_gauss_params_obj.keys():
+                scales_list.append(self.all_gauss_params_obj[joint_id]["scales"])
+                scales_list.append(self.all_gauss_params_canon[joint_id]["scales"])
+
+            # Background scales
+            if self.gauss_params_fixed["scales"].numel() > 0:
+                scales_list.append(self.gauss_params_fixed["scales"])
+
+            if scales_list:
+                scales = torch.cat(scales_list, dim=0)
+                scale_exp = torch.exp(scales)
+
+                # ratio of max/min eigenvalues
+                ratio = scale_exp.amax(dim=-1) / (scale_exp.amin(dim=-1) + 1e-9)
+                excess = torch.clamp(ratio - self.config.max_gauss_ratio, min=0.0)
+
+                scale_reg = 0.1 * excess.mean()
+            else:
+                scale_reg = torch.tensor(0.0, device=self.device)
         else:
-            scale_reg = torch.tensor(0.0).to(self.device)
+            scale_reg = torch.tensor(0.0, device=self.device)
+
 
         loss_dict = {
             "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
@@ -1139,9 +1173,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             depth_loss = self.depth_loss_fn(depth_out_loss, depth_gt_loss, mask_loss)
             
             # Add warmup schedule
-            if self.step < 1000:
-                depth_weight = 0.0
-            elif self.step < 3000:
+            if self.step < 3000:
                 # Ramp from 0 to final weight
                 progress = (self.step - 1000) / 2000
                 depth_weight = progress * self.config.depth_lambda
@@ -1209,57 +1241,33 @@ class ArtiSplatfactoModel(SplatfactoModel):
             
             loss_dict["joint_regularization"] = total_joint_reg
     
-
-
         if self.config.use_opacity_regularization and self.training:
             
-            all_obj_opacities = []
-            all_fixed_opacities = []
+            # Only apply opacity regularization to CANONICAL gaussians
+            all_canonical_opacities = []
             active_id = self.config.active_joint_id
             
-            # --- 1. Collect Opacities from ALL Joints (Object & Canonical) ---
-            for joint_id in self.all_gauss_params_obj.keys():
+            # --- 1. Collect Opacities from Canonical Gaussians ---
+            for joint_id in self.all_gauss_params_canon.keys():
+                canon_params = self.all_gauss_params_canon[joint_id]
                 
-                # Check trainability for each joint parameter
-                # We assume that in Articulation mode, only the active joint's radiance is trainable, 
-                # OR, based on the recommended fix, all radiance is trainable.
-                # The crucial check is that the .data must flow if .grad exists.
-                
-                params = self.all_gauss_params_obj[joint_id]
-                
-                # Use .requires_grad on the opacities parameter itself to determine inclusion.
-                # This correctly includes previous joints if their radiance was unfrozen (Fix B).
-                if params["opacities"].requires_grad:
-                    all_obj_opacities.append(torch.sigmoid(params["opacities"]))
-                
-
-            # --- 2. Collect Opacities from Fixed (Background) Gaussians ---
-            if "opacities" in self.gauss_params_fixed and self.gauss_params_fixed["opacities"].requires_grad:
-                all_fixed_opacities.append(torch.sigmoid(self.gauss_params_fixed["opacities"]))
+                # Check if this canonical set requires gradients
+                if canon_params["opacities"].requires_grad:
+                    all_canonical_opacities.append(torch.sigmoid(canon_params["opacities"]))
             
+            # --- 2. Compute Loss for Canonical Gaussians ---
+            total_canonical_loss = torch.tensor(0.0, device=self.device)
             
-            # --- 3. Compute Loss for Each Group if data exists ---
-            
-            total_obj_loss = torch.tensor(0.0, device=self.device)
-            total_fixed_loss = torch.tensor(0.0, device=self.device)
-            
-            if all_obj_opacities:
-                obj_opacities = torch.cat(all_obj_opacities, dim=0)
-                total_obj_loss = opacity_loss(obj_opacities)
+            if all_canonical_opacities:
+                canonical_opacities = torch.cat(all_canonical_opacities, dim=0)
                 
-            # if all_canon_opacities:
-            #     canon_opacities = torch.cat(all_canon_opacities, dim=0)
-            #     total_canon_loss = opacity_loss(canon_opacities)
+                # Apply your opacity loss function
+                total_canonical_loss = opacity_loss(canonical_opacities)
                 
-            if all_fixed_opacities:
-                fixed_opacities = torch.cat(all_fixed_opacities, dim=0)
-                # Use obj lambda for consistency, or define a new fixed_lambda
-                total_fixed_loss = opacity_loss(fixed_opacities)
-
-
-            loss_dict["opacity_reg"] = (
-                self.config.opacity_lambda_obj * total_obj_loss +
-                self.config.opacity_lambda_fixed * total_fixed_loss
+            
+            # Add to loss dict with canonical-specific weight
+            loss_dict["opacity_reg_canonical"] = (
+                self.config.opacity_lambda_canonical * total_canonical_loss
             )
 
 
@@ -2056,269 +2064,283 @@ class ArtiSplatfactoModel(SplatfactoModel):
                     }
                     metrics_dict.update(depth_metrics)
 
-        # === Gaussian Scale Metrics ===
-        with torch.no_grad():
-            if hasattr(self, 'scales'):
-                metrics_dict["avg_min_scale"] = float(torch.nanmean(torch.exp(self.scales[..., -1])))
-                metrics_dict["avg_max_scale"] = float(torch.nanmean(torch.exp(self.scales[..., 0])))
-                metrics_dict["avg_scale_ratio"] = float(
-                    torch.nanmean(torch.exp(self.scales[..., 0]) / (torch.exp(self.scales[..., -1]) + 1e-8))
-                )
+        # # === Gaussian Scale Metrics ===
+        # with torch.no_grad():
+        #     if hasattr(self, 'scales'):
+        #         metrics_dict["avg_min_scale"] = float(torch.nanmean(torch.exp(self.scales[..., -1])))
+        #         metrics_dict["avg_max_scale"] = float(torch.nanmean(torch.exp(self.scales[..., 0])))
+        #         metrics_dict["avg_scale_ratio"] = float(
+        #             torch.nanmean(torch.exp(self.scales[..., 0]) / (torch.exp(self.scales[..., -1]) + 1e-8))
+        #         )
 
-        if hasattr(self, "joint_angles") and self.joint_angles is not None:
-            with torch.no_grad():
-                # Joint angle statistics
-                mean_angle = self.joint_angles.mean().item()
-                std_angle = self.joint_angles.std().item()
-                min_angle = self.joint_angles.min().item()
-                max_angle = self.joint_angles.max().item()
-                angle_range = max_angle - min_angle
+        
+        # with torch.no_grad():
+        #     def log_scale_metrics(scales, prefix):
+        #         real_scales = torch.exp(scales)
+        #         smin = real_scales.min(dim=-1)[0]
+        #         smax = real_scales.max(dim=-1)[0]
+        #         metrics_dict[f"{prefix}_avg_min_scale"] = float(smin.mean())
+        #         metrics_dict[f"{prefix}_avg_max_scale"] = float(smax.mean())
+        #         metrics_dict[f"{prefix}_avg_scale_ratio"] = float((smax / (smin + 1e-8)).mean())
+
+        #     log_scale_metrics(self.gauss_params["scales"], "obj")
+        #     log_scale_metrics(self.gauss_params_canonical["scales"], "canon")
+
+
+        # if hasattr(self, "joint_angles") and self.joint_angles is not None:
+        #     with torch.no_grad():
+        #         # Joint angle statistics
+        #         mean_angle = self.joint_angles.mean().item()
+        #         std_angle = self.joint_angles.std().item()
+        #         min_angle = self.joint_angles.min().item()
+        #         max_angle = self.joint_angles.max().item()
+        #         angle_range = max_angle - min_angle
                 
-                metrics_dict.update({
-                    "joint/angle_mean": mean_angle,
-                    "joint/angle_std": std_angle,
-                    "joint/angle_min": min_angle,
-                    "joint/angle_max": max_angle,
-                    "joint/angle_range": angle_range,
-                    "joint/angle_range_degrees": angle_range * 180 / 3.14159,
-                })
+        #         metrics_dict.update({
+        #             "joint/angle_mean": mean_angle,
+        #             "joint/angle_std": std_angle,
+        #             "joint/angle_min": min_angle,
+        #             "joint/angle_max": max_angle,
+        #             "joint/angle_range": angle_range,
+        #             "joint/angle_range_degrees": angle_range * 180 / 3.14159,
+        #         })
                 
-                # NEW: Range parameter tracking (replaces min/max params)
-                if hasattr(self, 'angle_range_log'):
-                    learned_range = torch.exp(self.angle_range_log).item()
-                    metrics_dict["joint/learned_range"] = float(learned_range)
-                    metrics_dict["joint/learned_range_degrees"] = float(learned_range * 180 / 3.14159)
+        #         # NEW: Range parameter tracking (replaces min/max params)
+        #         if hasattr(self, 'angle_range_log'):
+        #             learned_range = torch.exp(self.angle_range_log).item()
+        #             metrics_dict["joint/learned_range"] = float(learned_range)
+        #             metrics_dict["joint/learned_range_degrees"] = float(learned_range * 180 / 3.14159)
                     
-                    # Compare learned range to observed range
-                    range_utilization = angle_range / (learned_range + 1e-8)
-                    metrics_dict["joint/range_utilization"] = float(range_utilization)
+        #             # Compare learned range to observed range
+        #             range_utilization = angle_range / (learned_range + 1e-8)
+        #             metrics_dict["joint/range_utilization"] = float(range_utilization)
                 
-                # NEW: First frame tracking (anchor point)
-                first_frame_angle = self.joint_angles[0].item()
-                metrics_dict["joint/first_frame_angle"] = float(first_frame_angle)
-                metrics_dict["joint/first_frame_angle_degrees"] = float(first_frame_angle * 180 / 3.14159)
+        #         # NEW: First frame tracking (anchor point)
+        #         first_frame_angle = self.joint_angles[0].item()
+        #         metrics_dict["joint/first_frame_angle"] = float(first_frame_angle)
+        #         metrics_dict["joint/first_frame_angle_degrees"] = float(first_frame_angle * 180 / 3.14159)
                 
-                # Derived limits from properties
-                joint_limits = self.joint_limits
-                metrics_dict["joint/derived_min"] = float(joint_limits[0].item())
-                metrics_dict["joint/derived_max"] = float(joint_limits[1].item())
-                metrics_dict["joint/derived_min_degrees"] = float(joint_limits[0].item() * 180 / 3.14159)
-                metrics_dict["joint/derived_max_degrees"] = float(joint_limits[1].item() * 180 / 3.14159)
+        #         # Derived limits from properties
+        #         joint_limits = self.joint_limits
+        #         metrics_dict["joint/derived_min"] = float(joint_limits[0].item())
+        #         metrics_dict["joint/derived_max"] = float(joint_limits[1].item())
+        #         metrics_dict["joint/derived_min_degrees"] = float(joint_limits[0].item() * 180 / 3.14159)
+        #         metrics_dict["joint/derived_max_degrees"] = float(joint_limits[1].item() * 180 / 3.14159)
                 
-                # Pivot tracking with enhanced metrics
-                if hasattr(self, 'joint_pivot'):
-                    pivot = self.joint_pivot
-                    metrics_dict.update({
-                        "joint/pivot_x": float(pivot[0].item()),
-                        "joint/pivot_y": float(pivot[1].item()),
-                        "joint/pivot_z": float(pivot[2].item()),
-                        "joint/pivot_norm": float(pivot.norm().item()),
-                    })
+        #         # Pivot tracking with enhanced metrics
+        #         if hasattr(self, 'joint_pivot'):
+        #             pivot = self.joint_pivot
+        #             metrics_dict.update({
+        #                 "joint/pivot_x": float(pivot[0].item()),
+        #                 "joint/pivot_y": float(pivot[1].item()),
+        #                 "joint/pivot_z": float(pivot[2].item()),
+        #                 "joint/pivot_norm": float(pivot.norm().item()),
+        #             })
                     
-                    # Pivot drift from initialization
-                    active_id = self.config.active_joint_id
-                    initial_pivot_attr = f'initial_joint_pivot_{active_id}'
-                    if hasattr(self, initial_pivot_attr):
-                        initial_pivot = getattr(self, initial_pivot_attr)
-                        pivot_diff = pivot - initial_pivot
-                        pivot_drift = pivot_diff.norm().item()
+        #             # Pivot drift from initialization
+        #             active_id = self.config.active_joint_id
+        #             initial_pivot_attr = f'initial_joint_pivot_{active_id}'
+        #             if hasattr(self, initial_pivot_attr):
+        #                 initial_pivot = getattr(self, initial_pivot_attr)
+        #                 pivot_diff = pivot - initial_pivot
+        #                 pivot_drift = pivot_diff.norm().item()
                         
-                        metrics_dict.update({
-                            "joint/pivot_drift": float(pivot_drift),
-                            "joint/pivot_drift_x": float(pivot_diff[0].item()),
-                            "joint/pivot_drift_y": float(pivot_diff[1].item()),
-                            "joint/pivot_drift_z": float(pivot_diff[2].item()),
-                        })
+        #                 metrics_dict.update({
+        #                     "joint/pivot_drift": float(pivot_drift),
+        #                     "joint/pivot_drift_x": float(pivot_diff[0].item()),
+        #                     "joint/pivot_drift_y": float(pivot_diff[1].item()),
+        #                     "joint/pivot_drift_z": float(pivot_diff[2].item()),
+        #                 })
                         
-                        # Log if drift is significant
-                        if pivot_drift > 0.01 and self.step % 1000 == 0:
-                            print(f"[Pivot Drift - Step {self.step}] "
-                                f"Total: {pivot_drift:.4f}m, "
-                                f"ΔX: {pivot_diff[0].item():.4f}, "
-                                f"ΔY: {pivot_diff[1].item():.4f}, "
-                                f"ΔZ: {pivot_diff[2].item():.4f}")
+        #                 # Log if drift is significant
+        #                 if pivot_drift > 0.01 and self.step % 1000 == 0:
+        #                     print(f"[Pivot Drift - Step {self.step}] "
+        #                         f"Total: {pivot_drift:.4f}m, "
+        #                         f"ΔX: {pivot_diff[0].item():.4f}, "
+        #                         f"ΔY: {pivot_diff[1].item():.4f}, "
+        #                         f"ΔZ: {pivot_diff[2].item():.4f}")
                 
-                # Axis tracking with enhanced metrics
-                if hasattr(self, 'joint_axis'):
-                    axis = self.joint_axis
-                    axis_norm = axis.norm().item()
+        #         # Axis tracking with enhanced metrics
+        #         if hasattr(self, 'joint_axis'):
+        #             axis = self.joint_axis
+        #             axis_norm = axis.norm().item()
                     
-                    metrics_dict.update({
-                        "joint/axis_x": float(axis[0].item()),
-                        "joint/axis_y": float(axis[1].item()),
-                        "joint/axis_z": float(axis[2].item()),
-                        "joint/axis_norm": float(axis_norm),
-                    })
+        #             metrics_dict.update({
+        #                 "joint/axis_x": float(axis[0].item()),
+        #                 "joint/axis_y": float(axis[1].item()),
+        #                 "joint/axis_z": float(axis[2].item()),
+        #                 "joint/axis_norm": float(axis_norm),
+        #             })
                     
-                    # Axis drift from initial (assuming you have initial axis stored)
-                    active_id = self.config.active_joint_id
-                    # Compute initial axis from metadata
-                    initial_axis_raw = F.normalize(self.obj_3d_seg.joint_axis.to(self.device), dim=0)
+        #             # Axis drift from initial (assuming you have initial axis stored)
+        #             active_id = self.config.active_joint_id
+        #             # Compute initial axis from metadata
+        #             initial_axis_raw = F.normalize(self.obj_3d_seg.joint_axis.to(self.device), dim=0)
                     
-                    # Angle between current and initial axis (cosine similarity)
-                    axis_similarity = torch.dot(axis, initial_axis_raw).item()
-                    axis_angle_diff = torch.acos(torch.clamp(torch.tensor(axis_similarity), -1.0, 1.0)).item()
+        #             # Angle between current and initial axis (cosine similarity)
+        #             axis_similarity = torch.dot(axis, initial_axis_raw).item()
+        #             axis_angle_diff = torch.acos(torch.clamp(torch.tensor(axis_similarity), -1.0, 1.0)).item()
                     
-                    metrics_dict.update({
-                        "joint/axis_similarity": float(axis_similarity),
-                        "joint/axis_angle_diff_rad": float(axis_angle_diff),
-                        "joint/axis_angle_diff_deg": float(axis_angle_diff * 180 / 3.14159),
-                    })
+        #             metrics_dict.update({
+        #                 "joint/axis_similarity": float(axis_similarity),
+        #                 "joint/axis_angle_diff_rad": float(axis_angle_diff),
+        #                 "joint/axis_angle_diff_deg": float(axis_angle_diff * 180 / 3.14159),
+        #             })
                     
-                    # Warn if axis has drifted significantly
-                    if axis_angle_diff > 0.1 and self.step % 1000 == 0:  # > ~5.7 degrees
-                        print(f"[Axis Drift - Step {self.step}] "
-                            f"Angle diff: {axis_angle_diff * 180 / 3.14159:.1f}°, "
-                            f"Current: [{axis[0].item():.3f}, {axis[1].item():.3f}, {axis[2].item():.3f}], "
-                            f"Initial: [{initial_axis_raw[0].item():.3f}, {initial_axis_raw[1].item():.3f}, {initial_axis_raw[2].item():.3f}]")
+        #             # Warn if axis has drifted significantly
+        #             if axis_angle_diff > 0.1 and self.step % 1000 == 0:  # > ~5.7 degrees
+        #                 print(f"[Axis Drift - Step {self.step}] "
+        #                     f"Angle diff: {axis_angle_diff * 180 / 3.14159:.1f}°, "
+        #                     f"Current: [{axis[0].item():.3f}, {axis[1].item():.3f}, {axis[2].item():.3f}], "
+        #                     f"Initial: [{initial_axis_raw[0].item():.3f}, {initial_axis_raw[1].item():.3f}, {initial_axis_raw[2].item():.3f}]")
                     
-                    # Check if axis is properly normalized
-                    norm_error = abs(axis_norm - 1.0)
-                    metrics_dict["joint/axis_norm_error"] = float(norm_error)
-                    if norm_error > 0.01 and self.step % 1000 == 0:
-                        print(f"[Axis Normalization - Step {self.step}] Warning: norm={axis_norm:.6f} (should be 1.0)")
+        #             # Check if axis is properly normalized
+        #             norm_error = abs(axis_norm - 1.0)
+        #             metrics_dict["joint/axis_norm_error"] = float(norm_error)
+        #             if norm_error > 0.01 and self.step % 1000 == 0:
+        #                 print(f"[Axis Normalization - Step {self.step}] Warning: norm={axis_norm:.6f} (should be 1.0)")
                 
-                # Per-frame correction statistics
-                if hasattr(self, 'joint_angle_deltas'):
-                    deltas = self.joint_angle_deltas
-                    metrics_dict.update({
-                        "joint/delta_mean": float(deltas.mean().item()),
-                        "joint/delta_std": float(deltas.std().item()),
-                        "joint/delta_max": float(deltas.max().item()),
-                        "joint/delta_min": float(deltas.min().item()),
-                        "joint/delta_abs_max": float(deltas.abs().max().item()),
-                        "joint/delta_abs_mean": float(deltas.abs().mean().item()),
-                    })
+        #         # Per-frame correction statistics
+        #         if hasattr(self, 'joint_angle_deltas'):
+        #             deltas = self.joint_angle_deltas
+        #             metrics_dict.update({
+        #                 "joint/delta_mean": float(deltas.mean().item()),
+        #                 "joint/delta_std": float(deltas.std().item()),
+        #                 "joint/delta_max": float(deltas.max().item()),
+        #                 "joint/delta_min": float(deltas.min().item()),
+        #                 "joint/delta_abs_max": float(deltas.abs().max().item()),
+        #                 "joint/delta_abs_mean": float(deltas.abs().mean().item()),
+        #             })
                     
-                    # First frame delta (should be small since it anchors min_angle)
-                    first_delta = deltas[0].item()
-                    metrics_dict["joint/first_frame_delta"] = float(first_delta)
+        #             # First frame delta (should be small since it anchors min_angle)
+        #             first_delta = deltas[0].item()
+        #             metrics_dict["joint/first_frame_delta"] = float(first_delta)
                     
-                    if abs(first_delta) > 0.1 and self.step % 500 == 0:
-                        print(f"[First Frame Delta - Step {self.step}] "
-                            f"Warning: δ[0]={first_delta:.4f} (should be near 0 for stable anchoring)")
+        #             if abs(first_delta) > 0.1 and self.step % 500 == 0:
+        #                 print(f"[First Frame Delta - Step {self.step}] "
+        #                     f"Warning: δ[0]={first_delta:.4f} (should be near 0 for stable anchoring)")
                 
-                # Current frame info
-                if 'time' in batch:
-                    time_val = float(batch['time'])
-                    num_frames = len(self.joint_angles)
-                    frame_idx = int(time_val * (num_frames - 1))
-                    frame_idx = max(0, min(frame_idx, num_frames - 1))
+        #         # Current frame info
+        #         if 'time' in batch:
+        #             time_val = float(batch['time'])
+        #             num_frames = len(self.joint_angles)
+        #             frame_idx = int(time_val * (num_frames - 1))
+        #             frame_idx = max(0, min(frame_idx, num_frames - 1))
                     
-                    current_angle = self.joint_angles[frame_idx].item()
-                    metrics_dict.update({
-                        "joint/current_frame_idx": float(frame_idx),
-                        "joint/current_frame_time": float(time_val),
-                        "joint/current_frame_angle": float(current_angle),
-                        "joint/current_frame_angle_degrees": float(current_angle * 180 / 3.14159),
-                    })
+        #             current_angle = self.joint_angles[frame_idx].item()
+        #             metrics_dict.update({
+        #                 "joint/current_frame_idx": float(frame_idx),
+        #                 "joint/current_frame_time": float(time_val),
+        #                 "joint/current_frame_angle": float(current_angle),
+        #                 "joint/current_frame_angle_degrees": float(current_angle * 180 / 3.14159),
+        #             })
                     
-                    # Current frame's correction
-                    if hasattr(self, 'joint_angle_deltas'):
-                        current_delta = self.joint_angle_deltas[frame_idx].item()
-                        current_prior = self.joint_angles_prior[frame_idx].item()
-                        metrics_dict.update({
-                            "joint/current_frame_delta": float(current_delta),
-                            "joint/current_frame_prior": float(current_prior),
-                        })
+        #             # Current frame's correction
+        #             if hasattr(self, 'joint_angle_deltas'):
+        #                 current_delta = self.joint_angle_deltas[frame_idx].item()
+        #                 current_prior = self.joint_angles_prior[frame_idx].item()
+        #                 metrics_dict.update({
+        #                     "joint/current_frame_delta": float(current_delta),
+        #                     "joint/current_frame_prior": float(current_prior),
+        #                 })
 
-        # === Gradient Tracking for Pivot/Axis (every 100 steps) ===
-        if self.step % 100 == 0:
-            grad_metrics = {}
+        # # === Gradient Tracking for Pivot/Axis (every 100 steps) ===
+        # if self.step % 100 == 0:
+        #     grad_metrics = {}
             
-            # Joint parameter gradients
-            if hasattr(self, 'joint_pivot') and self.joint_pivot.grad is not None:
-                pivot_grad = self.joint_pivot.grad
-                grad_metrics["gradients/joint_pivot_norm"] = float(pivot_grad.norm().item())
-                grad_metrics["gradients/joint_pivot_mean"] = float(pivot_grad.abs().mean().item())
-                grad_metrics["gradients/joint_pivot_max"] = float(pivot_grad.abs().max().item())
-                grad_metrics["gradients/joint_pivot_x"] = float(pivot_grad[0].item())
-                grad_metrics["gradients/joint_pivot_y"] = float(pivot_grad[1].item())
-                grad_metrics["gradients/joint_pivot_z"] = float(pivot_grad[2].item())
+        #     # Joint parameter gradients
+        #     if hasattr(self, 'joint_pivot') and self.joint_pivot.grad is not None:
+        #         pivot_grad = self.joint_pivot.grad
+        #         grad_metrics["gradients/joint_pivot_norm"] = float(pivot_grad.norm().item())
+        #         grad_metrics["gradients/joint_pivot_mean"] = float(pivot_grad.abs().mean().item())
+        #         grad_metrics["gradients/joint_pivot_max"] = float(pivot_grad.abs().max().item())
+        #         grad_metrics["gradients/joint_pivot_x"] = float(pivot_grad[0].item())
+        #         grad_metrics["gradients/joint_pivot_y"] = float(pivot_grad[1].item())
+        #         grad_metrics["gradients/joint_pivot_z"] = float(pivot_grad[2].item())
                 
-                # Check if gradients are flowing
-                if pivot_grad.norm().item() < 1e-8:
-                    print(f"[Gradient Check - Step {self.step}] ⚠️  Pivot gradients near zero!")
-            else:
-                if hasattr(self, 'joint_pivot') and self.step % 500 == 0:
-                    print(f"[Gradient Check - Step {self.step}] ⚠️  No pivot gradients!")
+        #         # Check if gradients are flowing
+        #         if pivot_grad.norm().item() < 1e-8:
+        #             print(f"[Gradient Check - Step {self.step}] ⚠️  Pivot gradients near zero!")
+        #     else:
+        #         if hasattr(self, 'joint_pivot') and self.step % 500 == 0:
+        #             print(f"[Gradient Check - Step {self.step}] ⚠️  No pivot gradients!")
             
-            if hasattr(self, 'joint_axis_raw') and self.joint_axis_raw.grad is not None:
-                axis_grad = self.joint_axis_raw.grad
-                grad_metrics["gradients/joint_axis_norm"] = float(axis_grad.norm().item())
-                grad_metrics["gradients/joint_axis_mean"] = float(axis_grad.abs().mean().item())
-                grad_metrics["gradients/joint_axis_x"] = float(axis_grad[0].item())
-                grad_metrics["gradients/joint_axis_y"] = float(axis_grad[1].item())
-                grad_metrics["gradients/joint_axis_z"] = float(axis_grad[2].item())
+        #     if hasattr(self, 'joint_axis_raw') and self.joint_axis_raw.grad is not None:
+        #         axis_grad = self.joint_axis_raw.grad
+        #         grad_metrics["gradients/joint_axis_norm"] = float(axis_grad.norm().item())
+        #         grad_metrics["gradients/joint_axis_mean"] = float(axis_grad.abs().mean().item())
+        #         grad_metrics["gradients/joint_axis_x"] = float(axis_grad[0].item())
+        #         grad_metrics["gradients/joint_axis_y"] = float(axis_grad[1].item())
+        #         grad_metrics["gradients/joint_axis_z"] = float(axis_grad[2].item())
                 
-                if axis_grad.norm().item() < 1e-8:
-                    print(f"[Gradient Check - Step {self.step}] ⚠️  Axis gradients near zero!")
-            else:
-                if hasattr(self, 'joint_axis_raw') and self.step % 500 == 0:
-                    print(f"[Gradient Check - Step {self.step}] ⚠️  No axis gradients!")
+        #         if axis_grad.norm().item() < 1e-8:
+        #             print(f"[Gradient Check - Step {self.step}] ⚠️  Axis gradients near zero!")
+        #     else:
+        #         if hasattr(self, 'joint_axis_raw') and self.step % 500 == 0:
+        #             print(f"[Gradient Check - Step {self.step}] ⚠️  No axis gradients!")
             
-            if hasattr(self, 'angle_range_log') and self.angle_range_log.grad is not None:
-                range_grad = self.angle_range_log.grad
-                grad_metrics["gradients/range_log_value"] = float(range_grad.item())
-                grad_metrics["gradients/range_log_abs"] = float(abs(range_grad.item()))
+        #     if hasattr(self, 'angle_range_log') and self.angle_range_log.grad is not None:
+        #         range_grad = self.angle_range_log.grad
+        #         grad_metrics["gradients/range_log_value"] = float(range_grad.item())
+        #         grad_metrics["gradients/range_log_abs"] = float(abs(range_grad.item()))
                 
-                if abs(range_grad.item()) < 1e-8:
-                    print(f"[Gradient Check - Step {self.step}] ⚠️  Range gradients near zero!")
+        #         if abs(range_grad.item()) < 1e-8:
+        #             print(f"[Gradient Check - Step {self.step}] ⚠️  Range gradients near zero!")
             
-            if hasattr(self, 'joint_angle_deltas') and self.joint_angle_deltas.grad is not None:
-                delta_grad = self.joint_angle_deltas.grad
-                grad_metrics["gradients/delta_norm"] = float(delta_grad.norm().item())
-                grad_metrics["gradients/delta_mean"] = float(delta_grad.abs().mean().item())
-                grad_metrics["gradients/delta_max"] = float(delta_grad.abs().max().item())
+        #     if hasattr(self, 'joint_angle_deltas') and self.joint_angle_deltas.grad is not None:
+        #         delta_grad = self.joint_angle_deltas.grad
+        #         grad_metrics["gradients/delta_norm"] = float(delta_grad.norm().item())
+        #         grad_metrics["gradients/delta_mean"] = float(delta_grad.abs().mean().item())
+        #         grad_metrics["gradients/delta_max"] = float(delta_grad.abs().max().item())
                 
-                # Count frames with significant gradients
-                significant_grads = (delta_grad.abs() > 1e-8).sum().item()
-                grad_metrics["gradients/delta_frames_with_grad"] = float(significant_grads)
-                grad_metrics["gradients/delta_frames_grad_pct"] = float(significant_grads / len(delta_grad) * 100)
+        #         # Count frames with significant gradients
+        #         significant_grads = (delta_grad.abs() > 1e-8).sum().item()
+        #         grad_metrics["gradients/delta_frames_with_grad"] = float(significant_grads)
+        #         grad_metrics["gradients/delta_frames_grad_pct"] = float(significant_grads / len(delta_grad) * 100)
             
-            # Gaussian parameter gradients (for comparison)
-            if hasattr(self, 'gauss_params'):
-                if self.gauss_params['means'].grad is not None:
-                    grad_metrics["gradients/gauss_means_norm"] = float(
-                        self.gauss_params['means'].grad.norm().item()
-                    )
-                if self.gauss_params['opacities'].grad is not None:
-                    grad_metrics["gradients/gauss_opacities_norm"] = float(
-                        self.gauss_params['opacities'].grad.norm().item()
-                    )
+        #     # Gaussian parameter gradients (for comparison)
+        #     if hasattr(self, 'gauss_params'):
+        #         if self.gauss_params['means'].grad is not None:
+        #             grad_metrics["gradients/gauss_means_norm"] = float(
+        #                 self.gauss_params['means'].grad.norm().item()
+        #             )
+        #         if self.gauss_params['opacities'].grad is not None:
+        #             grad_metrics["gradients/gauss_opacities_norm"] = float(
+        #                 self.gauss_params['opacities'].grad.norm().item()
+        #             )
             
-            metrics_dict.update(grad_metrics)
-        # === Learning Rate Tracking (every 100 steps) ===
-        if self.step % 100 == 0 and hasattr(self, 'optimizers'):
-            lr_metrics = {}
-            for name, opt in self.optimizers.items():
-                if 'joint' in name:
-                    for i, param_group in enumerate(opt.param_groups):
-                        lr_key = f"learning_rates/{name}_group{i}" if len(opt.param_groups) > 1 else f"learning_rates/{name}"
-                        lr_metrics[lr_key] = float(param_group['lr'])
-            metrics_dict.update(lr_metrics)
+        #     metrics_dict.update(grad_metrics)
+        # # === Learning Rate Tracking (every 100 steps) ===
+        # if self.step % 100 == 0 and hasattr(self, 'optimizers'):
+        #     lr_metrics = {}
+        #     for name, opt in self.optimizers.items():
+        #         if 'joint' in name:
+        #             for i, param_group in enumerate(opt.param_groups):
+        #                 lr_key = f"learning_rates/{name}_group{i}" if len(opt.param_groups) > 1 else f"learning_rates/{name}"
+        #                 lr_metrics[lr_key] = float(param_group['lr'])
+        #     metrics_dict.update(lr_metrics)
 
-        # === Training Coverage Tracking ===
-        if hasattr(self, 'joint_t_values') and 'time' in batch:
-            # Track which frames have been trained
-            if not hasattr(self, '_trained_frames'):
-                self._trained_frames = set()
-                self._frame_visit_count = torch.zeros(len(self.joint_t_values), device=self.device)
+        # # === Training Coverage Tracking ===
+        # if hasattr(self, 'joint_t_values') and 'time' in batch:
+        #     # Track which frames have been trained
+        #     if not hasattr(self, '_trained_frames'):
+        #         self._trained_frames = set()
+        #         self._frame_visit_count = torch.zeros(len(self.joint_t_values), device=self.device)
             
-            time_val = float(batch['time'])
-            frame_idx = int(time_val * (len(self.joint_t_values) - 1))
-            self._trained_frames.add(frame_idx)
-            self._frame_visit_count[frame_idx] += 1
+        #     time_val = float(batch['time'])
+        #     frame_idx = int(time_val * (len(self.joint_t_values) - 1))
+        #     self._trained_frames.add(frame_idx)
+        #     self._frame_visit_count[frame_idx] += 1
             
-            if self.step % 100 == 0:
-                coverage_metrics = {
-                    "training/unique_frames_seen": float(len(self._trained_frames)),
-                    "training/coverage_pct": float(len(self._trained_frames) / len(self.joint_t_values) * 100),
-                    "training/avg_frame_visits": float(self._frame_visit_count.mean().item()),
-                    "training/min_frame_visits": float(self._frame_visit_count.min().item()),
-                    "training/max_frame_visits": float(self._frame_visit_count.max().item()),
-                }
-                metrics_dict.update(coverage_metrics)
+        #     if self.step % 100 == 0:
+        #         coverage_metrics = {
+        #             "training/unique_frames_seen": float(len(self._trained_frames)),
+        #             "training/coverage_pct": float(len(self._trained_frames) / len(self.joint_t_values) * 100),
+        #             "training/avg_frame_visits": float(self._frame_visit_count.mean().item()),
+        #             "training/min_frame_visits": float(self._frame_visit_count.min().item()),
+        #             "training/max_frame_visits": float(self._frame_visit_count.max().item()),
+        #         }
+                # metrics_dict.update(coverage_metrics)
 
         return metrics_dict
 
