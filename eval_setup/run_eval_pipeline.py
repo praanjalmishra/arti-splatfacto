@@ -22,9 +22,7 @@ def run_pipeline_batch(eval_config_path, eval_data_root):
 
     results = []
     eval_data_root = Path(eval_data_root)
-    project_root = Path(__file__).resolve().parent.parent
-    script_path = project_root / "arti_pipeline_sim.sh"
-        
+    
     for obj in config['datasets']['partnet_objects']:
         object_id = obj['object_id']
         category = obj['category']
@@ -55,19 +53,15 @@ def run_pipeline_batch(eval_config_path, eval_data_root):
         
         try:
             # Run pipeline - skip rendering since data already exists
-            subprocess.run(
-                [
-                    str(script_path),
-                    str(data_dir),
-                    '0',
-                    'true',
-                    'false',
-                    change_cfg_path,
-                ],
-                check=True,
-                cwd=str(project_root)    # ← IMPORTANT
-            )
-
+            subprocess.run([
+                './arti_pipeline_sim.sh',
+                str(data_dir),   
+                '0',
+                'true',
+                'false',
+                change_cfg_path
+            ], check=True, cwd='./')
+            
             end_time = time.time()
             runtime = end_time - start_time
             
@@ -110,8 +104,8 @@ def run_pipeline_batch(eval_config_path, eval_data_root):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--eval_config', default='configs/eval_config.yaml')
-    parser.add_argument('--eval_data_root', required=True) 
+    parser.add_argument('--eval_config', default='eval_setup/configs/eval_config.yaml')
+    parser.add_argument('--eval_data_root', default='eval_renders') 
     args = parser.parse_args()
     
     run_pipeline_batch(args.eval_config, args.eval_data_root)

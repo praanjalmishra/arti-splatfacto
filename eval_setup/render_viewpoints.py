@@ -20,7 +20,7 @@ from scipy.spatial.transform import Rotation as R
 from tqdm import tqdm
 import argparse
 import subprocess
-
+from mesh_utils import parse_partid_to_objs, merge_meshs
 
 def spherical2cartesian(radius: float, theta: float, phi: float) -> np.ndarray:
     """Convert spherical coordinates to cartesian."""
@@ -128,14 +128,15 @@ def init_scene(ray_tracing: bool = False) -> sapien.Scene:
     scene = engine.create_scene()
     scene.set_timestep(1 / 100.0)
     
-    # Good lighting for 3DGS training
-    scene.set_ambient_light([0.4, 0.4, 0.4])
-    scene.add_directional_light([0, 1, -1], [0.6, 0.6, 0.6], shadow=True)
-    scene.add_point_light([2, 2, 2], [0.8, 0.8, 0.8], shadow=True)
-    scene.add_point_light([2, -2, 2], [0.8, 0.8, 0.8], shadow=True)
-    scene.add_point_light([-2, 0, 2], [0.8, 0.8, 0.8], shadow=True)
+    scene.set_ambient_light([0.5, 0.5, 0.5])  # Slightly brighter for isolated objects
     
-    # ADD GROUND WITH TEXTURE
+    # Disable shadows for cleaner background
+    scene.add_directional_light([0, 1, -1], [0.6, 0.6, 0.6], shadow=False)
+    scene.add_point_light([2, 2, 2], [0.8, 0.8, 0.8], shadow=False)
+    scene.add_point_light([2, -2, 2], [0.8, 0.8, 0.8], shadow=False)
+    scene.add_point_light([-2, 0, 2], [0.8, 0.8, 0.8], shadow=False)
+    
+
     ground_material = renderer.create_material()
     ground_material.base_color = np.array([202, 164, 114, 256]) / 256
     ground_material.specular = 0.5
@@ -170,10 +171,10 @@ def generate_dense_viewpoints(object_center: np.ndarray, object_radius: float) -
     viewpoints = []
     
     # Multiple camera distances for better coverage
-    distances = [3.0 * object_radius, 4.0 * object_radius, 5.0 * object_radius]
+    distances = [3.0 * object_radius, 4.0 * object_radius, 6.0 * object_radius]
     
     # Dense angular sampling
-    phi_angles = np.linspace(np.deg2rad(15), np.deg2rad(90), 6)  # 6 elevation levels
+    phi_angles = np.linspace(np.deg2rad(10), np.deg2rad(80), 6)  # 6 elevation levels
     
     for distance in distances:
         for phi in phi_angles:
@@ -387,8 +388,6 @@ def render_static_canonical_state(obj_urdf_path: str, output_dir: Path, object_c
     print(f"✅ Static canonical state rendered: {len(viewpoints)} views")
     scene = None  # Clean up
     return transforms_data
-
-
 def render_articulation_sequence(
     obj_urdf_path: str,
     output_dir: Path,
@@ -401,6 +400,9 @@ def render_articulation_sequence(
     joint_axis_dir: np.ndarray = None,
     bb_min: np.ndarray = None,
 ):
+    """
+    Simple articulation rendering focused on good viewpoint capture.
+    """
     import json
     import numpy as np
     from pathlib import Path
@@ -409,6 +411,7 @@ def render_articulation_sequence(
 
     scene = init_scene(ray_tracing=False)
 
+    # Load and position object
     loader = scene.create_urdf_loader()
     loader.fix_root_link = True
     articulate_obj = loader.load(obj_urdf_path)
@@ -419,12 +422,9 @@ def render_articulation_sequence(
     articulate_obj.set_pose(sapien.Pose([0, 0, aabb_lift]))
 
     camera = create_camera(scene, 640, 480, np.deg2rad(35), "dynamic_camera")
-
-    # ------------------------------------------------------------------------
-    # JOINT MOTION SETUP (moved earlier)
-    # ------------------------------------------------------------------------
+    
+    # Joint setup
     joint_limits = articulate_obj.get_qlimits()
-    print(f"Joint limits for joint {joint_id}: {joint_limits[joint_id]}")
     start_pos, end_pos = joint_limits[joint_id]
     joint_positions = np.linspace(start_pos, end_pos, n_frames)
 
@@ -436,122 +436,119 @@ def render_articulation_sequence(
     child_link = control_joint.get_child_link()
     movable_actor_ids = [child_link.get_id()]
 
-    # ------------------------------------------------------------------------
-    # CAMERA ARC SETUP - ROBUST FOR HINGE & SLIDER
-    # ------------------------------------------------------------------------
-
-    # Adjust joint axis origin for object lift
-    axis_origin_adjusted = joint_axis_origin + np.array([0, 0, aabb_lift])
-    axis_dir = np.array(joint_axis_dir, float)
-    axis_dir /= np.linalg.norm(axis_dir)
-
-    # Find perpendicular direction for camera placement
-    if abs(axis_dir[2]) < 0.9:  # Not vertical
-        perp_dir = np.cross(axis_dir, np.array([0, 0, 1]))
-    else:  # Nearly vertical - use horizontal plane
-        perp_dir = np.cross(axis_dir, np.array([1, 0, 0]))
-    perp_dir /= np.linalg.norm(perp_dir)
-
-    # FOR REVOLUTE: Determine if articulation opens toward or away from perp_dir
-    if joint_type.lower() in ["hinge", "revolute"]:
-        # Get the vector from joint origin to child link center
-        qpos_mid = joint_limits[:, 0].copy()
-        qpos_mid[joint_id] = (start_pos + end_pos) / 2
-        articulate_obj.set_qpos(qpos_mid)
-        scene.step()
-        
-        child_com = child_link.get_pose().p
-        print(f"Child link COM at mid position: {child_com}")
-        joint_to_child = child_com - axis_origin_adjusted
-        
-        # Project onto plane perpendicular to joint axis
-        joint_to_child_proj = joint_to_child - np.dot(joint_to_child, axis_dir) * axis_dir
-        joint_to_child_proj /= np.linalg.norm(joint_to_child_proj)
-        
-        if np.dot(joint_to_child_proj, perp_dir) < 0:
-            perp_dir = -perp_dir
-            print("  Flipped camera view: articulation opens toward camera")
-        else:
-            print("  Camera view: articulation already opens toward camera")
-        
-        # Reset
-        articulate_obj.set_qpos(joint_limits[:, 0])
-        scene.step()
-
-    # Camera distance: 3.5x radius ensures full object visibility
+    # ================================================================
+    # SIMPLE VIEWPOINT SETUP - LOOK AT MOTION MIDPOINT
+    # ================================================================
     
-
-    # Elevation angle: 25 degrees above horizontal for good view
-    elevation_angle = np.deg2rad(25)
-
-    # Camera arc: smoothly rotate around joint axis
-    arc_angles = np.linspace(np.deg2rad(60), np.deg2rad(5), n_frames)
-
-    # Look-at point
-    if joint_type.lower() in ["slider", "prismatic"]:
-        cam_distance = max(2.5, 1.5 * object_radius)
-        mid_displacement = (start_pos + end_pos) / 2
-        look_at = axis_origin_adjusted + axis_dir * mid_displacement
-    else:  # revolute/hinge
-        cam_distance = max(2.5, 4.0 * object_radius)
-        look_at = 0.7 * child_com + 0.3 * axis_origin_adjusted
-
+    # Calculate midpoint of articulation motion for better framing
+    mid_joint_pos = (start_pos + end_pos) / 2
+    
+    # Set joint to midpoint to get center of motion range
+    qpos_mid = joint_limits[:, 0].copy()
+    qpos_mid[joint_id] = mid_joint_pos
+    articulate_obj.set_qpos(qpos_mid)
+    scene.step()
+    
+    # Get child link position at motion midpoint
+    child_mid_pos = child_link.get_pose().p
+    
+    # For revolute joints: calculate center between start and end positions
+    if joint_type.lower() in ["hinge", "revolute"]:
+        # Get child positions at start and end of rotation
+        qpos_start = joint_limits[:, 0].copy()
+        qpos_start[joint_id] = start_pos
+        articulate_obj.set_qpos(qpos_start)
+        scene.step()
+        child_start_pos = child_link.get_pose().p
+        
+        qpos_end = joint_limits[:, 0].copy()
+        qpos_end[joint_id] = end_pos
+        articulate_obj.set_qpos(qpos_end)
+        scene.step()
+        child_end_pos = child_link.get_pose().p
+        
+        # Look at center of motion arc
+        look_at_point = (child_start_pos + child_end_pos) / 2
+        print(f"Revolute joint - looking at motion arc center")
+        
+    else:  # Prismatic/slider
+        # For linear motion, midpoint is the best look-at
+        look_at_point = child_mid_pos
+        print(f"Prismatic joint - looking at motion midpoint")
+    
+    # Camera distance - closer but not too close
+    camera_distance = max(2.5, 3.5 * object_radius)
+    
+    # Simple viewpoint pattern: orbit around motion center at fixed elevation
+    elevation = np.deg2rad(30)  # Fixed 30-degree elevation
+    
     print(f"Camera setup:")
-    print(f"  Distance: {cam_distance:.2f}")
-    print(f"  Look-at: {look_at}")
+    print(f"  Look-at point (motion center): {look_at_point}")
+    print(f"  Joint axis origin: {joint_axis_origin + np.array([0, 0, aabb_lift])}")
+    print(f"  Camera distance: {camera_distance:.2f}")
+    print(f"  Elevation: 25°")
+    print(f"  Arc: ±15° in front (30° total)")
+    
+    # Reset to initial position for rendering loop
+    articulate_obj.set_qpos(joint_limits[:, 0])
+    scene.step()
 
+    # Create output directories
     frames_dir = output_dir / "post" / "frames"
     depth_dir = output_dir / "post" / "depth"
     mask_dir = output_dir / "post" / "mask_gt"
-
     for d in [frames_dir, depth_dir, mask_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------------
-    # RENDER LOOP
-    # ------------------------------------------------------------------------
+    # ================================================================
+    # SIMPLE RENDER LOOP - SMALL ARC IN FRONT
+    # ================================================================
+    
     frames = []
 
-    for idx, (q, angle) in enumerate(zip(joint_positions, arc_angles)):
+    # Small arc parameters
+    arc_center = np.deg2rad(180)  # Front view (180° - looking AT object, not away)
+    arc_width = np.deg2rad(30)    # ±15° arc (30° total)
+    
+    for idx, q in enumerate(tqdm(joint_positions, desc="Rendering articulation")):
         frame_id = idx + 1
 
+        # Set joint position
         qpos = joint_limits[:, 0].copy()
         qpos[joint_id] = q
         articulate_obj.set_qpos(qpos)
-
-        # Compute camera position with smooth arc + elevation
-        # Rotate perpendicular direction around joint axis
-        Rmat = R.from_rotvec(axis_dir * angle).as_matrix()
-        horizontal_dir = Rmat @ perp_dir
-
-        # Elevation direction: perpendicular to both axis and horizontal view
-        elevation_dir = np.cross(axis_dir, horizontal_dir)
-        elevation_dir /= np.linalg.norm(elevation_dir)
-
-        # Apply distance and elevation
-        cam_offset_horiz = horizontal_dir * cam_distance * np.cos(elevation_angle)
-        cam_offset_elev = elevation_dir * cam_distance * np.sin(elevation_angle)
-
-        cam_pos = look_at + cam_offset_horiz + cam_offset_elev
-        
-        set_camera_pose(camera, cam_pos, look_at)
-
         scene.step()
+
+        # Small arc in front: smoothly vary azimuth across the arc
+        progress = idx / (n_frames - 1)  # 0 to 1
+        azimuth = arc_center + (progress - 0.5) * arc_width  # -15° to +15°
+        
+        # Calculate camera position around motion center
+        cam_x = look_at_point[0] + camera_distance * np.cos(elevation) * np.cos(azimuth)
+        cam_y = look_at_point[1] + camera_distance * np.cos(elevation) * np.sin(azimuth)
+        cam_z = look_at_point[2] + camera_distance * np.sin(elevation)
+        
+        cam_pos = np.array([cam_x, cam_y, cam_z])
+        
+        # Always look at motion center point
+        set_camera_pose(camera, cam_pos, look_at_point)
+
+        # Render
         scene.update_render()
         camera.take_picture()
 
-        # RGB
+        # Save RGB
         rgba = get_rgba_img(camera)[..., :3]
         rgb = Image.fromarray(rgba)
         rgb_path = frames_dir / f"frame_{frame_id:05d}.png"
         rgb.save(rgb_path)
 
-        # Depth
+        # Save depth
         depth = get_depth_img(camera)
         depth_path = depth_dir / f"depth_{frame_id:05d}.npy"
         np.save(depth_path, depth)
-
-        # Mask
+        
+        # Save mask
         try:
             seg_labels = camera.get_uint32_texture("Segmentation")
             actor_seg = seg_labels[..., 1]
@@ -564,24 +561,26 @@ def render_articulation_sequence(
         mask_path = mask_dir / f"mask_{frame_id:05d}.png"
         Image.fromarray(mask).save(mask_path)
 
-        # Save camera transform
+        # Save camera metadata
         cam_pose = camera.get_model_matrix().tolist()
+        frames.append({
+            "file_path": f"frames/{rgb_path.name}",
+            "depth_file_path": f"depth/{depth_path.name}",
+            "mask_file_path_gt": f"mask_gt/{mask_path.name}",
+            "transform_matrix": cam_pose,
+            "joint_angle_gt": float(q),
+        })
 
-        frames.append(
-            {
-                "file_path": f"frames/{rgb_path.name}",
-                "depth_file_path": f"depth/{depth_path.name}",
-                "mask_file_path_gt": f"mask_gt/{mask_path.name}",
-                "transform_matrix": cam_pose,
-                "joint_angle_gt": float(q),
-            }
-        )
-
-
+    # ================================================================
+    # SAVE METADATA
+    # ================================================================
+    
+    # Camera intrinsics
     intr = camera.get_intrinsic_matrix()
     fx, fy = float(intr[0, 0]), float(intr[1, 1])
     cx, cy = float(intr[0, 2]), float(intr[1, 2])
 
+    # Joint metadata
     if joint_type.lower() in ["hinge", "revolute"]:
         jt_type = "revolute"
         jlimits = [float(np.rad2deg(start_pos)), float(np.rad2deg(end_pos))]
@@ -592,14 +591,12 @@ def render_articulation_sequence(
         jt_type = joint_type.lower()
         jlimits = [float(start_pos), float(end_pos)]
 
-    articulations_gt = [
-        {
-            "joint_type_gt": jt_type,
-            "joint_axis_gt": joint_axis_dir.tolist() if joint_axis_dir is not None else [0, 0, 1],
-            "joint_pivot_gt": joint_axis_origin.tolist() if joint_axis_origin is not None else [0, 0, 0],
-            "joint_limits_gt": jlimits,
-        }
-    ]
+    articulations_gt = [{
+        "joint_type_gt": jt_type,
+        "joint_axis_gt": joint_axis_dir.tolist() if joint_axis_dir is not None else [0, 0, 1],
+        "joint_pivot_gt": joint_axis_origin.tolist() if joint_axis_origin is not None else [0, 0, 0],
+        "joint_limits_gt": jlimits,
+    }]
 
     transforms_data = {
         "camera_model": "PINHOLE",
@@ -621,6 +618,7 @@ def render_articulation_sequence(
     with open(json_path, "w") as f:
         json.dump(transforms_data, f, indent=2)
 
+    print(f"✅ Rendered {n_frames} frames with small arc in front of joint")
     scene = None
     return transforms_data
 
@@ -708,6 +706,70 @@ def estimate_object_bounds_and_joint_info(meta_path: Path, joint_id: int = 0):
     return object_center, object_radius, joint_axis_origin, joint_axis_dir, joint_type, bb_min, bb_max
 
 
+def extract_gt_meshes_from_objs(
+    shape_path: Path,
+    output_dir: Path,
+    joint_id: int = 0,
+    num_samples: int = 100000
+):
+    """
+    Extract GT meshes directly from textured_objs using mobility metadata.
+    """
+    import pyvista as pv
+    
+    # Parse which parts are moving
+    mobility_file = json.loads((shape_path / 'mobility_v2.json').read_text())
+    partid_to_objs = parse_partid_to_objs(shape_path)
+    
+    # Find moving parts
+    moving_objs = set()
+    static_objs = set()
+    
+    for part in mobility_file:
+        pid = part['id']
+        parent_id = part['parent']
+        
+        # Get obj files for this part
+        partids_in_result = [obj['id'] for obj in part["parts"]]
+        objs_for_part = set()
+        for partid in partids_in_result:
+            objs_for_part |= partid_to_objs[partid]
+        
+        # Check if this is a moving part (has non-fixed joint)
+        if parent_id != -1 and part.get('joint') not in ['fixed', 'junk']:
+            # Check if this is the joint we care about
+            if pid == joint_id or part.get('name') == f'link_{joint_id}':
+                moving_objs |= objs_for_part
+            else:
+                static_objs |= objs_for_part
+        else:
+            static_objs |= objs_for_part
+    
+    # Remove overlap
+    static_objs -= moving_objs
+    
+    gt_dir = output_dir / "gt_meshes"
+    gt_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Merge and save static parts
+    if static_objs:
+        static_paths = [shape_path / 'textured_objs' / (obj + '.obj') for obj in static_objs]
+        merge_meshs(static_paths, gt_dir / "static_parts.ply")
+        print(f"✅ Saved static parts: {len(static_objs)} obj files")
+    
+    # Merge and save moving parts
+    if moving_objs:
+        moving_paths = [shape_path / 'textured_objs' / (obj + '.obj') for obj in moving_objs]
+        merge_meshs(moving_paths, gt_dir / "moving_parts.ply")
+        print(f"✅ Saved moving parts: {len(moving_objs)} obj files")
+    
+    # Merge all for whole object
+    all_objs = static_objs | moving_objs
+    all_paths = [shape_path / 'textured_objs' / (obj + '.obj') for obj in all_objs]
+    merge_meshs(all_paths, gt_dir / "whole_object.ply")
+    print(f"✅ Saved whole object: {len(all_objs)} obj files")
+    
+    return gt_dir
 
 def create_videos(output_dir):
     """Create MP4 videos from rendered frames using FFmpeg"""
@@ -752,6 +814,7 @@ def create_videos(output_dir):
     make_video(post_frames, output_dir / "post_articulation.mp4", fps=15)  # Normal speed
     
     print(f"Videos saved to: {output_dir}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Enhanced PartNet rendering for 3DGS training")
@@ -850,6 +913,11 @@ def main():
         print(f"   Axis direction: {joint_axis_dir}")
         print(f"   Radius: {object_radius:.3f}")
 
+
+        gt_meshes = extract_gt_meshes_from_objs(
+            partnet_dir, output_dir, args.joint_id
+        )
+
     else:
         if args.meta is None:
             raise ValueError("--meta must be provided when not in eval_mode")
@@ -873,9 +941,9 @@ def main():
     print(f"Estimated object radius: {object_radius}")
 
     # Step 1: Render static canonical state
-    static_data = render_static_canonical_state(
-        str(urdf_path), output_dir, object_center, object_radius, bb_min
-    )
+    # static_data = render_static_canonical_state(
+    #     str(urdf_path), output_dir, object_center, object_radius, bb_min
+    # )
 
     # Step 2: Render articulation sequence
     sequence_data = render_articulation_sequence(
@@ -891,7 +959,7 @@ def main():
         "joint_id": args.joint_id,
         "object_center": object_center.tolist(),
         "object_radius": object_radius,
-        "static_views": len(static_data),
+        # "static_views": len(static_data),
         "sequence_frames": len(sequence_data["frames"]),
         "urdf_path": str(urdf_path),
         "eval_mode": args.eval_mode,
@@ -901,6 +969,7 @@ def main():
         json.dump(metadata, f, indent=2)
 
     create_videos(output_dir)
+
 
 if __name__ == "__main__":
     main()
