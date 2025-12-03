@@ -1,0 +1,79 @@
+evaluation:
+  name: "TwinSplat_vs_Video2Articulation"
+  description: "Benchmark comparing TwinSplat and Video2Articulation on PartNet-Mobility"
+  output_renders: "eval_renders"
+  output_root: "eval_results"      
+  version: "2025-12-02"
+
+datasets:
+  partnet_objects:
+
+    # # ---------------- StorageFurniture ----------------
+    - {category: "StorageFurniture", object_id: "41510", joint_id: "joint_1_bg"}
+    - {category: "StorageFurniture", object_id: "45132", joint_id: "joint_2_bg"}
+    - {category: "StorageFurniture", object_id: "45146", joint_id: "joint_0_bg"}
+    - {category: "StorageFurniture", object_id: "44962", joint_id: "joint_2_bg"}
+    - {category: "StorageFurniture", object_id: "44781", joint_id: "joint_0_bg"}
+    - {category: "StorageFurniture", object_id: "44817", joint_id: "joint_1_bg"}
+    - {category: "StorageFurniture", object_id: "45001", joint_id: "joint_1_bg"}
+    - {category: "StorageFurniture", object_id: "40453", joint_id: "joint_1_bg"}
+    - {category: "StorageFurniture", object_id: "35059", joint_id: "joint_0_bg"}
+    - {category: "StorageFurniture", object_id: "41083", joint_id: "joint_3_bg"}
+
+    # # ---------------- Table ----------------
+    - {category: "Table", object_id: "23372", joint_id: "joint_1_bg"}
+    - {category: "Table", object_id: "22433", joint_id: "joint_1_bg"}
+    - {category: "Table", object_id: "22433", joint_id: "joint_0_bg"}
+    - {category: "Table", object_id: "22433", joint_id: "joint_0_bg"}
+    - {category: "Table", object_id: "22367", joint_id: "joint_2_bg"}
+    - {category: "Table", object_id: "22367", joint_id: "joint_0_bg"}
+    - {category: "Table", object_id: "19898", joint_id: "joint_4_bg"}
+    - {category: "Table", object_id: "19898", joint_id: "joint_1_bg"}
+    - {category: "Table", object_id: "19898", joint_id: "joint_3_bg"}
+    - {category: "Table", object_id: "26525", joint_id: "joint_0_bg"}
+    - {category: "Table", object_id: "19855", joint_id: "joint_0_bg"}
+    - {category: "Table", object_id: "20985", joint_id: "joint_1_bg"}
+    - {category: "Table", object_id: "26608", joint_id: "joint_0_bg"}
+    - {category: "Table", object_id: "23807", joint_id: "joint_1_bg"}
+    - {category: "Table", object_id: "26657", joint_id: "joint_1_bg"}
+    - {category: "Table", object_id: "22339", joint_id: "joint_0_bg"}
+    - {category: "Table", object_id: "22241", joint_id: "joint_0_bg"}
+    - {category: "Table", object_id: "20745", joint_id: "joint_0_bg"}
+    - {category: "Table", object_id: "19179", joint_id: "joint_1_bg"}
+    - {category: "Table", object_id: "27267", joint_id: "joint_0_bg"}
+    - {category: "Table", object_id: "23724", joint_id: "joint_2_bg"}
+    - {category: "Table", object_id: "23724", joint_id: "joint_0_bg"}
+
+
+
+rendering:
+  resolution: [640, 480]
+  n_frames_static: 100              # dense static viewpoints for 3DGS
+  n_frames_articulation: 150       # dynamic articulation sequence length
+  joint_motion_range: "full"       # could be "half", "quarter", etc.
+  ray_tracing: false               # optional: enable for quality, slower speed
+  skip_existing: true              # skip already rendered objects
+
+evaluation_metrics:
+  geometry: ["psnr", "ssim", "lpips"]
+  joint_estimation: ["angular_error", "axis_error", "translation_error"]
+  runtime: ["training_time", "inference_time"]
+
+models:
+  - name: "TwinSplat"
+    config: "configs/twinsplat.yaml"
+  - name: "Video2Articulation"
+    config: "configs/video2articulation.yaml"
+
+logging:
+  save_intermediate: true
+  verbose: true
+  seed: 42
+
+
+change_detection:
+  area_threshold: 0.01
+  cd_kernel_ratio: 0.1
+  depth_weight: 0.5
+  num_positive_points: 20
+  num_negative_points: 20

@@ -1,0 +1,8 @@
+## all comands from root
+
+- render dataset
+
+python eval_setup/batch_eval_render.py 
+
+
+- run eval setup
