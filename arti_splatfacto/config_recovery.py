@@ -30,12 +30,11 @@ arti_splatfacto_recovery_config = MethodSpecification(
             model=ArtiSplatfactoModelConfig(
                 training_mode="recovery", 
                 refine_every=50,  
-                stop_split_at=0,
+                stop_split_at=5000,
                 warmup_length=100,
-                use_scale_regularization=False,  
+                use_scale_regularization=True,  
                 output_depth_during_training=True,
                 use_depth=True,
-                depth_lambda=1.0,   
             )
         ),
         optimizers={
@@ -52,7 +51,7 @@ arti_splatfacto_recovery_config = MethodSpecification(
                 "scheduler": None,
             },
             "obj_features_dc": {
-                "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),  # Lower LR
+                "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),  # Lower LR
                 "scheduler": ExponentialDecaySchedulerConfig(
                     lr_final=0.0001,
                     max_steps=10000,
@@ -66,7 +65,7 @@ arti_splatfacto_recovery_config = MethodSpecification(
                 ),
             },
             "obj_opacities": {
-                "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),  # Lower LR
+                "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),  # Lower LR
                 "scheduler": None,
             },
             
@@ -110,7 +109,7 @@ arti_splatfacto_recovery_config = MethodSpecification(
                 "scheduler": None,
             },            
             "bg_features_dc": {
-                "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=0.0001, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(
                     lr_final=0.0001,
                     max_steps=10000,
@@ -124,7 +123,7 @@ arti_splatfacto_recovery_config = MethodSpecification(
                 ),
             },
             "bg_opacities": {
-                "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=0.005, eps=1e-15),
                 "scheduler": None,
             },
             

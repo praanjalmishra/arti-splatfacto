@@ -30,10 +30,10 @@ arti_splatfacto_config = MethodSpecification(
             model=ArtiSplatfactoModelConfig(
                 refine_every=100,              
                 cull_alpha_thresh=0.005,      # Less aggressive culling (was 0.005)
-                densify_grad_thresh=0.0005,   
+                densify_grad_thresh=0.0008,   
                 densify_size_thresh=0.01,    # Split smaller Gaussians (was 0.01)
                 split_screen_size=0.05,       # Larger screen size threshold (was 0.05)
-                warmup_length=500,            
+                warmup_length=1000,            
                 # stop_split_at=1800,         
                 reset_alpha_every=15,         # More frequent alpha reset (was 20)
                 use_scale_regularization=True,
@@ -112,51 +112,35 @@ arti_splatfacto_config = MethodSpecification(
                     lr_final=1e-4, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
                 ),
             },
-            #### joint param optimizer
             "joint_pivot": {
-                "optimizer": AdamOptimizerConfig(lr=0.0001, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=1e-6, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
+                    lr_final=5e-6, 
+                    max_steps=30000, 
+                    warmup_steps=1000, 
+                    lr_pre_warmup=0
                 ),
             },
             "joint_axis": {
-                "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
+                "optimizer": AdamOptimizerConfig(lr=5e-4, eps=1e-15),
                 "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=1e-6, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
+                    lr_final=5e-6, 
+                    max_steps=30000, 
+                    warmup_steps=1000, 
+                    lr_pre_warmup=0
                 ),
             },
-            "joint_angles": {
-                "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),
+            "joint_angles": {  
+                "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),  # More stable
                 "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=5e-3,      
+                    lr_final=5e-4,  # Lower final LR
                     max_steps=30000,
-                    warmup_steps=0,     
-                    lr_pre_warmup=0.01 
+                    warmup_steps=500,  # Longer warmup
+                    lr_pre_warmup=6e-5  # Start very small
                 ),
             },
-            "joint_corrections": {
-                "optimizer": AdamOptimizerConfig(lr=0.001, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=5e-3,      
-                    max_steps=30000,
-                    warmup_steps=0,     
-                    lr_pre_warmup=0.01 
-                ),
-            },
-            "max_joint_angle": {
-                "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=1e-5,
-                    max_steps=30000,
-                ),
-            },
-            "min_joint_angle": {
-                "optimizer": AdamOptimizerConfig(lr=1e-3, eps=1e-15),
-                "scheduler": ExponentialDecaySchedulerConfig(
-                    lr_final=1e-5,
-                    max_steps=30000,
-                ),
-            },
+
+
         },
             viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
             vis="viewer",
