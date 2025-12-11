@@ -150,13 +150,41 @@ class ScaleAndShiftInvariantLoss(nn.Module):
     
 
 class DepthLoss(nn.Module):
-    def __init__(self, alpha=0.5, scales=4):
+    def __init__(self, alpha=0.5, scales=4, use_scale_shift=True):
         super().__init__()
-        self.depth_loss = ScaleAndShiftInvariantLoss(alpha=alpha, scales=scales)
+        self.mse_loss = MSELoss(reduction='batch-based')
+        self.gradient_loss = GradientLoss(scales=scales, reduction='batch-based')
+        self.alpha = alpha
+        self.use_scale_shift = use_scale_shift
     
     def forward(self, depth, depth_gt, mask):
-        depth_loss = self.depth_loss(depth, depth_gt, mask)
-        return depth_loss
+        """
+        Args:
+            depth: [B, H, W] predicted depth
+            depth_gt: [B, H, W] ground truth depth
+            mask: [B, H, W] valid depth mask
+        """
+        # Ensure mask is valid
+        if mask.sum() == 0:
+            return torch.tensor(0.0, device=depth.device, requires_grad=True)
+        
+        if self.use_scale_shift:
+            # Compute optimal scale and shift to align predicted depth with GT
+            scale, shift = compute_scale_and_shift(depth, depth_gt, mask)
+            depth_aligned = scale.view(-1, 1, 1) * depth + shift.view(-1, 1, 1)
+        else:
+            depth_aligned = depth
+        
+        # MSE loss on aligned depth
+        total_loss = self.mse_loss(depth_aligned, depth_gt, mask)
+        
+        # Optional: Add gradient smoothness regularization
+        if self.alpha > 0:
+            grad_loss = self.gradient_loss(depth_aligned, depth_gt, mask)
+            total_loss += self.alpha * grad_loss
+        
+        return total_loss
+
 
 class depth_smoothness_reg(nn.Module):
     def __init__(self):
