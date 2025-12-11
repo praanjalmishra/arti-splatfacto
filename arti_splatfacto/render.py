@@ -14,6 +14,8 @@ import mediapy as media
 import numpy as np
 import torch
 import tyro
+import cv2
+import math
 from rich import box, style
 from rich.panel import Panel
 from rich.progress import (
@@ -50,6 +52,8 @@ def render_joint_conditioned_trajectory(
     depth_far_plane: Optional[float] = None,
     colormap_options: colormaps.ColormapOptions = colormaps.ColormapOptions(),
     fps: int = 30,
+    joint_min: Optional[float] = None,
+    joint_max: Optional[float] = None,
 ) -> None:
     """
     Render trajectory across multiple joint angles for articulated objects.
@@ -73,27 +77,24 @@ def render_joint_conditioned_trajectory(
     
     # Verify model is joint-conditioned and get joint parameters
     model = pipeline.model
-    
-    # Detect architecture type and extract joint parameters
+
+    # Detect Architecture
     if hasattr(model, 'all_joint_params') and model.all_joint_params:
-        # Multi-joint architecture (new)
+        # Multi-joint architecture
         active_joint_id = getattr(model.config, 'active_joint_id', None)
-        
         if active_joint_id is None:
-            # Inference mode - pick first available joint
             active_joint_id = sorted(model.all_joint_params.keys())[0]
             CONSOLE.print(f"[yellow]No active joint specified, using: {active_joint_id}[/yellow]")
-        
+
         if active_joint_id not in model.all_joint_params:
-            available = list(model.all_joint_params.keys())
             raise ValueError(
-                f"Joint '{active_joint_id}' not found in model.\n"
-                f"Available joints: {available}"
+                f"Joint '{active_joint_id}' not found. "
+                f"Available joints: {list(model.all_joint_params.keys())}"
             )
-        
+
         joint_params = model.all_joint_params[active_joint_id]
-        
-        # Get joint type
+
+        # Determine joint type
         joint_type_attr = f'joint_type_{active_joint_id}'
         if hasattr(model, joint_type_attr):
             joint_type = getattr(model, joint_type_attr)
@@ -101,32 +102,61 @@ def render_joint_conditioned_trajectory(
             joint_type = model.joint_type
         else:
             joint_type = "revolute"
-            CONSOLE.print(f"[yellow]Could not determine joint type, assuming: {joint_type}[/yellow]")
-        
-        # Get joint limits from learned angles
-        if "angles" in joint_params:
-            angles = joint_params["angles"]
-            joint_min, joint_max = angles.min().item(), angles.max().item()
-            CONSOLE.print(f"Using joint '{active_joint_id}' with {len(angles)} learned angles")
+            CONSOLE.print(f"[yellow]Joint type not found, assuming {joint_type}[/yellow]")
+
+        # ---------------------------------
+        # Only compute model limits if user
+        # did NOT pass joint_min/max
+        # ---------------------------------
+        if joint_min is None or joint_max is None:
+            if "angles" in joint_params:
+                angles = joint_params["angles"]
+                joint_min = angles.min().item()
+                joint_max = angles.max().item()
+                CONSOLE.print(
+                    f"[cyan]Using MODEL learned joint limits "
+                    f"for '{active_joint_id}': [{joint_min:.3f}, {joint_max:.3f}][/cyan]"
+                )
+            else:
+                # Fallback defaults based on joint type
+                if joint_type == "revolute":
+                    joint_min, joint_max = -3.14, 3.14
+                else:
+                    joint_min, joint_max = -1.0, 1.0
+
+                CONSOLE.print(
+                    f"[yellow]No learned angles found for '{active_joint_id}', "
+                    f"using default range [{joint_min:.3f}, {joint_max:.3f}][/yellow]"
+                )
         else:
-            # Default ranges
-            joint_min, joint_max = (-3.14, 3.14) if joint_type == "revolute" else (-1.0, 1.0)
-            CONSOLE.print(f"[yellow]No learned angles found, using default range[/yellow]")
-    
+            # USER OVERRIDE
+            CONSOLE.print(
+                f"[green]Using USER-SPECIFIED joint limits "
+                f"for '{active_joint_id}': [{joint_min:.3f}, {joint_max:.3f}][/green]"
+            )
+
+    # Legacy single-joint case
     elif hasattr(model, 'joint_angle_deltas'):
-        # Single-joint architecture (legacy)
         active_joint_id = "joint_0"
-        joint_min, joint_max = model.joint_limits[0].item(), model.joint_limits[1].item()
+        if joint_min is None or joint_max is None:
+            joint_min = model.joint_limits[0].item()
+            joint_max = model.joint_limits[1].item()
+            CONSOLE.print(
+                f"[cyan]Using MODEL joint limits (legacy): "
+                f"[{joint_min:.3f}, {joint_max:.3f}]"
+            )
+        else:
+            CONSOLE.print(
+                f"[green]Using USER-SPECIFIED joint limits "
+                f"[{joint_min:.3f}, {joint_max:.3f}]"
+            )
+
         joint_type = model.joint_type
         CONSOLE.print("Using legacy single-joint architecture")
-    
+
     else:
-        raise ValueError(
-            "Model does not appear to be joint-conditioned!\n"
-            "Expected either:\n"
-            "  - 'all_joint_params' (multi-joint architecture), or\n"
-            "  - 'joint_angle_deltas' (single-joint architecture)"
-        )
+        raise ValueError("Model is not joint-conditioned!")
+
     
     CONSOLE.print(f"Joint type: {joint_type}")
     CONSOLE.print(f"Joint limits: [{joint_min:.3f}, {joint_max:.3f}]")
@@ -239,25 +269,51 @@ def render_joint_conditioned_trajectory(
             # Concatenate outputs horizontally
             render_image = np.concatenate(render_image, axis=1)
 
+            degrees = clamped_angle * 180.0 / math.pi
+            label = f"{active_joint_id}: {degrees:.1f} deg"
+
+            # Convert float32 render_image (0–1 or 0–255) to uint8 BGR
+            if render_image.dtype != np.uint8:
+                img_vis = (render_image * 255).astype(np.uint8)
+            else:
+                img_vis = render_image.copy()
+
+            img_vis = cv2.cvtColor(img_vis, cv2.COLOR_RGB2BGR)
+
+            # Draw label
+            cv2.putText(
+                img_vis,
+                label,
+                (60, 40),                        # position
+                cv2.FONT_HERSHEY_SIMPLEX,
+                2.0,                             # font scale
+                (0, 255, 0),                     # green text
+                3,                               # thickness
+                cv2.LINE_AA
+            )
+
+            # Convert back to RGB for saving
+            img_out = cv2.cvtColor(img_vis, cv2.COLOR_BGR2RGB)
+
             if output_format == "images":
                 if image_format == "png":
                     media.write_image(
                         output_image_dir / f"{frame_idx:05d}.png",
-                        render_image,
+                        img_out,
                         fmt="png",
                     )
                 elif image_format == "jpeg":
                     media.write_image(
                         output_image_dir / f"{frame_idx:05d}.jpg",
-                        render_image,
+                        img_out,
                         fmt="jpeg",
                         quality=jpeg_quality,
                     )
 
             if output_format == "video":
                 if writer is None:
-                    render_width = int(render_image.shape[1])
-                    render_height = int(render_image.shape[0])
+                    render_width = int(img_out.shape[1])
+                    render_height = int(img_out.shape[0])
                     writer = stack.enter_context(
                         media.VideoWriter(
                             path=output_filename,
@@ -265,7 +321,7 @@ def render_joint_conditioned_trajectory(
                             fps=fps,
                         )
                     )
-                writer.add_image(render_image)
+                writer.add_image(img_out)
 
             frame_idx += 1
 
@@ -296,7 +352,7 @@ class RenderJointConditionedPath:
     """Path to config YAML file."""
     camera_path_filename: Path = Path("camera_path.json")
     """Filename of the camera path to render."""
-    output_path: Path = Path("renders/joint_conditioned_output.mp4")
+    output_path: Path = Path("renders/joint_render.mp4")
     """Path to output video file or directory."""
     
     # Joint angle parameters
@@ -431,6 +487,8 @@ class RenderJointConditionedPath:
             depth_far_plane=self.depth_far_plane,
             colormap_options=self.colormap_options,
             fps=self.fps,
+            joint_min=joint_min,
+            joint_max=joint_max,
         )
 
 
@@ -626,8 +684,6 @@ class RenderJointConditionedDataset:
         )
 
 
-from typing import Union
-from typing_extensions import Annotated
 
 Commands = tyro.conf.FlagConversionOff[
     Union[

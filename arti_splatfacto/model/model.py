@@ -115,6 +115,8 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
 
     lambda_L1_fixed_opacity: float = 0.001
 
+    background_acc_lambda: float = 0.2
+
 
 
 
@@ -131,7 +133,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
 
 
         if self.config.use_depth:
-            self.depth_loss_fn = DepthLoss(alpha=0.5, scales=4)
+            self.depth_loss_fn = DepthLoss(alpha=0.5, scales=4, use_scale_shift=True)
 
 
     def populate_modules(self):
@@ -650,7 +652,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 scales=all_scales,  # Pass scale information
                 grow=4,             # Reduced from 6 since we have overlap_safety
                 thresh=0.01, 
-                bbox_margin=0.0,   # Small margin for safety
+                bbox_margin=0.02,   # Small margin for safety
                 overlap_safety=0.0, # Buffer to reduce edge loss
                 adaptive_samples=True
             ).to(torch.bool).cpu()
@@ -721,7 +723,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             
             # Query mask on background only
             obj_mask_in_bg = self.obj_3d_seg.query_refine_ellipsoid(
-                bg_means_only, grow=6, thresh=0.01, bbox_margin=0.0
+                bg_means_only, grow=6, thresh=0.01, bbox_margin=0.02
             ).to(torch.bool).cpu()
             
             remaining_bg_mask = ~obj_mask_in_bg
@@ -916,7 +918,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
         n_canon_before = self.gauss_params_canonical["means"].shape[0]
         
         if canon_info["gaussian_ids"].numel() > 0:
-            self.strategy_canonical.step_post_backward(
+            self.strategy.step_post_backward(
                 params=self.gauss_params_canonical,
                 optimizers=canon_optimizers,
                 state=self.strategy_state_canonical,
@@ -927,22 +929,22 @@ class ArtiSplatfactoModel(SplatfactoModel):
         
         n_canon_after = self.gauss_params_canonical["means"].shape[0]
         
-        # Enhanced logging
-        if step % 100 == 0:
-            CONSOLE.print(f"\n[cyan]Densification Summary (Step {step}):[/cyan]")
-            CONSOLE.print(f"  Object: {n_obj_before} → {n_obj_after} ({n_obj_after - n_obj_before:+d})")
-            CONSOLE.print(f"  Canon:  {n_canon_before} → {n_canon_after} ({n_canon_after - n_canon_before:+d})")
+        # # Enhanced logging
+        # if step % 100 == 0:
+        #     CONSOLE.print(f"\n[cyan]Densification Summary (Step {step}):[/cyan]")
+        #     CONSOLE.print(f"  Object: {n_obj_before} → {n_obj_after} ({n_obj_after - n_obj_before:+d})")
+        #     CONSOLE.print(f"  Canon:  {n_canon_before} → {n_canon_after} ({n_canon_after - n_canon_before:+d})")
             
-            # Debug canonical strategy state
-            if hasattr(self, 'strategy_state_canonical') and self.strategy_state_canonical.get("grad2d") is not None:
-                canon_grads = self.strategy_state_canonical["grad2d"]
-                canon_count = self.strategy_state_canonical["count"]
-                if len(canon_grads) > 0:
-                    avg_grads = canon_grads / canon_count.clamp_min(1)
-                    high_grad_count = (avg_grads > self.strategy_canonical.grow_grad2d).sum().item()
-                    CONSOLE.print(f"  Canon Strategy - High grad: {high_grad_count}/{len(avg_grads)} "
-                                f"(thresh: {self.strategy_canonical.grow_grad2d:.6f})")
-                    CONSOLE.print(f"  Canon Strategy - Avg grad: {avg_grads.mean():.6f}, Max: {avg_grads.max():.6f}")
+        #     # Debug canonical strategy state
+        #     if hasattr(self, 'strategy_state_canonical') and self.strategy_state_canonical.get("grad2d") is not None:
+        #         canon_grads = self.strategy_state_canonical["grad2d"]
+        #         canon_count = self.strategy_state_canonical["count"]
+        #         if len(canon_grads) > 0:
+        #             avg_grads = canon_grads / canon_count.clamp_min(1)
+        #             high_grad_count = (avg_grads > self.strategy_canonical.grow_grad2d).sum().item()
+        #             CONSOLE.print(f"  Canon Strategy - High grad: {high_grad_count}/{len(avg_grads)} "
+        #                         f"(thresh: {self.strategy_canonical.grow_grad2d:.6f})")
+        #             CONSOLE.print(f"  Canon Strategy - Avg grad: {avg_grads.mean():.6f}, Max: {avg_grads.max():.6f}")
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         """Route to appropriate loss function based on training mode"""
@@ -1127,7 +1129,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             accumulation = outputs["accumulation"]
             background_mask = ~mask.bool()
             background_acc_loss = (background_mask * accumulation).mean()
-            loss_dict["background_acc_penalty"] = 0.5 * background_acc_loss
+            loss_dict["background_acc_penalty"] = self.config.background_acc_lambda * background_acc_loss
         
         # === Scale regularization ===
         if self.config.use_scale_regularization and self.step % 10 == 0:
@@ -2063,6 +2065,29 @@ class ArtiSplatfactoModel(SplatfactoModel):
                         "depth_a3": float(a3.item()),
                     }
                     metrics_dict.update(depth_metrics)
+
+        # === Log Joint Angle Statistics ===
+        if hasattr(self, 'joint_angles_learned') and self.joint_angles_learned is not None:
+            active_id = self.config.active_joint_id
+            angles = self.joint_angles_learned
+            
+            # Basic stats
+            metrics_dict[f"{active_id}_angle_mean"] = angles.mean()
+            metrics_dict[f"{active_id}_angle_std"] = angles.std()
+            metrics_dict[f"{active_id}_angle_min"] = angles.min()
+            metrics_dict[f"{active_id}_angle_max"] = angles.max()
+            metrics_dict[f"{active_id}_angle_range"] = angles.max() - angles.min()
+            
+            if len(angles) > 1:
+                temporal_diff = torch.abs(angles[1:] - angles[:-1])
+                metrics_dict[f"{active_id}_temporal_variation"] = temporal_diff.mean()
+                metrics_dict[f"{active_id}_max_frame_jump"] = temporal_diff.max()
+            
+            # Smoothness (acceleration)
+            if len(angles) > 2:
+                accel = angles[:-2] - 2*angles[1:-1] + angles[2:]
+                metrics_dict[f"{active_id}_acceleration"] = accel.abs().mean()
+        
 
         # # === Gaussian Scale Metrics ===
         # with torch.no_grad():
