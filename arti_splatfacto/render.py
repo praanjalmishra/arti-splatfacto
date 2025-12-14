@@ -38,6 +38,70 @@ from nerfstudio.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE, ItersPerSecColumn
 
 
+
+def format_joint_value(value: float, joint_type: str) -> str:
+    """Format joint value for visualization based on joint type."""
+    if joint_type == "revolute":
+        return f"{value * 180.0 / math.pi:.1f} deg"
+    elif joint_type == "prismatic":
+        return f"{value:.3f} m"
+    else:
+        return f"{value:.3f}"
+
+
+def get_default_joint_limits(joint_type: str):
+    if joint_type == "revolute":
+        return -math.pi, math.pi
+    elif joint_type == "prismatic":
+        return 0.0, 1.0   # safe generic travel range
+    else:
+        return -1.0, 1.0
+
+
+def draw_joint_label(
+    image: np.ndarray,
+    text: str,
+    *,
+    margin: int = 30,
+    color=(0, 255, 0),
+):
+    h, w = image.shape[:2]
+
+    # Scale text relative to resolution
+    font_scale = max(0.8, min(w / 800.0, 2.0))
+    thickness = max(2, int(font_scale * 2))
+
+    # Compute text size
+    (text_w, text_h), baseline = cv2.getTextSize(
+        text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+    )
+
+    # Top-left anchored position
+    x = margin
+    y = margin + text_h
+
+    # Background box for readability
+    cv2.rectangle(
+        image,
+        (x - 10, y - text_h - 10),
+        (x + text_w + 10, y + baseline + 10),
+        (0, 0, 0),
+        thickness=-1,
+    )
+
+    # Draw text
+    cv2.putText(
+        image,
+        text,
+        (x, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
 def render_joint_conditioned_trajectory(
     pipeline: Pipeline,
     cameras: Cameras,
@@ -110,24 +174,11 @@ def render_joint_conditioned_trajectory(
         # ---------------------------------
         if joint_min is None or joint_max is None:
             if "angles" in joint_params:
-                angles = joint_params["angles"]
-                joint_min = angles.min().item()
-                joint_max = angles.max().item()
-                CONSOLE.print(
-                    f"[cyan]Using MODEL learned joint limits "
-                    f"for '{active_joint_id}': [{joint_min:.3f}, {joint_max:.3f}][/cyan]"
-                )
+                joint_min = joint_params["angles"].min().item()
+                joint_max = joint_params["angles"].max().item()
             else:
-                # Fallback defaults based on joint type
-                if joint_type == "revolute":
-                    joint_min, joint_max = -3.14, 3.14
-                else:
-                    joint_min, joint_max = -1.0, 1.0
+                joint_min, joint_max = get_default_joint_limits(joint_type)
 
-                CONSOLE.print(
-                    f"[yellow]No learned angles found for '{active_joint_id}', "
-                    f"using default range [{joint_min:.3f}, {joint_max:.3f}][/yellow]"
-                )
         else:
             # USER OVERRIDE
             CONSOLE.print(
@@ -267,10 +318,12 @@ def render_joint_conditioned_trajectory(
                 render_image.append(output_image)
 
             # Concatenate outputs horizontally
-            render_image = np.concatenate(render_image, axis=1)
+            # render_image = np.concatenate(render_image, axis=1)
+            # Stack outputs along x axis
+            render_image = np.concatenate(render_image, axis=0)
 
-            degrees = clamped_angle * 180.0 / math.pi
-            label = f"{active_joint_id}: {degrees:.1f} deg"
+            label_value = format_joint_value(clamped_angle, joint_type)
+            label = f"{active_joint_id}: {label_value}"
 
             # Convert float32 render_image (0–1 or 0–255) to uint8 BGR
             if render_image.dtype != np.uint8:
@@ -280,17 +333,7 @@ def render_joint_conditioned_trajectory(
 
             img_vis = cv2.cvtColor(img_vis, cv2.COLOR_RGB2BGR)
 
-            # Draw label
-            cv2.putText(
-                img_vis,
-                label,
-                (60, 40),                        # position
-                cv2.FONT_HERSHEY_SIMPLEX,
-                2.0,                             # font scale
-                (0, 255, 0),                     # green text
-                3,                               # thickness
-                cv2.LINE_AA
-            )
+            draw_joint_label(img_vis, label)
 
             # Convert back to RGB for saving
             img_out = cv2.cvtColor(img_vis, cv2.COLOR_BGR2RGB)
@@ -350,13 +393,13 @@ class RenderJointConditionedPath:
     
     load_config: Path
     """Path to config YAML file."""
-    camera_path_filename: Path = Path("camera_path.json")
+    camera_path: Path = Path("camera_path.json")
     """Filename of the camera path to render."""
     output_path: Path = Path("renders/joint_render.mp4")
     """Path to output video file or directory."""
     
     # Joint angle parameters
-    num_angles: int = 50
+    num_angles: int = 10
     """Number of joint angles to test at each camera pose."""
     angle_range: Optional[List[float]] = None
     """Custom angle range [min, max]. If None, use model's joint limits."""
@@ -440,8 +483,8 @@ class RenderJointConditionedPath:
             default_max = model.joint_limits[1].item()
         
         # Load camera path
-        CONSOLE.print(f"[bold]Loading camera path from {self.camera_path_filename}")
-        with open(self.camera_path_filename, "r", encoding="utf-8") as f:
+        CONSOLE.print(f"[bold]Loading camera path from {self.camera_path}")
+        with open(self.camera_path, "r", encoding="utf-8") as f:
             camera_path_data = json.load(f)
         
         camera_path = get_path_from_json(camera_path_data)
