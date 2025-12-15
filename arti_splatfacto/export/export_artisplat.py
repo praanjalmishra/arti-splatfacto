@@ -68,7 +68,7 @@ class URDFExporter:
     load_config_splatfacto: Path
     """Path to the trained Splatfacto config YAML file."""
     
-    output_dir: Path = Path("./urdf_export/")
+    output_dir: Path = Path("./export_data/")
     """Path to the output directory."""
     
     voxel_size: float = 0.01
@@ -98,6 +98,8 @@ class URDFExporter:
     min_cluster_triangles: int = 50
     """Minimum number of triangles for a cluster to be kept."""
 
+    background_crop_radius: float = 2.5
+    """Radius (meters) around camera center to keep background geometry."""
 
 
     def get_outputs_subset(
@@ -228,9 +230,7 @@ class URDFExporter:
                 
                 # Apply joint mask if provided
                 if joint_mask is not None:
-                    # Create a masked depth map (set masked areas to 0)
-                    # This requires rendering with masked Gaussians
-                    # For now, we'll skip this frame if mask doesn't match
+
                     pass
                 
                 # Prepare camera intrinsics
@@ -306,13 +306,58 @@ class URDFExporter:
         
         return mesh
 
+
+    def crop_mesh_by_camera_distance(
+        self,
+        mesh: o3d.geometry.TriangleMesh,
+        cameras: Cameras,
+        max_distance: float
+    ) -> o3d.geometry.TriangleMesh:
+        """
+        Crop mesh to keep only geometry within distance from camera centers.
+        
+        Args:
+            mesh: Input mesh
+            cameras: Camera dataset (using poses as reference)
+            max_distance: Maximum distance to keep (meters)
+        
+        Returns:
+            Cropped mesh
+        """
+        # Extract camera positions from poses
+        cam_positions = cameras.camera_to_worlds[:, :3, 3].cpu().numpy()  # [N, 3]
+        cam_center = cam_positions.mean(axis=0)  # Average position
+        
+        # Get mesh vertices
+        vertices = np.asarray(mesh.vertices)
+        
+        # Compute distance from camera center
+        distances = np.linalg.norm(vertices - cam_center, axis=1)
+        
+        # Create mask for vertices to keep
+        keep_mask = distances <= max_distance
+        
+        # Crop mesh
+        mesh_cropped = mesh.select_by_index(np.where(keep_mask)[0])
+        mesh_cropped.remove_unreferenced_vertices()
+        mesh_cropped.remove_degenerate_triangles()
+        
+        CONSOLE.print(f"  Camera center: [{cam_center[0]:.3f}, {cam_center[1]:.3f}, {cam_center[2]:.3f}]")
+        CONSOLE.print(f"  Crop radius: {max_distance}m")
+        CONSOLE.print(f"  Cropped: {len(vertices)} → {len(mesh_cropped.vertices)} vertices")
+        CONSOLE.print(f"  Removed: {(~keep_mask).sum()} vertices beyond {max_distance}m")
+        
+        return mesh_cropped
+
+
     def export_background_mesh(
         self,
         model: SplatfactoModel,
         cameras: Cameras,
         camera_indices: List[int],
+        cameras_pre: Cameras,  # ADD THIS PARAMETER
     ) -> o3d.geometry.TriangleMesh:
-        """Export background mesh (all Gaussians with joint_id == -1 or 0)."""
+        """Export background mesh with cropping based on cameras_pre."""
         CONSOLE.print("\n[bold green]Exporting background mesh...[/bold green]")
 
         self.current_subset = "background"
@@ -324,6 +369,14 @@ class URDFExporter:
         
         mesh = volume.extract_triangle_mesh()
         mesh = self.clean_mesh(mesh)
+        
+        # Crop background mesh using cameras_pre
+        CONSOLE.print("\n[bold cyan]Cropping background mesh...[/bold cyan]")
+        mesh = self.crop_mesh_by_camera_distance(
+            mesh,
+            cameras=cameras_pre,  
+            max_distance=self.background_crop_radius
+        )
         
         # Save mesh
         mesh_path = self.output_dir / "meshes" / "background.ply"
@@ -443,12 +496,12 @@ class URDFExporter:
 
         # Extract pivot point and axis (for revolute joints)
         if hasattr(model, "joint_pivot"):
-            pivot = model.joint_pivot.cpu().numpy().tolist()
+            pivot = model.joint_pivot.detach().cpu().numpy().tolist()
         else:
             pivot = [0.0, 0.0, 0.0]
         
         if hasattr(model, "joint_axis"):
-            joint_axis = model.joint_axis.cpu().numpy().tolist()
+            joint_axis = model.joint_axis.detach().cpu().numpy().tolist()
             # Normalize axis
             axis_norm = np.linalg.norm(joint_axis)
             if axis_norm > 0:
@@ -465,7 +518,7 @@ class URDFExporter:
                 "max": joint_max,
                 "unit": "radians" if metadata["joint_type"] == "revolute" else "meters"
             },
-            "pivot_pivot": pivot,
+            "pivot_point": pivot,
             "axis": joint_axis,
             "canonical_angle": self.get_canonical_angle(model),
             "object_angle": self.get_object_angle(model),
@@ -672,12 +725,24 @@ class URDFExporter:
         
         # Export background mesh
         CONSOLE.print("\n[3/5] Exporting background mesh...")
-        if not self.background_only:
-            background_mesh = self.export_background_mesh(model, cameras_all, camera_indices_all)
-        
 
+
+        if not self.background_only:
+            background_mesh = self.export_background_mesh(
+                model, 
+                cameras_all, 
+                camera_indices_all,
+                cameras_pre=cameras_pre  # Pass cameras_pre for cropping
+            )
+            
             del background_mesh
             torch.cuda.empty_cache()
+        # if not self.background_only:
+        #     background_mesh = self.export_background_mesh(model, cameras_all, camera_indices_all)
+        
+
+        #     del background_mesh
+        #     torch.cuda.empty_cache()
         # Export joint meshes
         if not self.background_only:
             CONSOLE.print("\n[4/5] Exporting articulated joint meshes...")
