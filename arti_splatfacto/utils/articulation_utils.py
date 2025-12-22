@@ -88,3 +88,64 @@ def apply_articulation_to_optimizer_params(trainer, joint_angle: torch.Tensor) -
             articulated_params[name] = param
 
     return articulated_params
+
+
+def apply_articulation_to_params(
+    params: Dict[str, torch.Tensor],
+    joint_angle: torch.Tensor,
+    joint_pivot: torch.Tensor,
+    joint_axis: torch.Tensor,
+    joint_type: str
+) -> Dict[str, torch.Tensor]:
+    """
+    Apply articulation transform to a slice of Gaussian parameters.
+    
+    Args:
+        params: Dict of Gaussian parameters (means, quats, scales, etc.) for ONE joint
+        joint_angle: Angle/displacement for this joint [scalar tensor]
+        joint_pivot: Pivot point [3]
+        joint_axis: Rotation/translation axis [3]
+        joint_type: "revolute" or "prismatic"
+    
+    Returns:
+        Dict with articulated means and quats, other params unchanged
+    """
+    if not isinstance(joint_angle, torch.Tensor):
+        joint_angle = torch.tensor([joint_angle], device=params["means"].device)
+    
+    # Skip articulation if angle is zero (optimization)
+    if torch.abs(joint_angle).item() < 1e-8:
+        return params
+    
+    articulated = {}
+    
+    # Apply transform based on joint type
+    if joint_type == "revolute":
+        means_art, quats_art = apply_joint_transform(
+            means=params["means"],
+            quats=params["quats"],
+            joint_pivot=joint_pivot,
+            joint_axis=joint_axis,
+            joint_angle=joint_angle.squeeze()
+        )
+    elif joint_type == "prismatic":
+        means_art, quats_art = apply_joint_transform_prismatic(
+            means=params["means"],
+            quats=params["quats"],
+            joint_pivot=joint_pivot,
+            joint_axis=joint_axis,
+            joint_disp=joint_angle.squeeze()
+        )
+    else:
+        raise ValueError(f"Unknown joint_type: {joint_type}")
+    
+    # Build output dict
+    articulated["means"] = means_art
+    articulated["quats"] = quats_art
+    
+    # Copy other parameters unchanged
+    for key in params.keys():
+        if key not in ["means", "quats"]:
+            articulated[key] = params[key]
+    
+    return articulated

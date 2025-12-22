@@ -36,6 +36,12 @@ from dinov2_utils import load_dinov2_model, compute_dinov2_similarity
 import glob
 from PIL import Image
 
+from scipy.ndimage import median_filter
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import IsolationForest
+
+from change_det.utils.image_diff import image_diff_effsam
+
 def compute_change_mask(first_frame: torch.Tensor, 
                        last_frame: torch.Tensor,
                        out_dir: str,
@@ -152,6 +158,392 @@ def compute_change_mask(first_frame: torch.Tensor,
     return masks, masks_all
 
 
+
+def validate_depth_reading(depth: float, 
+                          min_depth: float = 0.1,
+                          max_depth: float = 10.0) -> bool:
+    """Check if depth reading is valid."""
+    return (not np.isnan(depth) and 
+            not np.isinf(depth) and 
+            min_depth < depth < max_depth)
+
+
+def filter_depth_sequence(depth_sequence: np.ndarray,
+                         kernel_size: int = 3) -> np.ndarray:
+    """Apply temporal median filtering to reduce depth noise."""
+    filtered = np.zeros_like(depth_sequence)
+    
+    for i in range(depth_sequence.shape[0]):
+        start_idx = max(0, i - kernel_size // 2)
+        end_idx = min(depth_sequence.shape[0], i + kernel_size // 2 + 1)
+        
+        # Temporal median
+        window = depth_sequence[start_idx:end_idx]
+        filtered[i] = np.median(window, axis=0)
+    
+    return filtered
+
+
+# ============================================================================
+# 2. ROBUST 2D-TO-3D CONVERSION WITH VALIDATION
+# ============================================================================
+
+def project_to_3d_robust(u: float, v: float, 
+                        depth: float,
+                        camera_intrinsics,
+                        depth_confidence_threshold: float = 0.95) -> Tuple[bool, np.ndarray]:
+    """
+    Project 2D point to 3D with validation.
+    
+    Returns:
+        (is_valid, xyz_point)
+    """
+    # Validate depth
+    if not validate_depth_reading(depth):
+        return False, np.array([0, 0, 0])
+    
+    # Check if point is within image bounds
+    if not (0 <= u < camera_intrinsics.w and 0 <= v < camera_intrinsics.h):
+        return False, np.array([0, 0, 0])
+    
+    # Backproject to 3D camera coordinates
+    x = (u - camera_intrinsics.cx) * depth / camera_intrinsics.fx
+    y = (v - camera_intrinsics.cy) * depth / camera_intrinsics.fy
+    z = depth
+    
+    # Validate 3D point
+    point_3d = np.array([x, y, z])
+    if not np.all(np.isfinite(point_3d)):
+        return False, np.array([0, 0, 0])
+    
+    return True, point_3d
+
+
+# ============================================================================
+# 3. ENHANCED TRAJECTORY VALIDATION
+# ============================================================================
+
+def compute_trajectory_statistics(trajectory_3d) -> dict:
+    """Compute comprehensive trajectory statistics."""
+    positions = trajectory_3d.get_all_positions()
+    
+    if len(positions) < 2:
+        return {
+            'valid': False,
+            'length': len(positions),
+            'total_displacement': 0.0,
+            'avg_velocity': 0.0,
+            'velocity_std': 0.0,
+            'acceleration_std': 0.0,
+            'depth_std': 0.0
+        }
+    
+    # Displacement
+    displacements = np.diff(positions, axis=0)
+    velocities = np.linalg.norm(displacements, axis=1)
+    
+    total_disp = np.linalg.norm(positions[-1] - positions[0])
+    avg_velocity = np.mean(velocities)
+    velocity_std = np.std(velocities)
+    
+    # Acceleration (second derivative)
+    if len(velocities) > 1:
+        accelerations = np.diff(velocities)
+        acceleration_std = np.std(accelerations)
+    else:
+        acceleration_std = 0.0
+    
+    # Depth consistency
+    depths = positions[:, 2]  # Z coordinate
+    depth_std = np.std(depths)
+    
+    return {
+        'valid': True,
+        'length': len(positions),
+        'total_displacement': total_disp,
+        'avg_velocity': avg_velocity,
+        'velocity_std': velocity_std,
+        'acceleration_std': acceleration_std,
+        'depth_std': depth_std,
+        'mean_depth': np.mean(depths)
+    }
+
+
+def is_trajectory_valid_robust(trajectory_3d,
+                               min_length: int = 5,
+                               max_velocity_std_ratio: float = 3.0,
+                               max_acceleration_std: float = 0.5,
+                               max_depth_std_ratio: float = 0.3) -> bool:
+    """
+    Enhanced trajectory validation with adaptive thresholds.
+    """
+    stats = compute_trajectory_statistics(trajectory_3d)
+    
+    if not stats['valid'] or stats['length'] < min_length:
+        return False
+    
+    # Reject trajectories with unrealistic motion profiles
+    if stats['avg_velocity'] > 0:
+        velocity_std_ratio = stats['velocity_std'] / (stats['avg_velocity'] + 1e-6)
+        if velocity_std_ratio > max_velocity_std_ratio:
+            return False
+    
+    # Reject trajectories with extreme accelerations
+    if stats['acceleration_std'] > max_acceleration_std:
+        return False
+    
+    # Reject trajectories with inconsistent depth
+    if stats['mean_depth'] > 0:
+        depth_std_ratio = stats['depth_std'] / (stats['mean_depth'] + 1e-6)
+        if depth_std_ratio > max_depth_std_ratio:
+            return False
+    
+    return True
+
+
+# ============================================================================
+# 4. ROBUST MOTION SEGMENTATION
+# ============================================================================
+
+def segment_trajectories_robust(trajectories_3d: List,
+                                motion_threshold_percentile: float = 50.0,
+                                min_displacement: float = 0.01) -> List:
+    """
+    Segment trajectories into moving/static with adaptive thresholding.
+    
+    Args:
+        motion_threshold_percentile: Percentile for motion threshold (50 = median)
+        min_displacement: Absolute minimum displacement to be considered moving (meters)
+    """
+    if not trajectories_3d:
+        return trajectories_3d
+    
+    # Extract motion features
+    features = []
+    for traj in trajectories_3d:
+        stats = compute_trajectory_statistics(traj)
+        
+        if not stats['valid']:
+            features.append([0, 0, 0, 0])
+            continue
+        
+        # Normalized features
+        features.append([
+            stats['total_displacement'],
+            stats['avg_velocity'],
+            stats['velocity_std'],
+            stats['acceleration_std']
+        ])
+    
+    features = np.array(features)
+    
+    # Normalize features for fair comparison
+    scaler = StandardScaler()
+    features_normalized = scaler.fit_transform(features)
+    
+    # Compute motion score (combination of displacement and velocity)
+    motion_scores = np.linalg.norm(features_normalized[:, :2], axis=1)
+    
+    # Adaptive threshold based on distribution
+    threshold = np.percentile(motion_scores, motion_threshold_percentile)
+    
+    # Also apply absolute minimum displacement check
+    abs_displacements = features[:, 0]
+    
+    segmented = []
+    for i, traj in enumerate(trajectories_3d):
+        # A trajectory is "moving" if:
+        # 1. Motion score exceeds adaptive threshold, AND
+        # 2. Absolute displacement exceeds minimum
+        is_moving = (motion_scores[i] > threshold and 
+                    abs_displacements[i] > min_displacement)
+        
+        from data_structures import Trajectory3D
+        segmented_traj = Trajectory3D(
+            track_id=traj.track_id,
+            points=traj.points,
+            rigid_part=1 if is_moving else 0
+        )
+        segmented.append(segmented_traj)
+    
+    moving_count = sum(1 for t in segmented if t.rigid_part == 1)
+    static_count = len(segmented) - moving_count
+    
+    print(f"Motion segmentation: {moving_count} moving, {static_count} static")
+    print(f"  Adaptive threshold: {threshold:.4f}")
+    print(f"  Motion score range: [{motion_scores.min():.4f}, {motion_scores.max():.4f}]")
+    
+    return segmented
+
+
+# ============================================================================
+# 5. OUTLIER REMOVAL WITH RANSAC-LIKE APPROACH
+# ============================================================================
+
+def remove_trajectory_outliers(trajectories_3d: List,
+                               contamination: float = 0.1) -> List:
+    """
+    Remove outlier trajectories using isolation forest or statistical methods.
+    """
+    if len(trajectories_3d) < 10:
+        return trajectories_3d
+    
+    from sklearn.ensemble import IsolationForest
+    
+    # Extract features
+    features = []
+    for traj in trajectories_3d:
+        stats = compute_trajectory_statistics(traj)
+        features.append([
+            stats['total_displacement'],
+            stats['avg_velocity'],
+            stats['velocity_std'],
+            stats['mean_depth']
+        ])
+    
+    features = np.array(features)
+    
+    # Detect outliers
+    iso_forest = IsolationForest(contamination=contamination, random_state=42)
+    outlier_labels = iso_forest.fit_predict(features)
+    
+    # Keep only inliers (label = 1)
+    inlier_trajectories = [
+        traj for traj, label in zip(trajectories_3d, outlier_labels)
+        if label == 1
+    ]
+    
+    print(f"Outlier removal: {len(trajectories_3d)} → {len(inlier_trajectories)} trajectories")
+    
+    return inlier_trajectories
+
+
+# ============================================================================
+# 6. INTEGRATION INTO MAIN PIPELINE
+# ============================================================================
+
+def enhanced_convert_to_3d_trajectories(trajectories_2d: List,
+                                       depth_sequence: np.ndarray,
+                                       camera_intrinsics,
+                                       filter_depth: bool = True) -> List:
+    """
+    Enhanced 2D-to-3D conversion with validation.
+    """
+    from data_structures import Trajectory3D, Point3D
+    from tqdm import tqdm
+    
+    # Optional: filter depth sequence
+    if filter_depth:
+        print("Applying temporal depth filtering...")
+        depth_sequence = filter_depth_sequence(depth_sequence)
+    
+    trajectories_3d = []
+    
+    for traj_2d in tqdm(trajectories_2d, desc="Converting to 3D (robust)"):
+        points_3d = []
+        
+        for point_2d in traj_2d.points:
+            frame = point_2d.frame
+            u, v = point_2d.u, point_2d.v
+            
+            # Get depth value
+            depth = depth_sequence[frame, int(v), int(u)]
+            
+            # Project with validation
+            is_valid, xyz = project_to_3d_robust(
+                u, v, depth, camera_intrinsics
+            )
+            
+            if is_valid:
+                point_3d = Point3D(
+                    frame=frame,
+                    x=xyz[0],
+                    y=xyz[1],
+                    z=xyz[2],
+                    confidence=point_2d.confidence
+                )
+                points_3d.append(point_3d)
+        
+        if len(points_3d) >= 3:  # Minimum for meaningful trajectory
+            traj_3d = Trajectory3D(
+                track_id=traj_2d.track_id,
+                points=points_3d
+            )
+            trajectories_3d.append(traj_3d)
+    
+    return trajectories_3d
+
+
+# ============================================================================
+# 7. COMPLETE ROBUST PIPELINE
+# ============================================================================
+
+def robust_trajectory_pipeline(trajectories_2d: List,
+                              depth_sequence: np.ndarray,
+                              camera_intrinsics,
+                              min_length: int = 10,
+                              motion_percentile: float = 20.0,
+                              min_displacement: float = 0.1) -> Tuple[List, dict]:
+    """
+    Complete robust pipeline for real-world data.
+    
+    Returns:
+        (moving_trajectories, statistics_dict)
+    """
+    stats = {}
+    
+    # Step 1: Convert to 3D with validation
+    print("\n[1/5] Converting to 3D with depth validation...")
+    trajectories_3d = enhanced_convert_to_3d_trajectories(
+        trajectories_2d, depth_sequence, camera_intrinsics
+    )
+    stats['initial_3d'] = len(trajectories_3d)
+    
+    # Step 2: Enhanced validation
+    print("\n[2/5] Validating trajectories...")
+    valid_trajectories = [
+        t for t in trajectories_3d 
+        if is_trajectory_valid_robust(t, min_length=min_length)
+    ]
+    stats['after_validation'] = len(valid_trajectories)
+    
+    # Step 3: Remove outliers
+    print("\n[3/5] Removing outliers...")
+    inlier_trajectories = remove_trajectory_outliers(valid_trajectories)
+    stats['after_outlier_removal'] = len(inlier_trajectories)
+    
+    # Step 4: Segment motion
+    print("\n[4/5] Segmenting motion...")
+    segmented_trajectories = segment_trajectories_robust(
+        inlier_trajectories,
+        motion_threshold_percentile=motion_percentile,
+        min_displacement=min_displacement
+    )
+    
+    # Step 5: Extract moving trajectories
+    print("\n[5/5] Extracting moving trajectories...")
+    moving_trajectories = [
+        t for t in segmented_trajectories 
+        if t.rigid_part == 1
+    ]
+    stats['moving'] = len(moving_trajectories)
+    stats['static'] = len(segmented_trajectories) - len(moving_trajectories)
+    stats['all_segmented'] = segmented_trajectories  # Store for visualization
+    
+    # Print summary
+    print("\n" + "="*60)
+    print("ROBUST PIPELINE SUMMARY")
+    print("="*60)
+    print(f"Initial 3D trajectories:    {stats['initial_3d']}")
+    print(f"After validation:           {stats['after_validation']}")
+    print(f"After outlier removal:      {stats['after_outlier_removal']}")
+    print(f"Moving trajectories:        {stats['moving']}")
+    print(f"Static trajectories:        {stats['static']}")
+    print("="*60 + "\n")
+    
+    return moving_trajectories, stats
+
+
 class CoTrackerRGBD:
     """
     Main class for processing RGB-D video sequences with CoTracker.
@@ -163,11 +555,11 @@ class CoTrackerRGBD:
     def __init__(self, 
                 trajectory_filter_config: TrajectoryFilterConfig,
                 device: str = DEFAULT_DEVICE,
-                grid_size: int = 30,
+                grid_size: int = 10,
                 grid_query_frame: int = 0,
                 backward_tracking: bool = True,
                 use_change_mask: bool = True,
-                change_threshold: float = 1e-2,
+                change_threshold: float = 0.1,
                 max_resolution: int = 640,  # NEW
                 max_frames: int = 60):       # NEW
         """
@@ -216,18 +608,28 @@ class CoTrackerRGBD:
             self.dinov2_processor, self.dinov2_model = load_dinov2_model(self.device)
         
         first_frame = video_tensor[0, 0]
-        last_frame = video_tensor[0, -1]
+        last_frame = video_tensor[0, -1]\
+
+        first_frame = first_frame.unsqueeze(0)  # (1, 3, H, W)
+        last_frame = last_frame.unsqueeze(0)    # (1, 3, H, W)
         
         change_dir = os.path.join(out_dir, "change_detection")
-        masks, masks_all = compute_change_mask(
-            first_frame, last_frame, 
-            out_dir=change_dir,
+        # masks, masks_all = compute_change_mask(
+        #     first_frame, last_frame, 
+        #     out_dir=change_dir,
+        #     threshold=self.change_threshold,
+        #     use_dinov2=self.use_dinov2,
+        #     dinov2_model=self.dinov2_model,
+        #     dinov2_processor=self.dinov2_processor
+        # )
+
+        masks, masks_all = image_diff_effsam(
+            first_frame, last_frame,
+            debug_dir=change_dir,
             threshold=self.change_threshold,
-            use_dinov2=self.use_dinov2,
-            dinov2_model=self.dinov2_model,
-            dinov2_processor=self.dinov2_processor
+            kernel_ratio=0.05
         )
-        
+
         # Combine all large masks into single segmentation
         if len(masks) > 0:
             areas = [mask.sum().item() for mask in masks]  # number of pixels in each mask
@@ -242,29 +644,31 @@ class CoTrackerRGBD:
         self.change_masks = masks
         return segmentation
     
+
     def process_rgbd_sequence(self, 
                             video_path: str,
                             depth_dir: str, 
                             out_dir: str,
-                            camera_metadata_path: str) -> Tuple[List[Trajectory3D], CameraIntrinsics]:
-        """Process RGB-D sequence with memory optimizations."""
-        print("=== Starting RGB-D Processing (Memory Optimized) ===")
+                            camera_metadata_path: str) -> Tuple[List, object]:
+        """Process RGB-D sequence with robust trajectory extraction."""
+        print("=== Starting RGB-D Processing (Robust Pipeline) ===")
         
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             print(f"Initial GPU memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
         
-        print("Step 1: Loading RGB video...")
+        # ========================================================================
+        # STEP 1-3: Data Loading (unchanged)
+        # ========================================================================
+        print("\n[Step 1/7] Loading RGB video...")
         video_tensor, original_T, H, W = self._load_and_preprocess_video(video_path)
-        self.video_h, self.video_w = H, W  # Store for depth matching
-        
-        # Clear cache after video load
+        self.video_h, self.video_w = H, W
         torch.cuda.empty_cache()
         
-        print("Step 2: Loading depth sequence...")
+        print("\n[Step 2/7] Loading depth sequence...")
         depth_sequence = self._load_depth_sequence(depth_dir, video_tensor.shape[1])
         
-        print("Step 3: Loading camera parameters...")
+        print("\n[Step 3/7] Loading camera parameters...")
         camera_intrinsics = self._load_camera_parameters(camera_metadata_path)
         
         # Scale camera intrinsics to match downsampled resolution
@@ -276,58 +680,178 @@ class CoTrackerRGBD:
         camera_intrinsics.cy *= scale_y
         camera_intrinsics.w = W
         camera_intrinsics.h = H
-        print(f"Scaled camera intrinsics: fx={camera_intrinsics.fx:.1f}, fy={camera_intrinsics.fy:.1f}")
+        print(f"Scaled camera intrinsics: fx={camera_intrinsics.fx:.1f}, "
+            f"fy={camera_intrinsics.fy:.1f}, cx={camera_intrinsics.cx:.1f}, "
+            f"cy={camera_intrinsics.cy:.1f}")
         
+        # ========================================================================
+        # STEP 3.5: Optional Change Mask
+        # ========================================================================
         segmentation_mask = None
         if self.use_change_mask:
-            print("Step 3.5: Computing change-based segmentation...")
-            torch.cuda.empty_cache() 
+            print("\n[Step 3.5/7] Computing change-based segmentation...")
+            torch.cuda.empty_cache()
             segmentation_mask = self.compute_change_segmentation(video_tensor, out_dir)
-            torch.cuda.empty_cache() 
-
-        print("Step 4: Extracting 2D trajectories...")
-        trajectories_2d = self._extract_2d_trajectories(
-            video_tensor, 
-            segmentation_mask=segmentation_mask
-        )
-        print(f"Extracted {len(trajectories_2d)} 2D trajectories")
+            torch.cuda.empty_cache()
         
-        # Clear video from GPU after tracking
+        # ========================================================================
+        # STEP 4: 2D Trajectory Extraction
+        # ========================================================================
+        print("\n[Step 4/7] Extracting 2D trajectories...")
+        torch.cuda.empty_cache()
+        with torch.inference_mode():
+            trajectories_2d = self._extract_2d_trajectories(video_tensor, segmentation_mask)
+        print(f"✓ Extracted {len(trajectories_2d)} 2D trajectories")
+        
+        # Clear GPU memory
         del video_tensor
         if segmentation_mask is not None:
             del segmentation_mask
         torch.cuda.empty_cache()
         
-        print("Step 5: Converting to 3D trajectories...")
-        trajectories_3d = self._convert_to_3d_trajectories(
-            trajectories_2d, depth_sequence, camera_intrinsics
+        # ========================================================================
+        # STEP 5-7: ROBUST 3D PROCESSING PIPELINE
+        # ========================================================================
+        print("\n[Step 5-7/7] Running robust 3D trajectory pipeline...")
+        
+        # Convert depth to numpy for processing
+        depth_np = depth_sequence.cpu().numpy()
+        del depth_sequence
+        torch.cuda.empty_cache()
+        
+        # Run the robust pipeline
+        moving_trajectories, pipeline_stats = robust_trajectory_pipeline(
+            trajectories_2d=trajectories_2d,
+            depth_sequence=depth_np,
+            camera_intrinsics=camera_intrinsics,
+            min_length=self.trajectory_filter_config.min_length,
+            motion_percentile=60.0,      # Adjust: 50-70 typical
+            min_displacement=0.02         # Adjust: 0.01-0.05 meters
         )
-        print(f"Converted {len(trajectories_3d)} trajectories to 3D")
         
-        print("Step 6: Filtering trajectories...")
-        filtered_trajectories = self._filter_trajectories(trajectories_3d)
-        print(f"After filtering: {len(filtered_trajectories)} trajectories")
+        # Store stats for debugging
+        self._last_pipeline_stats = pipeline_stats
         
-        print("Step 7: Segmenting rigid parts...")
-        segmented_trajectories = self._segment_rigid_parts(filtered_trajectories)
-        
-        moving_trajectories = [t for t in segmented_trajectories if t.rigid_part == 1]
-        print(f"Moving trajectories: {len(moving_trajectories)}/{len(segmented_trajectories)}")
-        
+        # ========================================================================
+        # VISUALIZATION
+        # ========================================================================
+        print("\n[Visualization] Generating outputs...")
         self.visualize_result(out_dir=out_dir)
-        plot_trajectories_3d(moving_trajectories, out_path=f"{out_dir}/trajectories_3d.png")
         
-        print("=== RGB-D Processing Complete ===")
+        if len(moving_trajectories) > 0:
+            plot_trajectories_3d(
+                moving_trajectories, 
+                out_path=f"{out_dir}/trajectories_3d_moving.png"
+            )
+            
+            # Also plot all segmented trajectories for comparison
+            all_segmented = [t for t in pipeline_stats.get('all_segmented', [])]
+            if all_segmented:
+                plot_trajectories_3d(
+                    all_segmented,
+                    out_path=f"{out_dir}/trajectories_3d_all.png"
+                )
+        else:
+            print("⚠ Warning: No moving trajectories found!")
+        
+        # ========================================================================
+        # FINAL SUMMARY
+        # ========================================================================
+        print("\n" + "="*70)
+        print("RGB-D PROCESSING COMPLETE")
+        print("="*70)
+        print(f"Final moving trajectories: {len(moving_trajectories)}")
+        print(f"Camera: fx={camera_intrinsics.fx:.1f}, fy={camera_intrinsics.fy:.1f}")
+        print("="*70 + "\n")
+        
         return moving_trajectories, camera_intrinsics
+    
+    # def process_rgbd_sequence(self, 
+    #                         video_path: str,
+    #                         depth_dir: str, 
+    #                         out_dir: str,
+    #                         camera_metadata_path: str) -> Tuple[List[Trajectory3D], CameraIntrinsics]:
+    #     """Process RGB-D sequence with memory optimizations."""
+    #     print("=== Starting RGB-D Processing (Memory Optimized) ===")
+        
+    #     if torch.cuda.is_available():
+    #         torch.cuda.empty_cache()
+    #         print(f"Initial GPU memory: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+        
+    #     print("Step 1: Loading RGB video...")
+    #     video_tensor, original_T, H, W = self._load_and_preprocess_video(video_path)
+    #     self.video_h, self.video_w = H, W  # Store for depth matching
+        
+    #     # Clear cache after video load
+    #     torch.cuda.empty_cache()
+        
+    #     print("Step 2: Loading depth sequence...")
+    #     depth_sequence = self._load_depth_sequence(depth_dir, video_tensor.shape[1])
+        
+    #     print("Step 3: Loading camera parameters...")
+    #     camera_intrinsics = self._load_camera_parameters(camera_metadata_path)
+        
+    #     # Scale camera intrinsics to match downsampled resolution
+    #     scale_x = W / camera_intrinsics.w
+    #     scale_y = H / camera_intrinsics.h
+    #     camera_intrinsics.fx *= scale_x
+    #     camera_intrinsics.fy *= scale_y
+    #     camera_intrinsics.cx *= scale_x
+    #     camera_intrinsics.cy *= scale_y
+    #     camera_intrinsics.w = W
+    #     camera_intrinsics.h = H
+    #     print(f"Scaled camera intrinsics: fx={camera_intrinsics.fx:.1f}, fy={camera_intrinsics.fy:.1f}")
+        
+    #     segmentation_mask = None
+    #     if self.use_change_mask:
+    #         print("Step 3.5: Computing change-based segmentation...")
+    #         torch.cuda.empty_cache() 
+    #         segmentation_mask = self.compute_change_segmentation(video_tensor, out_dir)
+    #         torch.cuda.empty_cache() 
+
+    #     print("Step 4: Extracting 2D trajectories...")
+    #     torch.cuda.empty_cache()
+    #     with torch.inference_mode():
+    #         trajectories_2d = self._extract_2d_trajectories(video_tensor, segmentation_mask)
+    #     print(f"Extracted {len(trajectories_2d)} 2D trajectories")
+        
+    #     # Clear video from GPU after tracking
+    #     del video_tensor
+    #     if segmentation_mask is not None:
+    #         del segmentation_mask
+    #     torch.cuda.empty_cache()
+        
+    #     print("Step 5: Converting to 3D trajectories...")
+    #     trajectories_3d = self._convert_to_3d_trajectories(
+    #         trajectories_2d, depth_sequence, camera_intrinsics
+    #     )
+    #     print(f"Converted {len(trajectories_3d)} trajectories to 3D")
+        
+    #     print("Step 6: Filtering trajectories...")
+    #     filtered_trajectories = self._filter_trajectories(trajectories_3d)
+    #     print(f"After filtering: {len(filtered_trajectories)} trajectories")
+        
+    #     print("Step 7: Segmenting rigid parts...")
+    #     segmented_trajectories = self._segment_rigid_parts(filtered_trajectories)
+        
+    #     # moving_trajectories = [t for t in segmented_trajectories if t.rigid_part == 1]
+    #     moving_trajectories = [t for t in segmented_trajectories if t.rigid_part == 0]
+    #     print(f"Moving trajectories: {len(moving_trajectories)}/{len(segmented_trajectories)}")
+        
+    #     self.visualize_result(out_dir=out_dir)
+    #     plot_trajectories_3d(moving_trajectories, out_path=f"{out_dir}/trajectories_3d.png")
+        
+    #     print("=== RGB-D Processing Complete ===")
+    #     return moving_trajectories, camera_intrinsics
 
 
     def _load_and_preprocess_video(self, frames_dir: str) -> Tuple[torch.Tensor, int, int, int]:
         """Load and preprocess RGB frames from directory with memory optimization."""
         import glob
         from PIL import Image
-        
-        frame_files = sorted(glob.glob(os.path.join(frames_dir, "frame_*.png")))
-        
+
+        frame_files = sorted(glob.glob(os.path.join(frames_dir, "frame_*.jpg")))
+
         if len(frame_files) == 0:
             raise ValueError(f"No frames found in {frames_dir}")
         
@@ -350,10 +874,10 @@ class CoTrackerRGBD:
         else:
             new_h, new_w = original_h, original_w
         
-        # Temporal downsampling: keep max 60 frames
+        # Temporal downsampling: keep max 30 frames
         original_T = len(frame_files)
-        if original_T > 60:
-            stride = max(1, original_T // 60)
+        if original_T > 30:
+            stride = max(1, original_T // 30)
             frame_files = frame_files[::stride]
             print(f"Temporal downsampling: {original_T} → {len(frame_files)} frames (stride={stride})")
         

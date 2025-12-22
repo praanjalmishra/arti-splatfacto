@@ -15,11 +15,11 @@ from typing import List, Optional, Tuple
 from tqdm import tqdm
 import time
 
-from data_structures import (
+from joint_estimator.data_structures import (
     Trajectory3D, RANSACConfig, JointType, ModelFitResult, 
     JointEstimationResult
 )
-from joint_model import JointModelBase, create_joint_models
+from joint_estimator.joint_model import JointModelBase, create_joint_models
 
 
 
@@ -101,7 +101,6 @@ class RANSACCore:
                 if self.config.use_tms_preclustering and clusters:
                     result = self._expand_to_full_clusters(result, clusters, joint_model)
                 
-                # Prefer more inliers, but break ties with lower error
                 if (best_result is None or
                     result.inlier_count > best_result.inlier_count or
                     (result.inlier_count == best_result.inlier_count and 

@@ -706,155 +706,179 @@ class PostProcessor:
                         trajectories_3d: List[Trajectory3D],
                         title: str = "Joint Estimation Result") -> None:
         """
-        Create 3D visualization of joint estimation result.
-        
-        Args:
-            result: Joint estimation result
-            trajectories_3d: All trajectories (for context)
-            title: Plot title
+        Clean 3D visualization of joint estimation result.
+        Simpler look: no grid, clearer joint representation,
+        cleaner distinction between inliers and outliers.
         """
         fig = plt.figure(figsize=(12, 8))
-        ax = fig.add_subplot(111, projection='3d')
-        
+        ax = fig.add_subplot(111, projection="3d")
+
+        # -----------------------------------------
         # Plot all trajectories
+        # -----------------------------------------
         for traj in trajectories_3d:
             pts = traj.get_all_positions()
-            
-            if result.success and traj in result.inlier_trajectories:
-                color = "green"
-                alpha = 0.8
-                linewidth = 2
-                label = "Inliers" if traj == result.inlier_trajectories[0] else ""
-            else:
-                color = "red"
-                alpha = 0.4
-                linewidth = 1
-                label = "Outliers" if traj == trajectories_3d[0] and traj not in result.inlier_trajectories else ""
-            
-            ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], 
-                   color=color, alpha=alpha, linewidth=linewidth, label=label)
-            
-            # Mark start and end points
-            ax.scatter(pts[0, 0], pts[0, 1], pts[0, 2], 
-                      color=color, s=30, alpha=0.8, marker='o')
-            ax.scatter(pts[-1, 0], pts[-1, 1], pts[-1, 2], 
-                      color=color, s=30, alpha=0.8, marker='s')
-        
-        # Plot estimated joint
+
+            is_inlier = result.success and traj in result.inlier_trajectories
+
+            color = "green" if is_inlier else "red"
+            linewidth = 2 if is_inlier else 1
+            alpha = 0.9 if is_inlier else 0.4
+
+            label = ""
+            if traj == trajectories_3d[0]:
+                label = "Inliers" if is_inlier else "Outliers"
+
+            ax.plot(
+                pts[:, 0], pts[:, 1], pts[:, 2],
+                color=color, linewidth=linewidth, alpha=alpha, label=label
+            )
+
+            # Mark start (circle) and end (square)
+            ax.scatter(*pts[0], color=color, s=30, alpha=alpha, marker="o")
+            ax.scatter(*pts[-1], color=color, s=30, alpha=alpha, marker="s")
+
+        # -----------------------------------------
+        # Visualize the estimated joint
+        # -----------------------------------------
         if result.success:
-            if result.joint_type == JointType.HINGE:
-                hinge_params = result.get_hinge_params()
-                
-                # Draw rotation axis
-                axis_length = 2.0
-                axis_start = hinge_params.pivot - axis_length * hinge_params.axis
-                axis_end = hinge_params.pivot + axis_length * hinge_params.axis
-                
-                ax.plot([axis_start[0], axis_end[0]], 
-                       [axis_start[1], axis_end[1]], 
-                       [axis_start[2], axis_end[2]], 
-                       'blue', linewidth=4, label='Hinge Axis')
-                
-                # Mark pivot point
-                ax.scatter(hinge_params.pivot[0], hinge_params.pivot[1], hinge_params.pivot[2],
-                          color='blue', s=200, marker='*', label='Pivot')
-                
-            elif result.joint_type == JointType.SLIDER:
-                slider_params = result.get_slider_params()
-                
-                # Draw slider direction
-                if slider_params.reference_point is not None:
-                    ref_point = slider_params.reference_point
+
+            # ------------------------------
+            # HINGE JOINT
+            # ------------------------------
+            if result.is_hinge():
+                hinge = result.get_hinge_params()
+
+                pivot = hinge.pivot
+                axis = hinge.axis / np.linalg.norm(hinge.axis)
+
+                # Axis line
+                L = 2.0
+                p1 = pivot - L * axis
+                p2 = pivot + L * axis
+
+                ax.plot(
+                    [p1[0], p2[0]],
+                    [p1[1], p2[1]],
+                    [p1[2], p2[2]],
+                    color="blue", linewidth=3, label="Hinge Axis"
+                )
+
+                # Pivot point
+                ax.scatter(*pivot, color="blue", s=120, marker="*", label="Pivot")
+
+            # ------------------------------
+            # SLIDER JOINT
+            # ------------------------------
+            elif result.is_slider():
+                slider = result.get_slider_params()
+
+                if slider.reference_point is not None:
+                    ref = slider.reference_point
                 else:
-                    # Use centroid of inlier trajectories as reference
-                    all_points = []
-                    for traj in result.inlier_trajectories:
-                        all_points.extend(traj.get_all_positions())
-                    ref_point = np.mean(all_points, axis=0)
-                
-                direction_length = 2.0
-                dir_start = ref_point - direction_length * slider_params.direction
-                dir_end = ref_point + direction_length * slider_params.direction
-                
-                ax.plot([dir_start[0], dir_end[0]], 
-                       [dir_start[1], dir_end[1]], 
-                       [dir_start[2], dir_end[2]], 
-                       'blue', linewidth=4, label='Slide Direction')
-                
-                # Mark reference point
-                ax.scatter(ref_point[0], ref_point[1], ref_point[2],
-                          color='blue', s=200, marker='*', label='Reference')
-        
+                    pts = np.vstack([t.get_all_positions() for t in result.inlier_trajectories])
+                    ref = np.mean(pts, axis=0)
+
+                direction = slider.direction / np.linalg.norm(slider.direction)
+
+                L = 2.0
+                p1 = ref - L * direction
+                p2 = ref + L * direction
+
+                ax.plot(
+                    [p1[0], p2[0]],
+                    [p1[1], p2[1]],
+                    [p1[2], p2[2]],
+                    color="blue", linewidth=3, label="Slide Dir"
+                )
+
+                ax.scatter(*ref, color="blue", s=120, marker="*", label="Reference")
+
+        # -----------------------------------------
         # Formatting
+        # -----------------------------------------
         ax.legend()
-        ax.set_xlabel('X (m)')
-        ax.set_ylabel('Y (m)')
-        ax.set_zlabel('Z (m)')
-        
-        # Create comprehensive title
+        ax.set_xlabel("X [m]")
+        ax.set_ylabel("Y [m]")
+        ax.set_zlabel("Z [m]")
+        ax.grid(False)  # Remove grid for cleaner journal-style visuals
+
+        # Title
         if result.success:
-            confidence_str = f"(Confidence: {result.confidence:.2f})"
-            inlier_str = f"{len(result.inlier_trajectories)}/{result.total_trajectories} inliers"
-            full_title = f"{title}\n{result.joint_type.value.upper()} Joint {confidence_str} - {inlier_str}"
+            conf = f"(Confidence: {result.confidence:.2f})"
+            inl = f"{len(result.inlier_trajectories)}/{result.total_trajectories} inliers"
+            full_title = f"{title}\n{result.joint_type.value.upper()} Joint {conf} - {inl}"
         else:
             full_title = f"{title}\nFAILED: {result.error_message}"
-        
         ax.set_title(full_title)
-        
-        # Set equal aspect ratio
-        all_points = []
-        for traj in trajectories_3d:
-            all_points.extend(traj.get_all_positions())
-        
-        if all_points:
-            all_points = np.array(all_points)
-            max_range = np.max(np.ptp(all_points, axis=0)) / 2
-            mid_point = np.mean(all_points, axis=0)
-            
-            ax.set_xlim(mid_point[0] - max_range, mid_point[0] + max_range)
-            ax.set_ylim(mid_point[1] - max_range, mid_point[1] + max_range)
-            ax.set_zlim(mid_point[2] - max_range, mid_point[2] + max_range)
-        
+
+        # Equal aspect ratio
+        all_pts = np.vstack([t.get_all_positions() for t in trajectories_3d])
+        mid = np.mean(all_pts, axis=0)
+        span = np.ptp(all_pts, axis=0).max() / 2
+
+        ax.set_xlim(mid[0] - span, mid[0] + span)
+        ax.set_ylim(mid[1] - span, mid[1] + span)
+        ax.set_zlim(mid[2] - span, mid[2] + span)
+
         plt.tight_layout()
         plt.show()
+
+    
     
     def plot_motion_over_time(self,
-                             per_frame_values: Dict[int, float],
-                             joint_type: JointType,
-                             title: str = "Joint Motion Over Time") -> None:
+                            per_frame_values: Dict[int, float],
+                            joint_type: JointType,
+                            title: str = "Joint Motion Over Time") -> None:
         """
-        Plot joint motion (angle or translation) over time.
-        
-        Args:
-            per_frame_values: Dictionary mapping frame indices to motion values
-            joint_type: Type of joint (for axis labeling)
-            title: Plot title
+        Clean 2D plot of joint motion over time (angle or translation).
+        Publication-friendly: simple, uncluttered, no unnecessary elements.
         """
         if not per_frame_values:
             print("No per-frame values to plot")
             return
-        
+
         # Sort by frame index
         frames = sorted(per_frame_values.keys())
         values = [per_frame_values[f] for f in frames]
-        
+
         plt.figure(figsize=(10, 6))
-        plt.plot(frames, values, 'b-', linewidth=2, marker='o', markersize=4)
-        plt.grid(True, alpha=0.3)
-        plt.xlabel('Frame Index')
-        
+
+        # ---- HINGE ----
         if joint_type == JointType.HINGE:
-            # Convert to degrees for display
-            values_deg = [np.degrees(v) for v in values]
-            plt.plot(frames, values_deg, 'b-', linewidth=2, marker='o', markersize=4)
-            plt.ylabel('Angle (degrees)')
-            plt.title(f"{title}\nHinge Joint Rotation")
-        elif joint_type == JointType.SLIDER:
-            plt.ylabel('Translation (m)')
-            plt.title(f"{title}\nSlider Joint Translation")
-        
+            values_deg = np.degrees(values)
+
+            plt.plot(
+                frames, values_deg,
+                linewidth=2, marker='o', markersize=4,
+                color='blue'
+            )
+
+            ylabel = "Angle (degrees)"
+            subtitle = "Hinge Joint Rotation"
+
+        # ---- SLIDER ----
+        else:
+            plt.plot(
+                frames, values,
+                linewidth=2, marker='o', markersize=4,
+                color='blue'
+            )
+
+            ylabel = "Translation (m)"
+            subtitle = "Slider Joint Translation"
+
+        # Formatting
+        plt.xlabel("Frame Index")
+        plt.ylabel(ylabel)
+        plt.title(f"{title}\n{subtitle}")
+
+        # Light or no grid depending on preference
+        plt.grid(False)  # cleaner for journal figures
+
         plt.tight_layout()
         plt.show()
+
 
 
 def process_joint_result(result: JointEstimationResult, 

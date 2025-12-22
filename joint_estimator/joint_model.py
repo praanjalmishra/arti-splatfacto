@@ -14,7 +14,7 @@ from typing import List, Tuple, Optional, Dict
 from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation
 
-from data_structures import (
+from joint_estimator.data_structures import (
     Trajectory3D, Point3D, HingeParameters, SliderParameters,
     JointType, ModelFitResult
 )
@@ -122,68 +122,65 @@ class HingeJointModel(JointModelBase):
     
     def fit_from_sample(self, trajectory_sample: List[Trajectory3D]) -> Optional[HingeParameters]:
         """
-        Fit hinge parameters using the Mobility Fitting approach from Li & Wan 2016.
-        
-        Algorithm (following paper exactly):
-        1. Extract rigid transformation M=(R,t) between two frames
-        2. Hinge axis = eigenvector of R with eigenvalue 1
-        3. Hinge pivot c from: (I-R)c = t
+        Robust hinge fitting using multi-frame circular fitting.
+        Falls back to the classic Li & Wan 2016 two-frame method if needed.
         """
         if not self.validate_sample(trajectory_sample):
             return None
-        
+
         try:
-            # Use first trajectory with sufficient length
-            traj = None
-            for t in trajectory_sample:
+            centers = []
+            axes = []
+
+            # --- Use several trajectories to fit local circles ---
+            for traj in trajectory_sample:
+                pts = np.array([[p.x, p.y, p.z] for p in traj.points])
+                if len(pts) < 3:
+                    continue
+
+                # Pick three roughly spread-out frames
+                p1 = pts[0]
+                p2 = pts[len(pts) // 2]
+                p3 = pts[-1]
+
+                try:
+                    center, axis = self._fit_simple_circle(p1, p2, p3)
+                    if np.all(np.isfinite(center)) and np.all(np.isfinite(axis)):
+                        centers.append(center)
+                        axes.append(axis)
+                except Exception:
+                    continue
+
+            if len(centers) >= 2:
+                # Align axes so they point roughly the same direction
+                reference_axis = axes[0]
+                for i in range(1, len(axes)):
+                    if np.dot(axes[i], reference_axis) < 0:
+                        axes[i] = -axes[i]
+
+                pivot = np.mean(centers, axis=0)
+                axis = np.mean(axes, axis=0)
+                axis /= np.linalg.norm(axis)
+                return HingeParameters(axis=axis, pivot=pivot)
+
+            # --- Fallback: small motion, use Li & Wan method ---
+            if len(trajectory_sample) >= 1:
+                t = trajectory_sample[0]
                 if len(t.points) >= 2:
-                    traj = t
-                    break
-            
-            if traj is None:
-                return None
-            
-            # Get two frames from trajectory (first and last for maximum motion)
-            points_i = np.array([traj.points[0].x, traj.points[0].y, traj.points[0].z])
-            points_j = np.array([traj.points[-1].x, traj.points[-1].y, traj.points[-1].z])
-            
-            # For multiple trajectories, collect point correspondences
-            if len(trajectory_sample) > 1:
-                points_t1 = []
-                points_t2 = []
-                
-                for t in trajectory_sample:
-                    if len(t.points) >= 2:
-                        p1 = np.array([t.points[0].x, t.points[0].y, t.points[0].z])
-                        p2 = np.array([t.points[-1].x, t.points[-1].y, t.points[-1].z])
-                        points_t1.append(p1)
-                        points_t2.append(p2)
-                
-                if len(points_t1) < 2:
-                    return None
-                    
-                points_t1 = np.array(points_t1)
-                points_t2 = np.array(points_t2)
-            else:
-                # Single trajectory - create artificial correspondence
-                points_t1 = points_i.reshape(1, -1)
-                points_t2 = points_j.reshape(1, -1)
-            
-            # Estimate rigid transformation M = (R, t) using Procrustes/Kabsch
-            R, t = self._estimate_rigid_transform_kabsch(points_t1, points_t2)
-            
-            # Extract hinge axis (eigenvector of R with eigenvalue 1)
-            axis = self._extract_rotation_axis(R)
-            if axis is None:
-                return None
-            
-            # Find pivot point: (I - R)c = t
-            pivot = self._solve_pivot_point(R, t)
-            
-            return HingeParameters(axis=axis, pivot=pivot)
-            
-        except Exception as e:
+                    p1 = np.array([t.points[0].x, t.points[0].y, t.points[0].z])
+                    p2 = np.array([t.points[-1].x, t.points[-1].y, t.points[-1].z])
+                    R, trans = self._estimate_rigid_transform_kabsch(p1[None, :], p2[None, :])
+                    axis = self._extract_rotation_axis(R)
+                    if axis is None:
+                        return None
+                    pivot = self._solve_pivot_point(R, trans)
+                    return HingeParameters(axis=axis, pivot=pivot)
+
             return None
+
+        except Exception:
+            return None
+
     
     def _estimate_rigid_transform_kabsch(self, points_t1: np.ndarray, points_t2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """

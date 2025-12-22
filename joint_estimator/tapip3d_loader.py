@@ -10,7 +10,7 @@ from typing import List, Tuple
 from pathlib import Path
 import os
 
-from data_structures import (
+from joint_estimator.data_structures import (
     Trajectory3D, Point3D, TrajectoryFilterConfig
 )
 

@@ -70,93 +70,116 @@ def save_debug_id_maps(trainer, batch):
     """Save ID maps for debugging floater Gaussians in a compact combined image"""
     debug_dir = Path("debug_id_maps")
     debug_dir.mkdir(exist_ok=True, parents=True)
+
+    camera = getattr(trainer, "_current_camera", None)
+    if camera is None:
+        print("⚠ No camera found in batch for debug saving")
+        return
+
+
+    debug_outputs = trainer.get_outputs(camera, render_id_map=True)
+    id_map = debug_outputs["id_map"]        # [H,W,3]
+    obj_mask = debug_outputs["obj_mask"]    # [H,W]
+    canon_mask = debug_outputs["canon_mask"]# [H,W]
+
+
+    rgb_rendered = trainer.get_outputs(camera, render_id_map=False)["rgb"]
+
+
+    gt_img = trainer.get_gt_img(batch["image"])
+
+    d = trainer._get_downscale_factor()
+    if d > 1:
+        import torchvision.transforms.functional as TF
+        newsize = (gt_img.shape[0] // d, gt_img.shape[1] // d)
+        gt_img = TF.resize(gt_img.permute(2,0,1), newsize).permute(1,2,0)
+
+
+    batch_mask = batch.get("mask", None)  # [H,W,1] or None
+    if batch_mask is not None:
+        batch_mask = trainer._downscale_if_required(batch_mask)
+        batch_mask = batch_mask.squeeze(-1)
+        batch_mask_np = batch_mask.detach().cpu().numpy()
+    else:
+        batch_mask_np = None
+
+    to_np = lambda x: x.detach().cpu().numpy()
+
+    id_map_np = to_np(id_map)
+    obj_mask_np = to_np(obj_mask)
+    canon_mask_np = to_np(canon_mask)
+    rgb_rendered_np = to_np(rgb_rendered)
+    gt_img_np = to_np(gt_img)
+
+    import cv2
+    H, W = gt_img_np.shape[:2]
+
+    # Never stretch GT – resize everything else
+    resize_mask = lambda m: cv2.resize(m.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST)
+
+    if rgb_rendered_np.shape[:2] != (H, W):
+        rgb_rendered_np = cv2.resize(rgb_rendered_np, (W, H), interpolation=cv2.INTER_AREA)
+
+    if id_map_np.shape[:2] != (H, W):
+        id_map_np = cv2.resize(id_map_np, (W, H), interpolation=cv2.INTER_NEAREST)
+
+    if obj_mask_np.shape[:2] != (H, W):
+        obj_mask_np = resize_mask(obj_mask_np)
+
+    if canon_mask_np.shape[:2] != (H, W):
+        canon_mask_np = resize_mask(canon_mask_np)
+
+    if batch_mask_np is not None and batch_mask_np.shape[:2] != (H, W):
+        batch_mask_np = resize_mask(batch_mask_np)
+
+    fig = plt.figure(figsize=(18, 12))
+    gs = fig.add_gridspec(2, 3, hspace=0.25, wspace=0.15)
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.imshow(gt_img_np)
+    ax1.set_title("Ground Truth")
+    ax1.axis("off")
+
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.imshow(rgb_rendered_np)
+    ax2.set_title("Rendered RGB")
+    ax2.axis("off")
+
+    ax3 = fig.add_subplot(gs[0, 2])
+    diff_rgb = np.abs(gt_img_np - rgb_rendered_np).mean(axis=-1)
+    ax3.imshow(diff_rgb, cmap="hot")
+    ax3.set_title(f"Diff (MAE={diff_rgb.mean():.4f})")
+    ax3.axis("off")
+
+    ax4 = fig.add_subplot(gs[1, 0])
+    ax4.imshow(id_map_np)
+    ax4.set_title("ID Map")
+    ax4.axis("off")
+
+    ax5 = fig.add_subplot(gs[1, 1])
+    ax5.imshow(obj_mask_np, cmap="gray")
+    ax5.set_title("Object Mask")
+    ax5.axis("off")
+
+    ax6 = fig.add_subplot(gs[1, 2])
+    combined_vis = np.zeros((H, W, 3), dtype=np.float32)
+    # combined_vis[..., 0] = obj_mask_np
+    # combined_vis[..., 1] = canon_mask_np
+    if batch_mask_np is not None:
+        combined_vis[..., 2] = batch_mask_np
+    ax6.imshow(combined_vis)
+    ax6.set_title("BatchMask (B)")
+    ax6.axis("off")
+
+    fig.suptitle(f"Debug Visualization — Step {trainer.step:06d}")
+
+    outpath = debug_dir / f"step{trainer.step:06d}_debug.png"
+    plt.savefig(outpath, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
     
-    try:
-        camera = getattr(trainer, '_current_camera', None)
-        if camera is None:
-            print("⚠ No camera found in batch for debug saving")
-            return
-        
-        debug_outputs = trainer.get_outputs(camera, render_id_map=True)
-        id_map = debug_outputs["id_map"]
-        obj_mask = debug_outputs["obj_mask"] 
-        canon_mask = debug_outputs["canon_mask"]
-        
-        normal_outputs = trainer.get_outputs(camera, render_id_map=False)
-        rgb_rendered = normal_outputs["rgb"]
-        
-        gt_img = trainer.get_gt_img(batch["image"])
-        if trainer._get_downscale_factor() > 1:
-            import torchvision.transforms.functional as TF
-            d = trainer._get_downscale_factor()
-            newsize = (gt_img.shape[0] // d, gt_img.shape[1] // d)
-            gt_img = TF.resize(gt_img.permute(2, 0, 1), newsize, antialias=None).permute(1, 2, 0)
-        
-        # Convert to numpy
-        to_numpy = lambda x: x.detach().cpu().numpy()
-        id_map_np = to_numpy(id_map)
-        obj_mask_np = to_numpy(obj_mask)
-        canon_mask_np = to_numpy(canon_mask)
-        rgb_rendered_np = to_numpy(rgb_rendered)
-        gt_img_np = to_numpy(gt_img)
-        
-        fig = plt.figure(figsize=(18, 12))
-        gs = fig.add_gridspec(2, 3, hspace=0.25, wspace=0.15)
-        
-        ax1 = fig.add_subplot(gs[0, 0])
-        ax1.imshow(gt_img_np)
-        ax1.set_title("Ground Truth", fontsize=12, fontweight='bold')
-        ax1.axis('off')
-        
-        ax2 = fig.add_subplot(gs[0, 1])
-        ax2.imshow(rgb_rendered_np)
-        ax2.set_title("Rendered RGB", fontsize=12, fontweight='bold')
-        ax2.axis('off')
-        
-        ax3 = fig.add_subplot(gs[0, 2])
-        diff_rgb = np.abs(gt_img_np - rgb_rendered_np).mean(axis=-1)
-        im3 = ax3.imshow(diff_rgb, cmap='hot')
-        ax3.set_title(f"Difference (MAE: {diff_rgb.mean():.4f})", fontsize=12, fontweight='bold')
-        ax3.axis('off')
-        # plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
-        
-        ax4 = fig.add_subplot(gs[1, 0])
-        if len(id_map_np.shape) == 2 or (len(id_map_np.shape) == 3 and id_map_np.shape[-1] == 1):
-            id_map_vis = id_map_np.squeeze() if len(id_map_np.shape) == 3 else id_map_np
-            im4 = ax4.imshow(id_map_vis, cmap='tab20')
-        else:
-            im4 = ax4.imshow(id_map_np)
-        unique_ids = len(np.unique(id_map_np))
-        ax4.set_title(f"ID Map ({unique_ids} objects)", fontsize=12, fontweight='bold')
-        ax4.axis('off')
-        
-        ax5 = fig.add_subplot(gs[1, 1])
-        im5 = ax5.imshow(obj_mask_np, cmap='viridis', vmin=0, vmax=1)
-        ax5.set_title(f"Object Mask ({obj_mask_np.mean():.1%})", fontsize=12, fontweight='bold')
-        ax5.axis('off')
-        # plt.colorbar(im5, ax=ax5, fraction=0.046, pad=0.04)
-        
-        ax6 = fig.add_subplot(gs[1, 2])
-        im6 = ax6.imshow(canon_mask_np, cmap='plasma', vmin=0, vmax=1)
-        ax6.set_title(f"Canonical Mask ({canon_mask_np.mean():.1%})", fontsize=12, fontweight='bold')
-        ax6.axis('off')
-        # plt.colorbar(im6, ax=ax6, fraction=0.046, pad=0.04)
-        
-        fig.suptitle(f"Debug Visualization - Step {trainer.step:06d}", 
-                     fontsize=16, fontweight='bold')
-        
-        output_path = debug_dir / f"step{trainer.step:06d}_combined_debug.png"
-        plt.savefig(output_path, dpi=120, bbox_inches='tight')
-        plt.close(fig)
-        
         # print(f"✓ Saved debug to {output_path}")
         
-    except Exception as e:
-        print(f"✗ Failed to save debug ID maps: {e}")
-        import traceback
-        traceback.print_exc()
-
-
 def save_depth_debug(step: int, depth_out: torch.Tensor, depth_gt: torch.Tensor,
                      mask: torch.Tensor = None, scale: float = None, shift: float = None):
     """

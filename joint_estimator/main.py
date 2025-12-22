@@ -21,17 +21,19 @@ import torch
 from pathlib import Path
 from typing import Optional
 
-from data_structures import (
+from joint_estimator.data_structures import (
     PipelineConfig, CameraIntrinsics, RANSACConfig, TrajectoryFilterConfig,
     create_default_config
 )
-from cotracker_rgbd import process_rgbd_video
+# from cotracker_rgbd import process_rgbd_video
 from joint_estimator.preprocessing_traj import preprocess_trajectories
-from ransac_core import estimate_joint_from_trajectories
-from post_processing import process_joint_result, visualize_joint_result
-from utils import export_joint_and_inliers, export_joint_and_inliers_tapip3d, save_result_to_json
+from joint_estimator.ransac_core import estimate_joint_from_trajectories
+from joint_estimator.post_processing import plot_joint_motion, process_joint_result, visualize_joint_result
+from joint_estimator.utils import export_joint_and_inliers, export_joint_and_inliers_tapip3d, save_result_to_json
 
 from joint_estimator.obj_mask_gen import TemporalVoxelMaskGenerator, integrate_with_joint_estimation, visualize_voxel_mask
+from joint_estimator.tapip3d_loader import load_tapip3d_trajectories
+
 
 class JointEstimator:
     """
@@ -159,7 +161,6 @@ class JointEstimator:
         
         # Phase 1: Load TAPIP3D Trajectories
         print("\n📦 PHASE 1: Loading TAPIP3D Trajectories")
-        from tapip3d_loader import load_tapip3d_trajectories
         
         trajectories_3d, metadata = load_tapip3d_trajectories(
             npz_path=tapip3d_result_path,
@@ -176,11 +177,12 @@ class JointEstimator:
         print("\n🔧 PHASE 1.5: Preprocessing Trajectories")
         trajectories_3d = preprocess_trajectories(
             trajectories_3d,
-            smooth_window=5,
-            min_length=15,
-            min_displacement=0.01,
+            smooth_window=10,
+            min_length=5,
+            min_displacement=0.05,
             max_acceleration_percentile=95,
-            accel_threshold=0.5
+            accel_threshold=0.5,
+            sample_stride=4,
         )
         
         # Phase 2: RANSAC Joint Fitting
@@ -201,6 +203,8 @@ class JointEstimator:
         # Phase 3: Post-Processing
         print("\n PHASE 3: Post-Processing & Range Calculation")
         final_result, per_frame_values = process_joint_result(ransac_result)
+
+
         
         total_time = time.time() - total_start_time
         print(f"4D RANSAC complete in {total_time:.2f}s")
@@ -210,6 +214,7 @@ class JointEstimator:
             print("\nPHASE 4: Visualization")
             visualize_joint_result(final_result, trajectories_3d, 
                                 "4D RANSAC Joint Estimation (TAPIP3D)")
+            plot_joint_motion(per_frame_values, final_result.joint_type)
         
         return final_result, per_frame_values
         
@@ -334,7 +339,7 @@ def main():
     
     parser.add_argument("--use_temporal_voxels", action="store_true",
                        help="Use temporal RGB-D voxelization instead of sparse trajectories")
-    parser.add_argument("--voxel_resolution", type=int, default=16,
+    parser.add_argument("--voxel_resolution", type=int, default=32,
                        help="Voxel grid resolution (e.g., 32³)")
     parser.add_argument("--depth_scale", type=float, default=1000.0,
                        help="Depth scale factor (1000 for mm → m)")
@@ -344,7 +349,7 @@ def main():
                        help="Minimum valid depth (meters)")
     parser.add_argument("--use_tsdf", action="store_true",
                        help="Use TSDF instead of binary occupancy")
-    parser.add_argument("--frame_subsample", type=int, default=20,
+    parser.add_argument("--frame_subsample", type=int, default=10,
                        help="Process every Nth frame for voxelization")
     parser.add_argument("--voxel_dilate", type=int, default=1,
                        help="Number of dilation iterations on voxel grid")
@@ -364,7 +369,7 @@ def main():
                        help="Maximum RANSAC iterations")
     parser.add_argument("--error_threshold", type=float, default=0.05,
                        help="Error threshold for inliers (meters)")
-    parser.add_argument("--min_inliers", type=int, default=30,
+    parser.add_argument("--min_inliers", type=int, default=15,
                        help="Minimum inliers to accept model")
     parser.add_argument("--min_trajectory_length", type=int, default=5,
                        help="Minimum trajectory length")
@@ -460,16 +465,16 @@ def main():
         return 1
     
 
-    if args.out_dir and args.video_path :
-        export_joint_and_inliers(
-            result=result,
-            inlier_trajectories=result.inlier_trajectories,
-            extrinsics=args.extrinsics,
-            output_dir=args.out_dir,
-            filename_prefix="prismatic" if result.joint_type.value == "slider" else "revolute"
-        )
-        save_result_to_json(result, per_frame_values, Path(args.out_dir) / "joint_schemas.json", coordinate_system="world")
-        print(f"Results saved to: {Path(args.out_dir) / 'joint_schemas.json'}")
+    # if args.out_dir and args.video_path :
+    #     export_joint_and_inliers(
+    #         result=result,
+    #         inlier_trajectories=result.inlier_trajectories,
+    #         extrinsics=args.extrinsics,
+    #         output_dir=args.out_dir,
+    #         filename_prefix="prismatic" if result.joint_type.value == "slider" else "revolute"
+    #     )
+    #     save_result_to_json(result, per_frame_values, Path(args.out_dir) / "joint_schemas.json", coordinate_system="world")
+    #     print(f"Results saved to: {Path(args.out_dir) / 'joint_schemas.json'}")
 
 
     # if args.out_dir and not args.video_path :
@@ -488,20 +493,27 @@ def main():
         print("="*60)
         
         voxel_generator = TemporalVoxelMaskGenerator(
-            voxel_resolution=args.voxel_resolution,
+            voxel_resolution=16,
             depth_scale=args.depth_scale,
             depth_max=args.depth_max,
             depth_min=args.depth_min,
             use_tsdf=args.use_tsdf,
-            padding=0.0
+            padding=-0.02 
         )
-        
+
+        frames = metadata['frames']
+
+        selected_indices = range(1, 100)  
+
+
         voxel_data = voxel_generator.generate_voxel_mask(
             data_dir=args.data_dir,
             metadata_path=args.camera_metadata,
+            frame_indices=selected_indices,
             subsample_rate=args.frame_subsample,
             dilate_iterations=args.voxel_dilate
         )
+
         
         # Integrate with joint estimation
         integrate_with_joint_estimation(
@@ -511,7 +523,7 @@ def main():
             filename_prefix="prismatic" if result.joint_type.value == "slider" else "revolute"
         )
         
-        # Optional: Visualize voxel mask
+        # # Optional: Visualize voxel mask
         if not args.no_viz:
             visualize_voxel_mask(voxel_data, "Temporal Articulation Mask")
         

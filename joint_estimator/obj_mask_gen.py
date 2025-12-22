@@ -57,27 +57,51 @@ class TemporalVoxelMaskGenerator:
         return metadata
     
     def load_depth_image(self, depth_path: str) -> np.ndarray:
-        """Load depth image (.npy or .png) and convert to meters."""
+        """Load depth image with noise filtering."""
         path = Path(depth_path)
         if not path.exists():
             raise FileNotFoundError(f"Depth image not found: {depth_path}")
 
         if path.suffix == ".npy":
             depth = np.load(path).astype(np.float32)
-            # Optional sanity: if values are in mm scale
-            if np.max(depth) > 100:   # e.g., 5000 → mm
+            if np.max(depth) > 100:
                 depth = depth / 1000.0
-            return depth
-
-        depth_img = cv2.imread(str(path), cv2.IMREAD_ANYDEPTH)
-        if depth_img is None:
-            raise FileNotFoundError(f"Unable to load depth image: {path}")
-
-        # Convert to meters (uses existing config values)
-        depth_meters = depth_img.astype(np.float32) / self.depth_scale
-        depth_meters[depth_meters < self.depth_min] = 0
-        depth_meters[depth_meters > self.depth_max] = 0
-        return depth_meters
+        else:
+            depth_img = cv2.imread(str(path), cv2.IMREAD_ANYDEPTH)
+            if depth_img is None:
+                raise FileNotFoundError(f"Unable to load depth image: {path}")
+            depth = depth_img.astype(np.float32) / self.depth_scale
+        
+        # ========== NOISE FILTERING ==========
+        
+        # 1. Remove invalid depths
+        depth[depth < self.depth_min] = 0
+        depth[depth > self.depth_max] = 0
+        
+        # 2. Bilateral filter (preserves edges, removes noise)
+        depth_filtered = cv2.bilateralFilter(
+            depth.astype(np.float32),
+            d=5,           # Neighborhood size
+            sigmaColor=0.03,  # Color space sigma (depth similarity)
+            sigmaSpace=5   # Coordinate space sigma
+        )
+        
+        # 3. Remove isolated pixels (flying pixels)
+        kernel = np.ones((3, 3), np.uint8)
+        valid_mask = (depth_filtered > 0).astype(np.uint8)
+        valid_mask = cv2.morphologyEx(valid_mask, cv2.MORPH_OPEN, kernel)
+        depth_filtered[valid_mask == 0] = 0
+        
+        # 4. Depth gradient filtering (remove high-gradient regions)
+        grad_x = np.abs(np.gradient(depth_filtered, axis=1))
+        grad_y = np.abs(np.gradient(depth_filtered, axis=0))
+        gradient_mag = np.sqrt(grad_x**2 + grad_y**2)
+        
+        # Remove pixels with high depth gradients (likely noise/edges)
+        gradient_threshold = 0.05  # 5cm gradient threshold
+        depth_filtered[gradient_mag > gradient_threshold] = 0
+        
+        return depth_filtered
 
     
     def load_mask_image(self, mask_path: str) -> np.ndarray:
@@ -227,7 +251,7 @@ class TemporalVoxelMaskGenerator:
     def compute_robust_bbox(
         self,
         points: np.ndarray,
-        quantile: float = 0.02
+        quantile: float = 0.05
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute robust bounding box using quantiles to filter outliers.

@@ -8,7 +8,7 @@ from typing import List
 from scipy.signal import savgol_filter
 from scipy.ndimage import uniform_filter1d
 
-from data_structures import Trajectory3D, Point3D
+from joint_estimator.data_structures import Trajectory3D, Point3D
 
 
 
@@ -16,11 +16,11 @@ def preprocess_trajectories(
     trajectories: List[Trajectory3D],
     smooth_window: int = 5,
     min_length: int = 5,
-    min_displacement: float = 0.01,
+    min_displacement: float = 0.1,
     max_acceleration_percentile: float = 95,
     accel_threshold: float = 0.5,
     use_savgol: bool = True,
-    sample_stride: int = 5,
+    sample_stride: int = 1,
 ) -> List[Trajectory3D]:
     """
     Joint-agnostic trajectory preprocessing.

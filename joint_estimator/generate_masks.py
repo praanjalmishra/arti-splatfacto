@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 def load_data(data_dir: Path, voxel_subdir="obj_masks", voxel_filename="obj_prismatic.pt"):
     """Load transforms and voxel data."""
-    with open(data_dir / "transforms_post.json", "r") as f:
+    with open(data_dir / "transforms_arti.json", "r") as f:
         T = json.load(f)
     
     pt_path = data_dir / voxel_subdir / voxel_filename
@@ -50,6 +50,7 @@ def rotate_around_axis(points, axis, pivot, angle):
     """
     axis = axis / torch.norm(axis)
     points_centered = points - pivot.unsqueeze(0)
+    angle = torch.as_tensor(angle, dtype=torch.float32, device=points.device)
     
     cos_angle = torch.cos(angle)
     sin_angle = torch.sin(angle)
@@ -278,8 +279,8 @@ def main(data_dir="data/gs_t_multi_post",
 
         # Save masks
         img_name = Path(img_rel).stem
-        mask_pre_rel = f"masks_pre/{img_name}.png"
-        mask_post_rel = f"masks_post/{img_name}.png"
+        mask_pre_rel = f"masks_pre/{img_name}.jpg"
+        mask_post_rel = f"masks_post/{img_name}.jpg"
 
         cv2.imwrite(str(data_dir / mask_pre_rel), mask_pre)
         cv2.imwrite(str(data_dir / mask_post_rel), mask_post)
@@ -299,19 +300,19 @@ def main(data_dir="data/gs_t_multi_post",
                     overlay_pre = rgb.copy()
                     overlay_pre[mask_pre > 0] = [0, 0, 255]  # Red (BGR)
                     result_pre = cv2.addWeighted(rgb, 0.7, overlay_pre, 0.3, 0)
-                    cv2.imwrite(str(overlay_pre_dir / f"{img_name}.png"), result_pre)
+                    cv2.imwrite(str(overlay_pre_dir / f"{img_name}.jpg"), result_pre)
                     
                     # Post overlay (green for articulated pose)
                     overlay_post = rgb.copy()
                     overlay_post[mask_post > 0] = [0, 255, 0]  # Green (BGR)
                     result_post = cv2.addWeighted(rgb, 0.7, overlay_post, 0.3, 0)
-                    cv2.imwrite(str(overlay_post_dir / f"{img_name}.png"), result_post)
+                    cv2.imwrite(str(overlay_post_dir / f"{img_name}.jpg"), result_post)
 
     # Save updated JSON
     if update_json:
-        tj = data_dir / "transforms_post.json"
+        tj = data_dir / "transforms_arti.json"
         if backup_json and tj.exists():
-            backup_path = data_dir / "transforms_post.backup.json"
+            backup_path = data_dir / "transforms_arti.backup.json"
             backup_path.write_bytes(tj.read_bytes())
             print(f"\n✅ Backup written: {backup_path}")
         
@@ -331,8 +332,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description="Generate 2D masks for articulated objects (prismatic or revolute joints)"
     )
-    ap.add_argument("data_dir", 
-                    help="Path containing obj_masks/, rgb/, transforms_post.json")
+    ap.add_argument("--data_dir", 
+                    help="Path containing obj_masks/, rgb/, transforms_arti.json")
     ap.add_argument("--voxel-subdir", default="obj_masks",
                     help="Subdirectory containing voxel .pt file")
     ap.add_argument("--voxel-file", default=None,
@@ -340,9 +341,9 @@ if __name__ == "__main__":
     ap.add_argument("--overlays", action="store_true",
                     help="Write RGB overlays for debugging")
     ap.add_argument("--no-update-json", action="store_true",
-                    help="Do not modify transforms_post.json")
+                    help="Do not modify transforms_arti.json")
     ap.add_argument("--backup-json", action="store_true", default=True,
-                    help="Write transforms_post.backup.json before editing")
+                    help="Write transforms_arti.backup.json before editing")
     ap.add_argument("--close-kernel", type=int, default=9,
                     help="Morphological closing kernel size")
     ap.add_argument("--close-iters", type=int, default=1,
