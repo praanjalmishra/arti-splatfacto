@@ -88,7 +88,7 @@ class ArtiSplatfactoModelConfig(SplatfactoModelConfig):
     use_depth: bool = True
     """If True, use depth information for culling and optimization"""
 
-    depth_lambda: float = 0.5
+    depth_lambda: float = 0.3
     """Weighting factor for depth information in loss function"""
 
     output_depth_during_training: bool = True
@@ -1021,29 +1021,28 @@ class ArtiSplatfactoModel(SplatfactoModel):
                 loss_dict["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)
 
         if self.config.use_depth and "depth_image" in batch and outputs.get("depth") is not None:
-
-            gt_depth = self._downscale_if_required(batch["depth_image"])
-            gt_depth = gt_depth.to(self.device)
-            depth_mask = gt_depth > 0
-            if depth_mask.any():
-                depth_loss = torch.nn.functional.l1_loss(
-                    outputs["depth"][depth_mask], 
-                    gt_depth[depth_mask]
-                )
-                loss_dict["depth_loss"] = depth_loss * self.config.depth_lambda
-
-        if self.config.use_depth and "depth_image" in batch:
+            # Get depth maps
             depth_out = outputs["depth"]
             depth_gt = self.get_gt_img(batch["depth_image"])
             
-            depth_out_loss = depth_out.squeeze(-1).unsqueeze(0)
-            depth_gt_loss = depth_gt.squeeze(-1).unsqueeze(0)
+            # Prepare for loss calculation
+            depth_out_loss = depth_out.squeeze(-1).unsqueeze(0)  # [1, H, W]
+            depth_gt_loss = depth_gt.squeeze(-1).unsqueeze(0)    # [1, H, W]
             
-            mask_loss = torch.ones_like(depth_out_loss)
+            mask_loss = (depth_gt_loss > 0).float()
             
-            depth_loss = self.depth_loss_fn(depth_out_loss, depth_gt_loss, mask_loss)
-            
-            loss_dict["depth_loss"] = depth_loss * self.config.depth_lambda
+            # Check if we have valid pixels
+            if mask_loss.sum() > 0:
+                depth_loss = self.depth_loss_fn(depth_out_loss, depth_gt_loss, mask_loss)
+                loss_dict["depth_loss"] = depth_loss * self.config.depth_lambda
+                
+ 
+            else:
+                # No valid depth pixels
+                loss_dict["depth_loss"] = torch.tensor(0.0, device=self.device)
+                if self.step % 500 == 0:
+                    CONSOLE.print(f"[yellow][Recovery - Step {self.step}] No valid depth pixels![/yellow]")
+
 
         if self.config.use_opacity_regularization and self.training:
             
@@ -1197,7 +1196,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             if num_frames > 1:
                 forward_diff = self.joint_angles_learned[1:] - self.joint_angles_learned[:-1]
                 temporal_reg = torch.mean(forward_diff**2)
-            loss_dict["joint_temporal_smooth"] = 0.05 * temporal_reg
+            loss_dict["joint_temporal_smooth"] = 0.01 * temporal_reg
             
             # --- 2. Acceleration Penalty ---
             # Prevent jerky motion (second-order smoothness)
@@ -1205,7 +1204,7 @@ class ArtiSplatfactoModel(SplatfactoModel):
             if num_frames > 2:
                 accel = self.joint_angles_learned[:-2] - 2*self.joint_angles_learned[1:-1] + self.joint_angles_learned[2:]
                 accel_reg = torch.mean(accel**2)
-            loss_dict["joint_acceleration"] = 0.02 * accel_reg
+            loss_dict["joint_acceleration"] = 0.01 * accel_reg
             
             # --- 3. Range Bounds ---
             # Ensure physically plausible range

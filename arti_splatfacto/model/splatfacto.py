@@ -191,24 +191,6 @@ class SplatfactoModel(Model):
         super().__init__(*args, **kwargs)
 
     def populate_modules(self):
-        # means = torch.empty((0, 3)).float().cuda()
-        # scales = torch.empty((0, 3)).float().cuda()
-        # quats = torch.empty((0, 4)).float().cuda()
-        # dim_sh = num_sh_bases(self.config.sh_degree)
-        # features_dc = torch.empty((0, 3)).float().cuda()
-        # features_rest = torch.empty((0, dim_sh-1, 3)).float().cuda()
-        # opacities = torch.empty((0, 1)).float().cuda()
-
-        # self.gauss_params = torch.nn.ParameterDict(
-        #     {
-        #         "means": means,
-        #         "scales": scales,
-        #         "quats": quats,
-        #         "features_dc": features_dc,
-        #         "features_rest": features_rest,
-        #         "opacities": opacities,
-        #     }
-        # )
 
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
@@ -238,44 +220,6 @@ class SplatfactoModel(Model):
                 grid_W=self.config.grid_shape[2],
             )
 
-        # # Strategy for GS densification
-        # if self.config.strategy == "default":
-        #     # Strategy for GS densification
-        #     self.strategy = SpatialArtiStrategy(
-        #         owner=self,
-        #         prune_opa=self.config.cull_alpha_thresh,
-        #         grow_grad2d=self.config.densify_grad_thresh,
-        #         grow_scale3d=self.config.densify_size_thresh,
-        #         grow_scale2d=self.config.split_screen_size,
-        #         prune_scale3d=self.config.cull_scale_thresh,
-        #         prune_scale2d=self.config.cull_screen_size,
-        #         refine_scale2d_stop_iter=self.config.stop_screen_size_at,
-        #         refine_start_iter=self.config.warmup_length,
-        #         refine_stop_iter=self.config.stop_split_at,
-        #         reset_every=self.config.reset_alpha_every * self.config.refine_every,
-        #         refine_every=self.config.refine_every,
-        #         pause_refine_after_reset=self.num_train_data + self.config.refine_every,
-        #         absgrad=self.config.use_absgrad,
-        #         revised_opacity=False,
-        #         verbose=True,             
-        #     )
-        #     self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
-        # elif self.config.strategy == "mcmc":
-        #     self.strategy = MCMCStrategy(
-        #         cap_max=self.config.max_gs_num,
-        #         noise_lr=self.config.noise_lr,
-        #         refine_start_iter=self.config.warmup_length,
-        #         refine_stop_iter=self.config.stop_split_at,
-        #         refine_every=self.config.refine_every,
-        #         min_opacity=self.config.cull_alpha_thresh,
-        #         verbose=False,
-        #     )
-        #     self.strategy_state = self.strategy.initialize_state()
-        # else:
-        #     raise ValueError(f"""Splatfacto does not support strategy {self.config.strategy}
-        #                      Currently, the supported strategies include default and mcmc.""")
-
-
         # Strategy for GS densification
         if self.config.strategy == "default":
             # Strategy for GS densification
@@ -297,6 +241,26 @@ class SplatfactoModel(Model):
                 verbose=True,
             )
             self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
+
+
+            self.strategy_canonical = DefaultStrategy(
+                prune_opa=self.config.cull_alpha_thresh ,  
+                grow_grad2d=self.config.densify_grad_thresh, 
+                grow_scale3d=self.config.densify_size_thresh ,  
+                grow_scale2d=self.config.split_screen_size,
+                prune_scale3d=self.config.cull_scale_thresh,  
+                prune_scale2d=self.config.cull_screen_size,
+                refine_scale2d_stop_iter=self.config.stop_screen_size_at,
+                refine_start_iter=self.config.warmup_length,
+                refine_stop_iter=self.config.stop_split_at,
+                reset_every=self.config.reset_alpha_every * self.config.refine_every,
+                refine_every=self.config.refine_every,
+                pause_refine_after_reset=self.num_train_data + self.config.refine_every,
+                absgrad=self.config.use_absgrad,
+                revised_opacity=False,
+                verbose=True,
+            )
+            self.strategy_state_canonical = self.strategy_canonical.initialize_state(scene_scale=1.0)
         elif self.config.strategy == "mcmc":
             self.strategy = MCMCStrategy(
                 cap_max=self.config.max_gs_num,
