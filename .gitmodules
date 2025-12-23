@@ -1,0 +1,6 @@
+[submodule "third_party/sam2"]
+	path = third_party/sam2
+	url = git@github.com:praanjalmishra/SAM2.git
+[submodule "third_party/tapip3d"]
+	path = third_party/tapip3d
+	url = git@github.com:praanjalmishra/TAPIP3D.git
