@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from turtle import distance
+# from turtle import distance
 from typing import Any, Dict, Tuple, Union
 import torch
 from gsplat.strategy import DefaultStrategy

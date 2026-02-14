@@ -1,0 +1,35 @@
+services:
+  arti-splatfacto:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CUDA_ARCHITECTURES: "75"
+    image: arti-splatfacto:latest
+    container_name: arti-splatfacto
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      # Code (read-write for development)
+      - ./:/workspace/arti-splatfacto:rw
+      # Data directory (read-only)
+      - ${DATA_DIR:-~/nerfstudio}:/data:ro
+      # Outputs (persistent)
+      - ${OUTPUT_DIR:-~/arti-outputs}:/workspace/outputs:rw
+      # Downloaded datasets (persistent)
+      - ${DATASET_DIR:-~/nerfstudio-data}:/workspace/data:rw
+      # CUDA cache (persistent)
+      - torch-extensions-cache:/root/.cache/torch_extensions
+      # PyTorch hub models (persistent) - ADD THIS
+      - torch-hub-cache:/root/.cache/torch
+    ports:
+      - "7007:7007"
+    shm_size: '12gb'
+    stdin_open: true
+    tty: true
+
+volumes:
+  torch-extensions-cache:
+  torch-hub-cache:  # ADD THIS

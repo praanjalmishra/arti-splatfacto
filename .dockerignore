@@ -1,0 +1,8 @@
+.git
+outputs
+checkpoints
+*.pt
+*.pth
+data
+__pycache__
+*.pyc

@@ -4,3 +4,6 @@
 [submodule "third_party/tapip3d"]
 	path = third_party/tapip3d
 	url = git@github.com:praanjalmishra/TAPIP3D.git
+[submodule "qed-splatter"]
+	path = qed-splatter
+	url = https://github.com/leggedrobotics/qed-splatter.git
