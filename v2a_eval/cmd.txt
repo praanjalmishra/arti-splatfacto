@@ -1,0 +1,36 @@
+# 1. Prepare scene (RGBA→RGB, extract masks)
+
+inside the container
+python -m v2a_eval.prepare_scene --scene $DATA/7265_joint_0_bg_view_0 --output outputs/v2a_eval
+
+# 2. Train canonical 3DGS
+inside the container
+
+ns-train qed-splatter --data outputs/v2a_eval/7265_joint_0_bg_view_0/canonical/transforms.json
+
+inside the container
+3 .python -m v2a_eval.run_change_detection     --scene outputs/v2a_eval/7265_joint_0_bg_view_0 --debug
+
+inside the sam2 conda env
+
+4. python -m v2a_eval.run_sam2_vos     --scene outputs/v2a_eval/7265_joint_0_bg_view_0     --sam2_dir /local/home/pmishra/arti-splatfacto/third_party/sam2/
+
+
+inside the tapip3d conda env
+# 3. Point tracking 
+python -m v2a_eval.run_point_tracking --scene outputs/v2a_eval/7265_joint_0_bg_view_0
+
+inside the container
+# 4. RANSAC joint estimation
+python -m v2a_eval.run_joint_estimation --scene outputs/v2a_eval/7265_joint_0_bg_view_0
+
+inside the container
+# 5. Merge → ready for ArtiSplatFacto  
+python -m v2a_eval.merge_arti_data_v2a     --scene_dir     outputs/v2a_eval/7265_joint_0_bg_view_0
+
+inside the container
+
+# 6. Train articulation-aware 3DGS 
+bash v2a_eval/run_training.sh \
+    outputs/v2a_eval/7265_joint_0_bg_view_0 \
+    0 

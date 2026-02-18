@@ -5,12 +5,17 @@ services:
       dockerfile: Dockerfile
       args:
         CUDA_ARCHITECTURES: "75"
+        DOCKER_UID: ${DOCKER_UID}
+        DOCKER_GID: ${DOCKER_GID}
     image: arti-splatfacto:latest
     container_name: arti-splatfacto
     runtime: nvidia
+  
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - CUDA_VISIBLE_DEVICES=0
+      - VIDEOART_DATA=/workspace/videoartgs-data
+
     volumes:
       # Code (read-write for development)
       - ./:/workspace/arti-splatfacto:rw
@@ -20,16 +25,17 @@ services:
       - ${OUTPUT_DIR:-~/arti-outputs}:/workspace/outputs:rw
       # Downloaded datasets (persistent)
       - ${DATASET_DIR:-~/nerfstudio-data}:/workspace/data:rw
-      # CUDA cache (persistent)
-      - torch-extensions-cache:/root/.cache/torch_extensions
-      # PyTorch hub models (persistent) - ADD THIS
-      - torch-hub-cache:/root/.cache/torch
+      - /local/home/pmishra/VideoArtGS/data:/workspace/videoartgs-data:rw
+      # CUDA cache (persistent) - FIXED PATHS
+      - torch-extensions-cache:/home/appuser/.cache/torch_extensions
+      - torch-hub-cache:/home/appuser/.cache/torch
     ports:
       - "7007:7007"
+      - "8000:8000"
     shm_size: '12gb'
     stdin_open: true
     tty: true
 
 volumes:
   torch-extensions-cache:
-  torch-hub-cache:  # ADD THIS
+  torch-hub-cache:
