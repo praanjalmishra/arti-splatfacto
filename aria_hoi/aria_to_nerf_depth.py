@@ -414,7 +414,7 @@ def write_transforms(
         transforms["meta"] = meta
 
     (out_dir / "transforms.json").write_text(json.dumps(transforms, indent=2))
-    
+
 # -----------------------------------------------------------------------------
 # Core: process one subset of frames into a directory
 # -----------------------------------------------------------------------------
@@ -523,7 +523,7 @@ def process_subset(
         h=out_h,
         ply_path=ply_rel_path,
         meta=meta,
-    )    
+    )
     return len(nerfstudio_frames)
 
 
@@ -536,6 +536,58 @@ def subsample(frames: List, n: int) -> List:
         return frames
     idx = [int(x) for x in np.linspace(0, len(frames) - 1, n)]
     return [frames[i] for i in idx]
+
+
+def subsample_articulated(
+    frames:  List[Tuple[int, Path]],
+    n:       int,
+    end_ns:  int,
+) -> List[Tuple[int, Path]]:
+    """
+    Subsample articulated frames while guaranteeing that the frame whose
+    timestamp is closest to end_ns is always the LAST entry in the output.
+
+    This ensures transforms.json[-1] corresponds to the object's final resting
+    position (maximum displacement from canonical), which is the anchor frame
+    that change detection diffs against the canonical 3DGS render.
+
+    The 66 ms gap between the annotated end_ns and the nearest captured frame
+    means a naive np.linspace may silently drop that closest frame — this
+    function prevents that regardless of the subsampling ratio.
+
+    Strategy
+    --------
+    1. Identify the anchor: frame with |ts - end_ns| minimised.
+    2. Build a pool of all other frames; subsample n-1 slots uniformly.
+    3. Append the anchor as the final element.
+    """
+    if not frames:
+        return frames
+
+    # Step 1 — find anchor
+    timestamps = np.array([ts for ts, _ in frames], dtype=np.int64)
+    anchor_idx = int(np.argmin(np.abs(timestamps - end_ns)))
+    anchor     = frames[anchor_idx]
+
+    dt_ms = abs(timestamps[anchor_idx] - end_ns) / 1e6
+    print(f"  anchor frame: ts={timestamps[anchor_idx]}  "
+          f"Δt={dt_ms:.1f} ms from end_ns={end_ns}")
+
+    if len(frames) <= n:
+        result = list(frames)
+        if result[-1][0] != anchor[0]:
+            result = [f for f in result if f[0] != anchor[0]]
+            result.append(anchor)
+        return result
+
+    pool = [f for i, f in enumerate(frames) if i != anchor_idx]
+    if len(pool) <= n - 1:
+        sampled = pool
+    else:
+        idx     = [int(x) for x in np.linspace(0, len(pool) - 1, n - 1)]
+        sampled = [pool[i] for i in idx]
+
+    return sampled + [anchor]
 
 
 def run(args: argparse.Namespace) -> None:
@@ -556,7 +608,8 @@ def run(args: argparse.Namespace) -> None:
 
     # 2. Trajectory
     traj_aligned = data_dir / "slam" / "closed_loop_trajectory_aligned" / "data.csv"
-    traj_path    = traj_aligned 
+    traj_default = data_dir / "slam" / "closed_loop_trajectory" / "data.csv"
+    traj_path    = traj_aligned if traj_aligned.exists() else traj_default
     print(f"\nLoading trajectory: {traj_path}")
     ts_ns, T_wd_list = load_trajectory(traj_path)
     print(f"  {len(ts_ns)} poses loaded.")
@@ -667,14 +720,17 @@ def run(args: argparse.Namespace) -> None:
     )
     print(f"  -> {n} frames written to canonical/")
 
-    # 9. Process each window as independent articulated episode
+    # 9. Process each window as independent articulated episode.
+    #    subsample_articulated() pins the closest-to-end_ns frame as the
+    #    final entry so that transforms.json[-1] always shows the object in
+    #    its final resting position — the correct anchor for change detection.
     for w in splits["windows"]:
-        widx      = w["index"]
+        widx        = w["index"]
         subset_name = f"articulated_joint_{widx}"
         print(f"\n[{subset_name}]  ({w['name']}, {w['duration_s']:.2f}s)")
 
         raw    = window_raw[widx]
-        frames = subsample(raw, args.max_per_window)
+        frames = subsample_articulated(raw, args.max_per_window, end_ns=w["end_ns"])
 
         if not frames:
             print(f"  WARNING: no frames in this window — skipping.")
