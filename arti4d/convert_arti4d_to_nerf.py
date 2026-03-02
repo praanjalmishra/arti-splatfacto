@@ -265,6 +265,8 @@ def process_frame(
     depth_ts_arr: np.ndarray,
     out_dir: Path,
     frame_label: int,
+    map1: np.ndarray,
+    map2: np.ndarray,
 ) -> dict | None:
     ts_ns = ts_from_name(rgb_path.name)
     ts_s  = ts_ns / 1e9
@@ -285,13 +287,19 @@ def process_frame(
         if img is None:
             print(f"  [WARN] Could not read {rgb_path}, skipping")
             return None
+
         if img.dtype == np.uint16:
             img = (img / 256).astype(np.uint8)
         elif img.dtype != np.uint8:
             img = img.astype(np.uint8)
+
         if img.ndim == 3 and img.shape[2] == 4:
             img = img[:, :, :3]
-        cv2.imwrite(str(dst_rgb), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+        # Rectify RGB
+        img_rect = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
+
+        cv2.imwrite(str(dst_rgb), img_rect, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
     frame = {
         "file_path":        f"frames/{frame_name}",
@@ -301,13 +309,26 @@ def process_frame(
     if len(depth_src_files) > 0:
         idx_d      = int(np.argmin(np.abs(depth_ts_arr - ts_ns)))
         depth_path = depth_src_files[idx_d]
-        depth_raw  = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
-        depth_m    = depth_raw.astype(np.float32) / 1000.0
-        depth_m[depth_raw == 0] = 0.0
-        depth_m[depth_m > 3.0]  = 0.0
-        depth_mm   = (depth_m * 1000.0).astype(np.uint16)
+        depth_raw = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+
+        # Rectify depth using same maps
+        depth_rect = cv2.remap(
+            depth_raw,
+            map1,
+            map2,
+            interpolation=cv2.INTER_NEAREST
+        )
+
+        # Convert mm → metres
+        depth_m = depth_rect.astype(np.float32) / 1000.0
+        depth_m[depth_rect == 0] = 0.0
+        depth_m[depth_m > 3.0] = 0.0
+
+        depth_mm = (depth_m * 1000.0).astype(np.uint16)
+
         depth_name = f"frame_{frame_label:05d}.png"
         cv2.imwrite(str(depth_dir / depth_name), depth_mm)
+
         frame["depth_file_path"] = f"depth/{depth_name}"
 
     return frame
@@ -380,9 +401,49 @@ def convert(args):
         print(f"[intrinsics] Manual override: {cam}")
     else:
         cam = parse_camera_info(scene_dir / "rgb" / "camera_info.txt")
+
+
+        # ── Rectification setup ──────────────────────────
+        K = np.array([
+            [cam["fx"], 0, cam["cx"]],
+            [0, cam["fy"], cam["cy"]],
+            [0, 0, 1]
+        ], dtype=np.float32)
+
+        D = np.array([
+            cam.get("k1", 0.0),
+            cam.get("k2", 0.0),
+            cam.get("p1", 0.0),
+            cam.get("p2", 0.0),
+            cam.get("k3", 0.0),
+            cam.get("k4", 0.0),
+            cam.get("k5", 0.0),
+            cam.get("k6", 0.0),
+        ], dtype=np.float32)
+
+        w, h = cam["w"], cam["h"]
+
+        # Compute rectified intrinsics
+        new_K, _ = cv2.getOptimalNewCameraMatrix(K, D, (w, h), 0)
+
+        # Precompute remap grids
+        map1, map2 = cv2.initUndistortRectifyMap(
+            K, D, None, new_K, (w, h), cv2.CV_32FC1
+        )
+
+        # Replace intrinsics with rectified ones
+        cam["fx"] = float(new_K[0, 0])
+        cam["fy"] = float(new_K[1, 1])
+        cam["cx"] = float(new_K[0, 2])
+        cam["cy"] = float(new_K[1, 2])
+
+
         print(f"[intrinsics] fx={cam['fx']:.2f}  fy={cam['fy']:.2f}  "
               f"cx={cam['cx']:.2f}  cy={cam['cy']:.2f}  "
               f"w={cam['w']}  h={cam['h']}")
+
+        print(f"[rectified] fx={cam['fx']:.2f}, fy={cam['fy']:.2f}, "
+            f"cx={cam['cx']:.2f}, cy={cam['cy']:.2f}")
 
     # ── Odometry ────────────────────────────────────────────
     odom_csvs = list((scene_dir / "odom").glob("*.csv"))
@@ -492,7 +553,7 @@ def convert(args):
     print(f"\n── Building canonical/ ({len(sampled_canonical)} frames) ──")
     for label, frame_1based in enumerate(sampled_canonical, start=1):
         rgb_path = rgb_files[frame_1based - 1]
-        frame    = process_frame(
+        frame = process_frame(
             rgb_path=rgb_path,
             odom_df=odom_df,
             odom_ts=odom_ts,
@@ -500,6 +561,8 @@ def convert(args):
             depth_ts_arr=depth_ts_arr,
             out_dir=canonical_dir,
             frame_label=label,
+            map1=map1,
+            map2=map2,
         )
         if frame:
             canonical_tf["frames"].append(frame)
@@ -525,14 +588,16 @@ def convert(args):
 
         for label, frame_1based in enumerate(window_indices, start=1):
             rgb_path = rgb_files[frame_1based - 1]
-            frame    = process_frame(
+            frame = process_frame(
                 rgb_path=rgb_path,
                 odom_df=odom_df,
                 odom_ts=odom_ts,
                 depth_src_files=depth_src_files,
                 depth_ts_arr=depth_ts_arr,
-                out_dir=joint_dir,
+                out_dir=joint_dir,   # ✅ FIXED
                 frame_label=label,
+                map1=map1,
+                map2=map2,
             )
             if frame:
                 joint_tf["frames"].append(frame)
