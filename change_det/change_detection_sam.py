@@ -19,11 +19,11 @@ from tqdm import tqdm
 from change_det.utils.sam_refine import refine_change_detection_masks
 from change_det.utils.debug_utils import debug_image_pairs, debug_depth_pairs
 from change_det.utils.img_utils import overlay_mask_on_image
-from change_det.utils.io import read_transforms, save_masks
+from change_det.utils.io import read_transforms, save_masks, params_to_cameras
 from change_det.utils.render_utils import render_cameras
 from change_det.utils.image_diff import image_diff_sam2_with_depth
 from nerfstudio.utils.eval_utils import eval_setup
-
+import yaml
 
 DEFAULT_CONFIG = {
     "area_threshold": 0.01,
@@ -31,30 +31,31 @@ DEFAULT_CONFIG = {
     "depth_weight": 0.3,
     "num_positive_points": 20,
     "num_negative_points": 20,
+    "min_iou": 0.5,
 }
 
+def apply_dataparser_transform(poses: torch.Tensor, dataparser_json: Path) -> torch.Tensor:
+    """Apply Nerfstudio dataparser_transforms.json to query poses."""
+    with open(dataparser_json) as f:
+        dp = json.load(f)
+    T = torch.eye(4, dtype=torch.float32)
+    T[:3, :] = torch.tensor(dp["transform"], dtype=torch.float32)
+    scale = float(dp["scale"])
+    out = poses.clone()
+    out[:, :3, :3] = scale * (T[:3, :3] @ poses[:, :3, :3])
+    out[:, :3,  3] = scale * (T[:3, :3] @ poses[:, :3, 3].unsqueeze(-1)).squeeze(-1) + scale * T[:3, 3]
+    return out
+
+
 class ChangeDetector:
-    """
-    Simple change detector that compares the last frame (t=1) 
-    with pre-trained 3DGS rendering to identify moved objects.
-    """
-    
     def __init__(self, pretrained_config: Path, output_dir: Path, debug: bool = False):
-        """
-        Initialize the change detector.
-        
-        Args:
-            pretrained_config: Path to config.yml of pre-trained 3DGS
-            output_dir: Directory to save output masks
-            debug: Enable debug mode for visualizations
-        """
         self.pretrained_config = pretrained_config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.debug = debug
-        
+
         if debug:
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             self.debug_dir = self.output_dir / "cd_debug" / timestamp
@@ -62,60 +63,61 @@ class ChangeDetector:
             print(f"[DEBUG] Outputs will be saved to: {self.debug_dir}")
         else:
             self.debug_dir = None
-        
-        _, self.pipeline, _, _ = eval_setup(
-            pretrained_config, test_mode="inference"
-        )
+
+        _, self.pipeline, _, _ = eval_setup(pretrained_config, test_mode="inference")
         print("[INFO] 3DGS model loaded successfully")
-    
+
+        # Auto-locate dataparser_transforms.json next to config.yml
+        self.dataparser_json = Path(pretrained_config).parent / "dataparser_transforms.json"
+        assert self.dataparser_json.exists(), \
+            f"dataparser_transforms.json not found at {self.dataparser_json}"
+        print(f"[INFO] Dataparser transform loaded: {self.dataparser_json}")
+
     def load_last_frame(self, transforms_json: Path):
         """
-        Load the last frame from the dynamic sequence based on frame index.
-
-        Args:
-            transforms_json: Path to transforms.json (no time annotations required)
-
-        Returns:
-            rgb, depth, camera, img_fname: Last captured frame and camera parameters
+        Load the last frame from the dynamic sequence.
+        Applies the dataparser transform so poses align with the trained model.
         """
-
-        result = read_transforms(transforms_json)
+        result = read_transforms(transforms_json, keep_alpha=True)
         if len(result) == 8:
-            color_images, depth_images, img_fnames, c2w, K, dist_params, cameras, _ = result
+            color_images, depth_images, img_fnames, c2w, K, dist_params, _, _ = result
         else:
-            color_images, depth_images, img_fnames, c2w, K, dist_params, cameras = result
+            color_images, depth_images, img_fnames, c2w, K, dist_params, _ = result
 
         assert dist_params.sum() < 1e-6, "Images must be undistorted before change detection"
 
-        # Use the last frame index directly
-        last_idx = len(color_images) - 1
+        # Align poses to trained model's coordinate frame
+        c2w_transformed = apply_dataparser_transform(c2w, self.dataparser_json)
+        dist_zeros = torch.zeros(len(c2w), 4)
+        cameras = params_to_cameras(c2w_transformed, K.cpu(), dist_zeros,
+                                    color_images.shape[-2], color_images.shape[-1])
+
+        last_idx = len(color_images) // 2
         print(f"[INFO] Last frame index: {last_idx}")
         print(f"[INFO] Frame name: {img_fnames[last_idx]}")
 
-        # Extract last frame data
-        rgb_captured = color_images[last_idx:last_idx+1].to(self.device)
+        rgb_captured   = color_images[last_idx:last_idx+1].to(self.device)
         depth_captured = depth_images[last_idx:last_idx+1].to(self.device)
-        camera_last = cameras[last_idx:last_idx+1]
+        camera_last    = cameras[last_idx:last_idx+1]
+
+        if rgb_captured.shape[1] == 4:
+            print("[INFO] Captured image is RGBA - compositing onto black background")
+            rgb_captured = rgb_captured[:, :3] * rgb_captured[:, 3:4]
 
         return rgb_captured, depth_captured, camera_last, img_fnames[last_idx]
 
-    
     def render_at_last_frame(self, camera):
-        """
-        Render the pre-trained 3DGS model at the last frame's viewpoint.
-        
-        Args:
-            camera: Camera parameters for the last frame
-            
-        Returns:
-            rgb_rendered, depth_rendered: Rendered images from static model
-        """
+        """Render the pre-trained 3DGS model at the last frame's viewpoint."""
         print("[INFO] Rendering pre-trained 3DGS at last frame viewpoint...")
-        
+
         rgb_rendered, depth_rendered = render_cameras(
-            self.pipeline, camera, device=self.device
+            self.pipeline, camera, device=self.device, return_rgba=True
         )
-        
+
+        if rgb_rendered.shape[1] == 4:
+            print("[INFO] Rendered image is RGBA - compositing onto black background")
+            rgb_rendered = rgb_rendered[:, :3] * rgb_rendered[:, 3:4]
+
         return rgb_rendered, depth_rendered
     
     def detect_changes(
@@ -240,15 +242,6 @@ class ChangeDetector:
         Returns:
             masks: Detected change masks [N, 1, H, W]
         """
-        # # Default configuration
-        # if config is None:
-        #     config = {
-        #         "area_threshold": 0.01,
-        #         "cd_kernel_ratio": 0.1,
-        #         "depth_weight": 0.4,
-        #         "num_positive_points": 30,
-        #         "num_negative_points": 50,
-        #     }
         
         # Load last frame
         rgb_captured, depth_captured, camera_last, frame_name = \
@@ -257,24 +250,6 @@ class ChangeDetector:
         # Render pre-trained model at last frame
         rgb_rendered, depth_rendered = self.render_at_last_frame(camera_last)
         
-
-        if self.debug and self.debug_dir is not None:
-            # # Ensure the debug subdirectories exist before calling visualization utils
-            # rgb_debug_dir = Path(self.debug_dir) / "rgb_comparison"
-            # depth_debug_dir = Path(self.debug_dir) / "depth_comparison"
-
-            # os.makedirs(rgb_debug_dir, exist_ok=True)
-            # os.makedirs(depth_debug_dir, exist_ok=True)
-
-            # Call the debug visualization functions
-            debug_image_pairs(
-                rgb_rendered, rgb_captured, 
-                self.debug_dir
-            )
-            debug_depth_pairs(
-                depth_rendered, depth_captured,
-                self.debug_dir
-            )
 
         
         # Detect changes
@@ -305,11 +280,16 @@ class ChangeDetector:
         torch.cuda.empty_cache()
 
 
+
+
 def load_config(config_path: Path = None) -> dict:
     config = DEFAULT_CONFIG.copy()
     if config_path and config_path.exists():
         with open(config_path, 'r') as f:
-            user_cfg = json.load(f)
+            if config_path.suffix in [".yaml", ".yml"]:
+                user_cfg = yaml.safe_load(f)
+            else:
+                user_cfg = json.load(f)
         config.update(user_cfg)
     return config
 
