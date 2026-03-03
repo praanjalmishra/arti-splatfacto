@@ -257,6 +257,69 @@ def write_transforms(out_dir: Path, transforms: dict):
         json.dump(transforms, f, indent=2)
 
 
+def preprocess_depth(depth_rect: np.ndarray, depth_max_m: float = 3.0) -> np.ndarray:
+    """
+    Clean and fill sparse/noisy depth maps.
+    Input:  uint16 depth in mm (0 = invalid)
+    Output: uint16 depth in mm (0 = invalid/unfillable)
+    """
+    # 1. Convert to float metres for processing
+    depth_m = depth_rect.astype(np.float32) / 1000.0
+    invalid_mask = (depth_rect == 0)
+
+    # 2. Remove flying pixels (depth discontinuity edges)
+    #    Erode the valid region slightly — pixels at object boundaries
+    #    often have blended/incorrect depth from the ToF sensor
+    kernel = np.ones((3, 3), np.uint8)
+    valid_mask = (~invalid_mask).astype(np.uint8)
+    valid_mask_eroded = cv2.erode(valid_mask, kernel, iterations=1)
+    depth_m[valid_mask_eroded == 0] = 0.0
+
+    # 3. Range filter — clip physically implausible values
+    depth_m[(depth_m > 0) & (depth_m < 0.3)] = 0.0   # too close
+    depth_m[depth_m > depth_max_m] = 0.0
+
+    # 4. Median filter to suppress ToF salt-and-pepper noise
+    #    Only filter valid pixels (avoid smearing invalid regions)
+    depth_u16_tmp = (depth_m * 1000.0).astype(np.uint16)
+    depth_filtered = cv2.medianBlur(depth_u16_tmp, 5)
+    # Restore zeros that were valid before (don't let median fill holes)
+    depth_filtered[depth_m == 0] = 0
+    depth_m = depth_filtered.astype(np.float32) / 1000.0
+
+    # 5. Hole filling via inpainting
+    #    Use Fast Marching Method — good for structured scenes
+    hole_mask = (depth_m == 0).astype(np.uint8)
+    # Only fill small holes (large holes = legitimately missing geometry)
+    # Dilate mask to find "small" holes via connected components
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(hole_mask, connectivity=8)
+    small_hole_mask = np.zeros_like(hole_mask)
+    MAX_HOLE_PIXELS = 500  # tune based on your resolution
+    for label_id in range(1, n_labels):  # skip background (0)
+        if stats[label_id, cv2.CC_STAT_AREA] < MAX_HOLE_PIXELS:
+            small_hole_mask[labels == label_id] = 1
+
+    if small_hole_mask.any():
+        # Inpaint needs uint8 image — scale depth to 0-255 range temporarily
+        depth_norm = cv2.normalize(depth_m, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        depth_inpainted_norm = cv2.inpaint(depth_norm, small_hole_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+        # Recover scale and only apply where we filled holes
+        scale = depth_m.max() / 255.0 if depth_m.max() > 0 else 1.0
+        filled_depth = depth_inpainted_norm.astype(np.float32) * scale
+        depth_m[small_hole_mask == 1] = filled_depth[small_hole_mask == 1]
+
+    # 6. Final bilateral filter — smooth noise while preserving edges
+    #    (skip if you need metric accuracy; adds slight smoothing)
+    depth_valid = depth_m.copy()
+    depth_valid_u8 = cv2.normalize(depth_valid, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    smoothed = cv2.bilateralFilter(depth_valid_u8, d=5, sigmaColor=10, sigmaSpace=5)
+    scale = depth_m.max() / 255.0 if depth_m.max() > 0 else 1.0
+    depth_smoothed = smoothed.astype(np.float32) * scale
+    # Only apply smoothing where depth was already valid
+    depth_m[depth_m > 0] = depth_smoothed[depth_m > 0]
+
+    return (depth_m * 1000.0).astype(np.uint16)
+
 def process_frame(
     rgb_path: Path,
     odom_df: pd.DataFrame,
@@ -310,21 +373,8 @@ def process_frame(
         idx_d      = int(np.argmin(np.abs(depth_ts_arr - ts_ns)))
         depth_path = depth_src_files[idx_d]
         depth_raw = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
-
-        # Rectify depth using same maps
-        depth_rect = cv2.remap(
-            depth_raw,
-            map1,
-            map2,
-            interpolation=cv2.INTER_NEAREST
-        )
-
-        # Convert mm → metres
-        depth_m = depth_rect.astype(np.float32) / 1000.0
-        depth_m[depth_rect == 0] = 0.0
-        depth_m[depth_m > 3.0] = 0.0
-
-        depth_mm = (depth_m * 1000.0).astype(np.uint16)
+        depth_rect = cv2.remap(depth_raw, map1, map2, interpolation=cv2.INTER_NEAREST)
+        depth_mm = preprocess_depth(depth_rect, depth_max_m=3.0)
 
         depth_name = f"frame_{frame_label:05d}.png"
         cv2.imwrite(str(depth_dir / depth_name), depth_mm)
